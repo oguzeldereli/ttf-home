@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ttf-home"
+version = "0.1.0.dev0"
+description = "Train, convert, fine-tune and run ternary (TTF) language models on a home computer"
+readme = "README.md"
+authors = [{name = "Özgür Güzeldereli"}]
+requires-python = ">=3.11"
+dependencies = ["ttf-ternary", "numpy", "tokenizers", "gguf"]
+
+[project.optional-dependencies]
+convert = ["ttf-conversion", "transformers==5.19.0", "flash-linear-attention==0.5.2"]
+
+[project.scripts]
+ttf = "ttfhome.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ttfhome*"]

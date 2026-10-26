@@ -1,0 +1,5 @@
+__pycache__/
+*.gguf
+tools/ttf_score
+tools/ttf_score_cpu
+tools/ttf_score_cuda

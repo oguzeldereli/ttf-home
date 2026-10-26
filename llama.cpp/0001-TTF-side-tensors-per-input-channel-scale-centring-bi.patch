@@ -1,0 +1,270 @@
+From bbc0ff2e07dce5d560b561ba78166c0c64daafba Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 00:37:56 +0000
+Subject: [PATCH 1/2] TTF side tensors: per-input-channel scale, centring, bias
+ and a low-rank ternary adapter on any weight
+
+Optional tensors next to a weight (<base>.ttf_c / ttf_m / ttf_b, <base>.ttf_d* / ttf_u*) are loaded by a generic
+pass after the per-arch loader and applied in build_lora_mm: y = mul_mat(W, c*x + m) + b + U(D(x)). Models without
+them are unchanged.
+---
+ src/llama-context.cpp |  1 +
+ src/llama-graph.cpp   | 38 +++++++++++++++++++++-
+ src/llama-graph.h     | 10 ++++++
+ src/llama-model.cpp   | 76 +++++++++++++++++++++++++++++++++++++++++++
+ src/llama-model.h     |  3 ++
+ src/llama-ttf.h       | 27 +++++++++++++++
+ 6 files changed, 154 insertions(+), 1 deletion(-)
+ create mode 100644 src/llama-ttf.h
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 220240ea9..bfc5ebfc5 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2415,6 +2415,7 @@ llm_graph_params llama_context::graph_params(
+         /*.n_outputs   =*/ n_outputs,
+         /*.cb          =*/ graph_get_cb(),
+         /*.res         =*/ res,
++        /*.ttf         =*/ &model.ttf,
+     };
+ }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 68c9e606c..76b8dd7e5 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1060,6 +1060,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+     backend_cpu      (params.backend_cpu),
+     cvec             (params.cvec),
+     loras            (params.loras),
++    ttf              (params.ttf),
+     mctx             (params.mctx),
+     cross            (params.cross),
+     samplers         (params.samplers),
+@@ -1082,11 +1083,46 @@ ggml_tensor * llm_graph_context::build_cvec(
+     return cvec->apply_to(ctx0, cur, il);
+ }
+ 
++ggml_tensor * llm_graph_context::build_ttf_mm(
++          ggml_tensor * w,
++          ggml_tensor * cur,
++  const llama_ttf_lin & l) const {
++    if (l.c) {
++        cur = ggml_mul(ctx0, cur, l.c);
++    }
++    if (l.m) {
++        cur = ggml_add(ctx0, cur, l.m);
++    }
++    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
++    if (l.b) {
++        res = ggml_add(ctx0, res, l.b);
++    }
++    return res;
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
+-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
++    ggml_tensor * res = nullptr;
++
++    const llama_ttf_ext * te = nullptr;
++    if (ttf && !ttf->empty()) {
++        auto it = ttf->find(w);
++        if (it != ttf->end()) {
++            te = &it->second;
++        }
++    }
++
++    if (te) {
++        res = build_ttf_mm(w, cur, te->main);
++        if (te->d && te->u) {
++            ggml_tensor * h = build_ttf_mm(te->d, cur, te->dl);
++            res = ggml_add(ctx0, res, build_ttf_mm(te->u, h, te->ul));
++        }
++    } else {
++        res = ggml_mul_mat(ctx0, w, cur);
++    }
+ 
+     if (w_s) {
+         res = ggml_mul(ctx0, res, w_s);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index a6e8c3985..99880a91e 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -4,6 +4,7 @@
+ #include "llama-batch.h"
+ #include "llama-hparams.h"
+ #include "llama-adapter.h"
++#include "llama-ttf.h"
+ 
+ #include <cstdint>
+ #include <vector>
+@@ -626,6 +627,8 @@ struct llm_graph_params {
+ 
+     llm_graph_result * res;
+ 
++    const llama_ttf_map * ttf = nullptr; // TTF side tensors per weight (empty for other models)
++
+     // return true if the "other" params would result in a graph with the same topology as with the current params
+     //   having the same topology allows us to reuse the graph in some cases
+     bool allow_reuse(const llm_graph_params & other) const {
+@@ -829,6 +832,7 @@ struct llm_graph_context {
+ 
+     const llama_adapter_cvec     * cvec;
+     const llama_adapter_loras    * loras;
++    const llama_ttf_map          * ttf;
+     const llama_memory_context_i * mctx;
+     const llama_cross            * cross;
+ 
+@@ -854,6 +858,12 @@ struct llm_graph_context {
+              ggml_tensor * cur,
+                      int   il) const;
+ 
++    // x -> mul_mat(w, c * x + m) + b for one TTF part (c / m / b optional)
++    ggml_tensor * build_ttf_mm(
++              ggml_tensor * w,
++              ggml_tensor * cur,
++      const llama_ttf_lin & l) const;
++
+     // do mat_mul, while optionally apply lora and per-tensor scale
+     ggml_tensor * build_lora_mm(
+               ggml_tensor * w,
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d041a9ce3..7225d57bb 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1467,6 +1467,82 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
++    // TTF side tensors: optional, next to the weight they belong to (see llama-ttf.h)
++    {
++        const auto tn = LLM_TN(arch);
++        auto ttf_vec = [&](llm_tensor e, const char * suf, int bid, int64_t n) -> ggml_tensor * {
++            const std::string name = tn(e, suf, bid);
++            const ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
++            if (!meta) {
++                return nullptr;
++            }
++            if (ggml_n_dims(meta) != 1 || meta->ne[0] != n) {
++                throw std::runtime_error(format("TTF tensor %s: expected [%lld]", name.c_str(), (long long) n));
++            }
++            return create_tensor(tn(e, suf, bid), {n}, TENSOR_NOT_REQUIRED);
++        };
++        auto ttf_mat = [&](llm_tensor e, const char * suf, int bid, int64_t K, int64_t N) -> ggml_tensor * {
++            const std::string name = tn(e, suf, bid);
++            const ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
++            if (!meta) {
++                return nullptr;
++            }
++            // K or N may be the adapter rank (-1: take it from the file)
++            const int64_t k = K < 0 ? meta->ne[0] : K;
++            const int64_t n = N < 0 ? meta->ne[1] : N;
++            return create_tensor(tn(e, suf, bid), {k, n}, TENSOR_NOT_REQUIRED);
++        };
++        auto ttf_load = [&](llm_tensor e, ggml_tensor * w, int bid) {
++            if (!w || ggml_n_dims(w) != 2) {
++                return;
++            }
++            const int64_t K = w->ne[0];
++            const int64_t N = w->ne[1];
++            llama_ttf_ext te;
++            te.main.c = ttf_vec(e, "ttf_c", bid, K);
++            te.main.m = ttf_vec(e, "ttf_m", bid, K);
++            te.main.b = ttf_vec(e, "ttf_b", bid, N);
++            te.d = ttf_mat(e, "ttf_d", bid, K, -1);
++            if (te.d) {
++                const int64_t r = te.d->ne[1];
++                te.dl.c = ttf_vec(e, "ttf_d_c", bid, K);
++                te.dl.m = ttf_vec(e, "ttf_d_m", bid, K);
++                te.dl.b = ttf_vec(e, "ttf_d_b", bid, r);
++                te.u = ttf_mat(e, "ttf_u", bid, r, N);
++                if (!te.u) {
++                    throw std::runtime_error(format("TTF adapter %s has a down layer but no up layer", tn(e, "ttf_d", bid).str().c_str()));
++                }
++                te.ul.c = ttf_vec(e, "ttf_u_c", bid, r);
++                te.ul.m = ttf_vec(e, "ttf_u_m", bid, r);
++                te.ul.b = ttf_vec(e, "ttf_u_b", bid, N);
++            }
++            if (te.main.c || te.main.m || te.main.b || te.d) {
++                ttf[w] = te;
++            }
++        };
++        {
++            for (int i = 0; i < n_layer_all; ++i) {
++                auto & layer = layers[i];
++                ttf_load(LLM_TENSOR_ATTN_Q,     layer.wq,        i);
++                ttf_load(LLM_TENSOR_ATTN_K,     layer.wk,        i);
++                ttf_load(LLM_TENSOR_ATTN_V,     layer.wv,        i);
++                ttf_load(LLM_TENSOR_ATTN_OUT,   layer.wo,        i);
++                ttf_load(LLM_TENSOR_ATTN_QKV,   layer.wqkv,      i);
++                ttf_load(LLM_TENSOR_ATTN_GATE,  layer.wqkv_gate, i);
++                ttf_load(LLM_TENSOR_FFN_GATE,   layer.ffn_gate,  i);
++                ttf_load(LLM_TENSOR_FFN_DOWN,   layer.ffn_down,  i);
++                ttf_load(LLM_TENSOR_FFN_UP,     layer.ffn_up,    i);
++                ttf_load(LLM_TENSOR_SSM_IN,     layer.ssm_in,    i);
++                ttf_load(LLM_TENSOR_SSM_OUT,    layer.ssm_out,   i);
++                ttf_load(LLM_TENSOR_SSM_ALPHA,  layer.ssm_alpha, i);
++                ttf_load(LLM_TENSOR_SSM_BETA,   layer.ssm_beta,  i);
++            }
++            if (!ttf.empty()) {
++                LLAMA_LOG_INFO("%s: TTF side tensors on %zu weights\n", __func__, ttf.size());
++            }
++        }
++    }
++
+     ml.done_getting_tensors();
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+diff --git a/src/llama-model.h b/src/llama-model.h
+index f4718f6d5..5fe834889 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -594,6 +594,9 @@ struct llama_model {
+     // for quantize-stats only
+     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+ 
++    // TTF side tensors (column scale, centring, bias, ternary adapter) by weight; empty for other models
++    llama_ttf_map ttf;
++
+     // for keeping track of associated LoRA adapters
+     std::unordered_set<llama_adapter_lora *> loras;
+ 
+diff --git a/src/llama-ttf.h b/src/llama-ttf.h
+new file mode 100644
+index 000000000..04a955d2b
+--- /dev/null
++++ b/src/llama-ttf.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++// TTF (ternary) layers: y = mul_mat(W, c * x + m) + b  [+ the low-rank ternary adapter U (D x)], where
++// W holds the trits with the row scale folded into its block scales (TQ1_0 / TQ2_0 / Q2_K hold {-1, 0, 1} * d
++// exactly), c is the per-input-channel scale, m = -c * mu the centring, b the output bias. Each of the three
++// parts is optional; the adapter's down (D) and up (U) layers have the same form. The side tensors sit next to
++// the weight in the GGUF: <base>.ttf_c / ttf_m / ttf_b, <base>.ttf_d (+ _c / _m / _b), <base>.ttf_u (+ _c / _m / _b).
++
++#include "ggml.h"
++
++#include <unordered_map>
++
++struct llama_ttf_lin {
++    ggml_tensor * c = nullptr; // [K] column scale
++    ggml_tensor * m = nullptr; // [K] -c * mu (centring)
++    ggml_tensor * b = nullptr; // [N] bias
++};
++
++struct llama_ttf_ext {
++    llama_ttf_lin main;
++    ggml_tensor * d = nullptr; // [K, r] adapter down
++    llama_ttf_lin dl;
++    ggml_tensor * u = nullptr; // [r, N] adapter up
++    llama_ttf_lin ul;
++};
++
++using llama_ttf_map = std::unordered_map<const ggml_tensor *, llama_ttf_ext>;
+-- 
+2.55.0
+
