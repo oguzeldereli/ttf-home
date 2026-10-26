@@ -1,0 +1,35 @@
+From ae38f10115540b56e22675dbdf5af91bff91af1f Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 05:02:58 +0000
+Subject: [PATCH 5/5] tests: TQ1_0 / TQ2_0 in the backend-ops type lists (CUDA
+ MUL_MAT: 22 / 22 OK vs CPU)
+
+---
+ tests/test-backend-ops.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 15ae38927..0f3c6a58b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7601,7 +7601,7 @@ static const ggml_type all_types[] = {
+     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+     GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+     GGML_TYPE_Q6_K,
+-    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
++    GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
+     GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+@@ -7626,7 +7626,7 @@ static const ggml_type other_types[] = {
+     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+     GGML_TYPE_Q5_K,
+     GGML_TYPE_Q6_K,
+-    // GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0, // TODO: implement for all backends
++    GGML_TYPE_TQ1_0, GGML_TYPE_TQ2_0,
+     GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S,
+     GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,
+     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_XS,
+-- 
+2.55.0
+

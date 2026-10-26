@@ -112,7 +112,7 @@ def cmd_engine(a):
         if not (d / ".git").exists():
             d.parent.mkdir(parents=True, exist_ok=True)
             run(["git", "clone", ENGINE_URL, d])
-            run(["git", "-C", d, "checkout", "-b", "ttf", ENGINE_BASE])
+            run(["git", "-C", d, "checkout", "-B", "ttf", ENGINE_BASE])
             patches = sorted((HOME / "llama.cpp").glob("*.patch"))
             run(["git", "-C", d, "-c", "user.name=ttf", "-c", "user.email=ttf@localhost", "am", *patches])
         flags = {"cuda": ["-DGGML_CUDA=ON"], "cpu": ["-DGGML_CUDA=OFF"], "metal": ["-DGGML_METAL=ON"],

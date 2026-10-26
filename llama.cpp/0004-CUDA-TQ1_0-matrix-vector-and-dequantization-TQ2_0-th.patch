@@ -1,0 +1,347 @@
+From bb66cb5dce2d1b1ebbe090ba4f94035ec6c18347 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 05:00:30 +0000
+Subject: [PATCH 4/5] CUDA: TQ1_0 matrix-vector and dequantization; TQ2_0
+ through MMQ (the Q2_K kernels with unit sub-block scales)
+
+TQ1_0: one int of base-3 codes per thread, branch-free across the three code regions, two bytes per 16-bit lane;
+bit-identical decode NLL to the CPU layout (0.8B TTF 2.587994). 27B TTF: 16.8 tok/s at 7.87 GiB (TQ2_0: 23.1 at
+9.23 GiB). TQ2_0 MMQ: prefill without the fp16 copy of the weight; NLL 2.5889 vs 2.5883 through cuBLAS.
+---
+ ggml/src/ggml-cuda/common.cuh                 |  7 ++
+ ggml/src/ggml-cuda/convert.cu                 | 30 +++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu               |  1 +
+ ggml/src/ggml-cuda/mmq.cu                     |  4 ++
+ ggml/src/ggml-cuda/mmq.cuh                    | 65 +++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu                    |  8 +++
+ .../template-instances/generate_cu_files.py   |  2 +-
+ .../template-instances/mmq-instance-tq2_0.cu  |  5 ++
+ ggml/src/ggml-cuda/vecdotq.cuh                | 36 ++++++++++
+ 9 files changed, 157 insertions(+), 1 deletion(-)
+ create mode 100644 ggml/src/ggml-cuda/template-instances/mmq-instance-tq2_0.cu
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 5841bcee5..18fc12f5d 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1014,6 +1014,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
+     static constexpr int qi = QI_NVFP4;
+ };
+ 
++template<>
++struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0> {
++    static constexpr int qk = QK_K;
++    static constexpr int qr = 1;
++    static constexpr int qi = 16;   // 13 ints per block (vec_dot_tq1_0_q8_1), padded to divide the warp
++};
++
+ template<>
+ struct ggml_cuda_type_traits<GGML_TYPE_TQ2_0> {
+     static constexpr int qk = QK_K;
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 34aaa6a49..b734c5dbf 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -539,6 +539,32 @@ static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k
+     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
+ }
+ 
++template<typename dst_t>
++static __global__ void dequantize_block_tq1_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
++
++    const int64_t i = blockIdx.x;
++    const block_tq1_0 * x = (const block_tq1_0 *) vx;
++    const int e = threadIdx.x;     // the element, 0..255 (layout: vec_dot_tq1_0_q8_1)
++
++    int n, b;
++    if (e < 160) {
++        n = e / 32;          b = x[i].qs[e % 32];
++    } else if (e < 240) {
++        n = (e - 160) / 16;  b = x[i].qs[32 + (e - 160) % 16];
++    } else {
++        n = (e - 240) / 4;   b = x[i].qh[(e - 240) % 4];
++    }
++    const uint32_t pow3[5] = {1, 3, 9, 27, 81};
++    const uint32_t q = ((uint32_t) b * pow3[n]) & 0xFF;
++    yy[i*QK_K + e] = __half2float(x[i].d) * ((int) ((q * 3) >> 8) - 1);
++}
++
++template<typename dst_t>
++static void dequantize_row_tq1_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
++    const int nb = k / QK_K;
++    dequantize_block_tq1_0<<<nb, QK_K, 0, stream>>>(vx, y);
++}
++
+ template<typename dst_t>
+ static void dequantize_row_tq2_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = k / QK_K;
+@@ -754,6 +780,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+         case GGML_TYPE_Q2_K:
+             return dequantize_row_q2_K_cuda;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_row_tq1_0_cuda;
+         case GGML_TYPE_TQ2_0:
+             return dequantize_row_tq2_0_cuda;
+         case GGML_TYPE_Q3_K:
+@@ -811,6 +839,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+         case GGML_TYPE_Q2_K:
+             return dequantize_row_q2_K_cuda;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_row_tq1_0_cuda;
+         case GGML_TYPE_TQ2_0:
+             return dequantize_row_tq2_0_cuda;
+         case GGML_TYPE_Q3_K:
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 13e2ed2fb..aa83cf959 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5216,6 +5216,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_NVFP4:
+                     case GGML_TYPE_Q2_K:
++                    case GGML_TYPE_TQ1_0:
+                     case GGML_TYPE_TQ2_0:
+                     case GGML_TYPE_Q3_K:
+                     case GGML_TYPE_Q4_K:
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index e1add5e03..dd05fa535 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -32,6 +32,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+         case GGML_TYPE_Q2_K:
+             mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, args, stream);
+             break;
++        case GGML_TYPE_TQ2_0:
++            mul_mat_q_case<GGML_TYPE_TQ2_0>(ctx, args, stream);
++            break;
+         case GGML_TYPE_Q3_K:
+             mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, args, stream);
+             break;
+@@ -281,6 +284,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+         case GGML_TYPE_MXFP4:
+         case GGML_TYPE_NVFP4:
+         case GGML_TYPE_Q2_K:
++        case GGML_TYPE_TQ2_0:
+         case GGML_TYPE_Q3_K:
+         case GGML_TYPE_Q4_K:
+         case GGML_TYPE_Q5_K:
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index edf546d8f..a00ce2de4 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -76,6 +76,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
+         case GGML_TYPE_NVFP4:
+             return MMQ_Q8_1_DS_LAYOUT_D4;
+         case GGML_TYPE_Q2_K:
++        case GGML_TYPE_TQ2_0:
+             return MMQ_Q8_1_DS_LAYOUT_D2S6;
+         case GGML_TYPE_Q3_K:
+             return MMQ_Q8_1_DS_LAYOUT_D4;
+@@ -200,6 +201,7 @@ static constexpr __host__ __device__ tile_x_sizes mmq_get_dp4a_tile_x_sizes(ggml
+         case GGML_TYPE_MXFP4:   return MMQ_DP4A_TXS_Q8_1;
+         case GGML_TYPE_NVFP4:   return MMQ_DP4A_TXS_Q8_0_16;
+         case GGML_TYPE_Q2_K:    return MMQ_DP4A_TXS_Q2_K;
++        case GGML_TYPE_TQ2_0:   return MMQ_DP4A_TXS_Q2_K;
+         case GGML_TYPE_Q3_K:    return MMQ_DP4A_TXS_Q3_K;
+         case GGML_TYPE_Q4_K:    return MMQ_DP4A_TXS_Q4_K;
+         case GGML_TYPE_Q5_K:    return MMQ_DP4A_TXS_Q5_K;
+@@ -250,6 +252,7 @@ static constexpr __host__ __device__ int mmq_get_mma_tile_x_k(ggml_type type) {
+         case GGML_TYPE_NVFP4:   return MMQ_MMA_TILE_X_K_NVFP4;
+ #endif // defined(BLACKWELL_MMA_AVAILABLE)
+         case GGML_TYPE_Q2_K:    return MMQ_MMA_TILE_X_K_Q2_K;
++        case GGML_TYPE_TQ2_0:   return MMQ_MMA_TILE_X_K_Q2_K;
+         case GGML_TYPE_Q3_K:    return MMQ_MMA_TILE_X_K_Q3_K;
+         case GGML_TYPE_Q4_K:    return MMQ_MMA_TILE_X_K_Q8_1;
+         case GGML_TYPE_Q5_K:    return MMQ_MMA_TILE_X_K_Q8_1;
+@@ -1683,6 +1686,59 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
+     }
+ }
+ 
++template <int mmq_y, bool need_check> static __device__ __forceinline__ void load_tiles_tq2_0(
++    const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
++    constexpr int nwarps = mmq_get_nwarps_device();
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++    int   * x_qs = (int   *)  x_tile;
++    half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
++#else
++    constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(GGML_TYPE_Q2_K, mmq_y);
++    int   * x_qs = (int   *)  x_tile;
++    half2 * x_dm = (half2 *) (x_qs + txs.qs);
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++
++    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR2_K);
++    constexpr int nrows = ggml_cuda_get_physical_warp_size() / threads_per_row;
++    const int kqsx = threadIdx.x % threads_per_row;
++
++#pragma unroll
++    for (int i0 = 0; i0 < mmq_y; i0 += nrows*nwarps) {
++        int i = i0 + threadIdx.y*nrows + threadIdx.x/threads_per_row;
++
++        if (need_check) {
++            i = min(i, i_max);
++        }
++
++        const block_tq2_0 * bxi = (const block_tq2_0 *) x + kbx0 + i*stride;
++
++        const int x_ql_0 = get_int_b2(bxi->qs, kqsx);
++
++#pragma unroll
++        for (int l = 0; l < QR2_K; ++l) {
++            const int k = (kqsx/8)*32 + l*8 + kqsx % 8;
++
++            const int x_qs_k = (x_ql_0 >> (2*l)) & 0x03030303;
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++            x_qs[i*MMQ_MMA_TILE_X_K_Q2_K + k] = x_qs_k;
++#else
++            x_qs[i*(2*MMQ_TILE_NE_K + 1) + k] = x_qs_k;
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++        }
++
++        // TQ2_0 = Q2_K with every sub-block scale and min 1: (d, dmin) = (d, d), y = d q - d
++        const half2 x_dm_ik = make_half2(bxi->d, bxi->d);
++
++#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++        x_dm[i*MMQ_MMA_TILE_X_K_Q2_K + kqsx] = x_dm_ik;
++#else
++        x_dm[i*(MMQ_TILE_NE_K + 1)   + kqsx] = x_dm_ik;
++#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
++    }
++}
++
+ template <int mmq_x, int mmq_y>
+ static __device__ __forceinline__ void vec_dot_q2_K_q8_1_dp4a(
+     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+@@ -3347,6 +3403,14 @@ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q2_K> {
+     static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q2_K_q8_1_dp4a<mmq_x, mmq_y>;
+ };
+ 
++template <int mmq_x, int mmq_y, bool need_check>
++struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_TQ2_0> {
++    static constexpr int              vdr          = VDR_Q2_K_Q8_1_MMQ;
++    static constexpr load_tiles_mmq_t load_tiles   = load_tiles_tq2_0<mmq_y, need_check>;
++    static constexpr vec_dot_mmq_t    vec_dot_mma  = vec_dot_q2_K_q8_1_mma<mmq_x, mmq_y>;
++    static constexpr vec_dot_mmq_t    vec_dot_dp4a = vec_dot_q2_K_q8_1_dp4a<mmq_x, mmq_y>;
++};
++
+ template <int mmq_x, int mmq_y, bool need_check>
+ struct mmq_type_traits<mmq_x, mmq_y, need_check, GGML_TYPE_Q3_K> {
+     static constexpr int              vdr          = VDR_Q3_K_Q8_1_MMQ;
+@@ -4148,6 +4212,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
+ extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
+ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
++extern DECL_MMQ_CASE(GGML_TYPE_TQ2_0);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);
+ extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index b59228b57..24b5da367 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -18,6 +18,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
+         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
++        case GGML_TYPE_TQ1_0:   return vec_dot_tq1_0_q8_1;
+         case GGML_TYPE_TQ2_0:   return vec_dot_tq2_0_q8_1;
+         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
+@@ -47,6 +48,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
++        case GGML_TYPE_TQ1_0:   return VDR_TQ1_0_Q8_1_MMVQ;
+         case GGML_TYPE_TQ2_0:   return VDR_TQ2_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
+         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
+@@ -1038,6 +1040,12 @@ static void mul_mat_vec_q_switch_type(
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
++        case GGML_TYPE_TQ1_0:
++            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_TQ1_0>
++                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            break;
+         case GGML_TYPE_TQ2_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_TQ2_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+diff --git a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+index af05a9eff..4a3eafa12 100755
+--- a/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
++++ b/ggml/src/ggml-cuda/template-instances/generate_cu_files.py
+@@ -37,7 +37,7 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v},
+ TYPES_MMQ = [
+     "GGML_TYPE_Q1_0",
+     "GGML_TYPE_Q4_0", "GGML_TYPE_Q4_1", "GGML_TYPE_Q5_0", "GGML_TYPE_Q5_1", "GGML_TYPE_Q8_0",
+-    "GGML_TYPE_Q2_K", "GGML_TYPE_Q3_K", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K",
++    "GGML_TYPE_Q2_K", "GGML_TYPE_TQ2_0", "GGML_TYPE_Q3_K", "GGML_TYPE_Q4_K", "GGML_TYPE_Q5_K", "GGML_TYPE_Q6_K",
+     "GGML_TYPE_IQ2_XXS", "GGML_TYPE_IQ2_XS", "GGML_TYPE_IQ2_S", "GGML_TYPE_IQ3_XXS", "GGML_TYPE_IQ3_S",
+     "GGML_TYPE_IQ1_S", "GGML_TYPE_IQ4_NL", "GGML_TYPE_IQ4_XS", "GGML_TYPE_MXFP4", "GGML_TYPE_NVFP4"
+ ]
+diff --git a/ggml/src/ggml-cuda/template-instances/mmq-instance-tq2_0.cu b/ggml/src/ggml-cuda/template-instances/mmq-instance-tq2_0.cu
+new file mode 100644
+index 000000000..2780a4d47
+--- /dev/null
++++ b/ggml/src/ggml-cuda/template-instances/mmq-instance-tq2_0.cu
+@@ -0,0 +1,5 @@
++// This file has been autogenerated by generate_cu_files.py, do not edit manually.
++
++#include "../mmq.cuh"
++
++DECL_MMQ_CASE(GGML_TYPE_TQ2_0);
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 2a8786951..dd85c1565 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -856,6 +856,42 @@ static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
+     return __half2float(bq->d) * sumf;
+ }
+ 
++// TQ1_0: five base-3 digits per byte (qh: four), digit n of byte b = ((b * 3^n mod 256) * 3) >> 8, in {0, 1, 2}.
++// Element order: qs[0..31] digit n -> elements 32n + byte (q8_1 blocks 0..4); qs[32..47] digit n -> 160 + 16n + byte
++// (half blocks of 5..7); qh[0..3] digit n -> 240 + 4n + byte (the second half of block 7). One int of codes per
++// thread, iqs 0..12 (iqs 13..15 idle).
++#define VDR_TQ1_0_Q8_1_MMVQ 1
++
++// digit n (p = 3^n) of the 4 bytes of v, two bytes per 16-bit lane (b * 81 < 2^16: no carry between lanes)
++static __device__ __forceinline__ int tq1_0_digit4(const int v, const uint32_t p) {
++    const uint32_t e = (( (uint32_t) v       & 0x00FF00FF) * p) & 0x00FF00FF;
++    const uint32_t o = ((((uint32_t) v >> 8) & 0x00FF00FF) * p) & 0x00FF00FF;
++    return (int) ((((e * 3) >> 8) & 0x00030003) | ((((o * 3) >> 8) & 0x00030003) << 8));
++}
++
++static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    if (iqs >= 13) {
++        return 0.0f;
++    }
++    const block_tq1_0 * bq = (const block_tq1_0 *) vbq + kbx;
++    const int v = get_int_b2(bq->qs, iqs);          // iqs 12: qh, which follows qs
++
++    // the q8_1 block and int of digit n, without branches (a warp holds all three cases)
++    const bool lo = iqs < 8, hi = iqs == 12;
++    float sumf = 0.0f;
++    uint32_t p = 1;
++#pragma unroll
++    for (int n = 0; n < 5; ++n, p *= 3) {
++        const int blk = lo ? n : (hi ? 7 : 5 + n/2);
++        const int idx = lo ? iqs : (hi ? 4 + n : (n % 2)*4 + iqs - 8);
++        const int u   = (hi && n == 4) ? 0 : get_int_b4(bq8_1[blk].qs, idx);
++        sumf += __low2float(bq8_1[blk].ds) * (ggml_cuda_dp4a(tq1_0_digit4(v, p), u, 0) - ggml_cuda_dp4a(0x01010101, u, 0));
++    }
++    return __half2float(bq->d) * sumf;
++}
++
+ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+-- 
+2.55.0
+
