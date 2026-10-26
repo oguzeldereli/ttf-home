@@ -211,6 +211,17 @@ class TTFCheckpoint:
         left = [k for k in self.floats if k.endswith((".codes", ".m.lo", ".m.s"))]
         assert not left, f"unknown int-k tensors {left[:3]}"
 
+    def width(self, b):
+        """K of sub-layer b: from its column scale / input mean, else the multiple of 8 among the widths its packed
+        rows (5 trits per byte) can hold"""
+        p = self.parts[b]
+        if "col_scale" in p or "in_mean" in p:
+            return (p["col_scale"] if "col_scale" in p else p["in_mean"]).shape[0]
+        B = p["wpacked"].shape[1]
+        K = [k for k in range(5 * B - 4, 5 * B + 1) if k % 8 == 0]
+        assert len(K) == 1, f"{b}: width unknown ({B} packed bytes per row, no col_scale / in_mean)"
+        return K[0]
+
     def part(self, b, K):
         """sub-layer b -> (T int8 [N, K], s = r * beta fp32 [N], c [K] | None, mu [K] | None, bias [N] | None)"""
         p = self.parts[b]
@@ -398,9 +409,8 @@ def _make_class(base, ck, wq, eq, hq, log):
                 hname = item[0]
                 bid = next((int(p) for p in hname.split(".") if p.isdecimal()), None)
                 p = ck.parts[sub["main"]]
-                assert "col_scale" in p or "in_mean" in p, f"{hb}: K unknown (no col_scale / in_mean)"
                 N = p["wpacked"].shape[0]
-                K = (p["col_scale"] if "col_scale" in p else p["in_mean"]).shape[0]
+                K = ck.width(sub["main"])
                 T, s, c, mu, b = ck.part(sub["main"], K)
                 mag = ck.mag(sub["main"])
                 if hb in ck.out_scale:              # the query temperature: the whole output scales
