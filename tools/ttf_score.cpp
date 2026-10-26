@@ -1,7 +1,7 @@
 // ttf_score: next-token NLL of a GGUF model on raw token ids (uint32, the trainer's .bin format), in chunks of
 // CTX tokens, each scored on positions [FIRST, CTX-1) (the llama-perplexity protocol when FIRST = CTX/2), with no
 // re-tokenization. Prints the mean NLL and writes one float per scored token to OUT (optional).
-//   ttf_score MODEL.gguf TOKENS.bin [-c 512] [-n chunks] [-f first] [-ngl 99] [-t threads] [-o out.f32] [-u16]
+//   ttf_score MODEL.gguf TOKENS.bin [-c 512] [-n chunks] [-f first] [-ngl 99] [-t threads] [-o out.f32] [-u16] [-ub 1]
 #include "llama.h"
 
 #include <cmath>
@@ -18,7 +18,7 @@ int main(int argc, char ** argv) {
     }
     const char * model_path = argv[1];
     const char * tok_path   = argv[2];
-    int ctx = 512, n_chunks = 10, first = -1, ngl = 0, threads = 8;
+    int ctx = 512, n_chunks = 10, first = -1, ngl = 0, threads = 8, ub = 0;
     const char * out_path = nullptr;
     bool u16 = false;   // -u16: uint16 token ids (the 32k-vocab data files)
     for (int i = 3; i < argc; i += 2) {
@@ -29,6 +29,7 @@ int main(int argc, char ** argv) {
         else if (a == "-f")   first    = atoi(argv[i + 1]);
         else if (a == "-ngl") ngl      = atoi(argv[i + 1]);
         else if (a == "-t")   threads  = atoi(argv[i + 1]);
+        else if (a == "-ub")  ub       = atoi(argv[i + 1]);
         else if (a == "-o")   out_path = argv[i + 1];
         else if (a == "-u16") { u16 = true; --i; }
     }
@@ -54,7 +55,7 @@ int main(int argc, char ** argv) {
     llama_model * model = llama_model_load_from_file(model_path, mp);
     if (!model) { fprintf(stderr, "failed to load %s\n", model_path); return 1; }
     auto cp = llama_context_default_params();
-    cp.n_ctx = ctx; cp.n_batch = ctx; cp.n_ubatch = ctx; cp.n_threads = threads; cp.n_threads_batch = threads;
+    cp.n_ctx = ctx; cp.n_batch = ctx; cp.n_ubatch = ub > 0 ? ub : ctx;   // -ub 1: the decode (matrix-vector) path cp.n_threads = threads; cp.n_threads_batch = threads;
     llama_context * lctx = llama_init_from_model(model, cp);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 

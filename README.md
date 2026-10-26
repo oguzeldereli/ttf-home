@@ -11,8 +11,8 @@ Inference uses llama.cpp with two small patches (`llama.cpp/`), so a TTF model i
 
 | model | file | GPU decode | GPU prefill | CPU decode (8 threads) |
 |---|---|---|---|---|
-| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 20.3 tok/s | 438 tok/s | - |
-| Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 212 tok/s | 9.6k tok/s | 49 tok/s |
+| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 23.3 tok/s | 440 tok/s | - |
+| Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 256 tok/s | 9.9k tok/s | 49 tok/s |
 | Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
 
 The 27B model fits entirely on the 12 GB card, with a 17k-token context.
@@ -83,5 +83,5 @@ Converting 0.8B models needs about 12 GB. A 27B conversion needs a 48 to 96 GB c
 - **Ternary adapters** are stored as `.ttf_d*` and `.ttf_u*`.
 - The patched llama.cpp applies all of these inside `build_lora_mm`, so every architecture llama.cpp supports gets
   them without per-model code.
-- **CUDA**: patch 0002 adds a dp4a matrix-vector kernel for `TQ2_0`. Without it, `TQ2_0` decode falls back to the
+- **CUDA**: patch 0002 adds a dp4a matrix-vector kernel for `TQ2_0`; patch 0003 fuses the side tensors into it for decode (bit-identical, +10-20% tok/s). Without 0002, `TQ2_0` decode falls back to the
   CPU.

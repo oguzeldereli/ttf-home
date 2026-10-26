@@ -1,0 +1,184 @@
+From 950402bc328cb2e0ca42f25fd0f37c637a344316 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 04:28:25 +0000
+Subject: [PATCH 3/3] CUDA: fuse the TTF input scale and shift into the mmvq
+ activation quantiser, the bias into its epilogue
+
+x*c (+m) -> mul_mat (+b) runs as one matrix-vector product for decode: removes ~2400 small kernels per token on a
+27B TTF model (21.2 -> 23.3 tok/s, 0.8B 212 -> 256 tok/s on an RTX 4080 Laptop). Bit-identical to the unfused path.
+---
+ ggml/src/ggml-cuda/common.cuh   |  2 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 51 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      |  8 +++++-
+ ggml/src/ggml-cuda/quantize.cu  | 29 +++++++++++++++++--
+ ggml/src/ggml-cuda/quantize.cuh |  6 ++++
+ 5 files changed, 92 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 778c5d337..5841bcee5 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1510,6 +1510,8 @@ struct ggml_backend_cuda_context {
+ 
+ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_bias = nullptr;
++    const ggml_tensor * y_scale = nullptr;   // TTF: src1 * y_scale + y_shift per input channel, in the quantiser
++    const ggml_tensor * y_shift = nullptr;
+     const ggml_tensor * gate = nullptr;
+     const ggml_tensor * gate_bias = nullptr;
+     ggml_glu_op glu_op;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7679337d3..13e2ed2fb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3967,6 +3967,57 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // TTF: a per-input-channel scale (and shift) feeding a quantized matrix-vector product, x*c (+m) -> mul_mat
++    // (+b): the scale and shift go into the activation quantiser, the bias into the product's epilogue
++    if (node->op == GGML_OP_MUL && node->src[0]->type == GGML_TYPE_F32) {
++        // (ggml_can_fuse wants equal shapes along the chain, which a product never has)
++        auto chain = [&](std::initializer_list<ggml_op> ops) {
++            int j = 0;
++            for (ggml_op op : ops) {
++                if (i + j >= cgraph->n_nodes || cgraph->nodes[i + j]->op != op ||
++                    (cgraph->nodes[i + j]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
++                    (j + 1 < (int) ops.size() && !ggml_node_has_n_uses(cgraph, i + j, 1))) {
++                    return false;
++                }
++                j++;
++            }
++            return true;
++        };
++        const bool shift = chain({ GGML_OP_MUL, GGML_OP_ADD, GGML_OP_MUL_MAT });
++        if (shift || chain({ GGML_OP_MUL, GGML_OP_MUL_MAT })) {
++            const int           k   = shift ? 2 : 1;
++            ggml_tensor       * mm  = cgraph->nodes[i + k];
++            const ggml_tensor * add = shift ? cgraph->nodes[i + 1] : nullptr;
++            const ggml_tensor * x   = node->src[0];
++            const ggml_tensor * c   = node->src[1];
++            const ggml_tensor * m   = add ? (add->src[0] == node ? add->src[1] : add->src[0]) : nullptr;
++            auto chan_vec = [&](const ggml_tensor * v) {
++                return v->type == GGML_TYPE_F32 && v->ne[0] == x->ne[0] && ggml_nelements(v) == v->ne[0] &&
++                       ggml_is_contiguous(v);
++            };
++            const bool ok = mm->src[1] == cgraph->nodes[i + k - 1] && chan_vec(c) && ggml_are_same_shape(x, node) &&
++                            (!add || ((add->src[0] == node || add->src[1] == node) && chan_vec(m))) &&
++                            ggml_cuda_should_fuse_mul_mat_vec_q(mm);
++            if (ok) {
++                ggml_cuda_mm_fusion_args_host fusion_data{};
++                fusion_data.y_scale = c;
++                fusion_data.y_shift = m;
++                ggml_tensor * dst = mm;
++                int n = k + 1;
++                if (ggml_can_fuse(cgraph, i + k, { GGML_OP_MUL_MAT, GGML_OP_ADD })) {
++                    ggml_tensor * b = cgraph->nodes[i + k + 1];
++                    if (b->src[0] == mm && ggml_are_same_shape(b->src[0], b->src[1])) {
++                        fusion_data.x_bias = b->src[1];
++                        dst = b;
++                        n++;
++                    }
++                }
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], x, nullptr, dst, &fusion_data);
++                return n - 1;
++            }
++        }
++    }
++
+     // multi-(add or mul)
+     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+         int     n_fuse = 0;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 1b4033d86..b59228b57 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1196,7 +1196,13 @@ void ggml_cuda_mul_mat_vec_q(
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        if (fusion && fusion->y_scale) {
++            quantize_row_q8_1_scaled_cuda(src1_d, (const float *) fusion->y_scale->data,
++                fusion->y_shift ? (const float *) fusion->y_shift->data : nullptr, src1_q8_1.get(),
++                ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        } else {
++            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index 39a500a17..7e4b2ae39 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -5,7 +5,8 @@ __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
+ static __global__ void quantize_q8_1(
+         const float * x_ptr, void * vy_ptr,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+-        const int64_t ne0, const uint32_t ne1, const uint3 ne2) {
++        const int64_t ne0, const uint32_t ne1, const uint3 ne2,
++        const float * y_scale = nullptr, const float * y_shift = nullptr) {
+     ggml_cuda_pdl_lc();
+     const float * GGML_CUDA_RESTRICT x  = x_ptr;
+     void        * GGML_CUDA_RESTRICT vy = vy_ptr;
+@@ -32,7 +33,13 @@ static __global__ void quantize_q8_1(
+     const int64_t iqs = i_cont % QK8_1; // quant index
+ 
+     ggml_cuda_pdl_sync();
+-    const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
++    float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
++    if (y_scale && i0 < ne00) {
++        xi *= y_scale[i00];
++        if (y_shift) {
++            xi += y_shift[i00];
++        }
++    }
+     float amax = fabsf(xi);
+     float sum = xi;
+ 
+@@ -385,10 +392,26 @@ void quantize_row_q8_1_cuda(
+     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
+     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
+-    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
++    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv,
++                            (const float *) nullptr, (const float *) nullptr);
+     GGML_UNUSED(type_src0);
+ }
+ 
++void quantize_row_q8_1_scaled_cuda(
++        const float * x, const float * y_scale, const float * y_shift, void * vy,
++        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
++    GGML_ASSERT(ne0 % QK8_1 == 0);
++
++    const uint3 ne2_fastdiv = init_fastdiv_values(ne2);
++
++    const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
++    const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
++    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
++    ggml_cuda_kernel_launch(quantize_q8_1, launch_params, x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv, y_scale, y_shift);
++}
++
+ void quantize_mmq_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+diff --git a/ggml/src/ggml-cuda/quantize.cuh b/ggml/src/ggml-cuda/quantize.cuh
+index 768a3ae6d..9df3d67e0 100644
+--- a/ggml/src/ggml-cuda/quantize.cuh
++++ b/ggml/src/ggml-cuda/quantize.cuh
+@@ -39,3 +39,9 @@ void quantize_mmq_fp4_cuda(const float *   x,
+                              int64_t         ne2,
+                              int64_t         ne3,
+                              cudaStream_t    stream);
++
++// q8_1 of src1 * y_scale + y_shift (per input channel; y_shift may be null): the TTF input scale and centring
++void quantize_row_q8_1_scaled_cuda(
++        const float * x, const float * y_scale, const float * y_shift, void * vy,
++        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream);
+-- 
+2.55.0
+
