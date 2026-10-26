@@ -1,7 +1,7 @@
 From d99e111ae3a17a1598e16f5cd5df141b8a43c4aa Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 05:23:29 +0000
-Subject: [PATCH 7/7] CUDA: the TTF scale / shift fusion for batched products
+Subject: [PATCH 7/8] CUDA: the TTF scale / shift fusion for batched products
  too (in MMQ's activation quantiser)
 
 27B TTF prefill (pp512) 630 -> 691 tok/s; bit-identical NLL (0.8B 2.589127).

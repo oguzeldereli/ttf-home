@@ -1,0 +1,28 @@
+From 0bc43f5a163c1158f9414a266e037447973edce5 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 06:05:04 +0000
+Subject: [PATCH 8/8] CUDA: TQ1_0 / TQ2_0 mmvq one warp per row at every K
+
+No cross-warp reduction for the ternary types at batch 1: 27B decode TQ2_0 23.2 -> 25.6 tok/s, TQ1_0 17.0 -> 18.2 on an RTX 4080 laptop; neutral at 0.8B. Results unchanged.
+---
+ ggml/src/ggml-cuda/mmvq.cu | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 24b5da367..756a0c39a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -848,6 +848,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
+         bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
++        // TQ1_0 / TQ2_0: one warp per row at every K (no cross-warp reduction): +12% / +7% decode at 27B, neutral at 0.8B
++        if ((type == GGML_TYPE_TQ2_0 || type == GGML_TYPE_TQ1_0) && c_ncols_dst == 1 && nwarps > 1) {
++            use = true;
++        }
+ 
+         constexpr std::array<ggml_type, 2> iq_slow_turing = {
+             GGML_TYPE_IQ3_XXS,
+-- 
+2.55.0
+
