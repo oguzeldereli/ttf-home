@@ -93,3 +93,8 @@ Converting 0.8B models needs about 12 GB. A 27B conversion needs a 48 to 96 GB c
 - **CUDA** (patches 0002-0010): matrix-vector kernels for `TQ2_0` and `TQ1_0`, prefill for both through the Q8_0 MMQ kernels, and
   the side tensors fused into the activation quantiser of both (bit-identical; +10-20% tok/s), and one warp per row and two ints per thread at batch 1 (+16% at 27B). `test-backend-ops`: 22 / 22
   `TQ1_0` / `TQ2_0` matrix products match the CPU. `TQ2_0` is the fastest; `TQ1_0` is 15% smaller and 31% slower.
+
+## Licence
+
+[PolyForm Noncommercial 1.0.0](LICENSE.md): free for personal, research and other noncommercial use; commercial use
+needs a separate licence. llama.cpp itself is MIT-licensed; the patches in `llama.cpp/` modify it.

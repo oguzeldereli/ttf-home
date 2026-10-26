@@ -7,6 +7,7 @@ name = "ttf-home"
 version = "0.1.0.dev0"
 description = "Train, convert, fine-tune and run ternary (TTF) language models on a home computer"
 readme = "README.md"
+license = {file = "LICENSE.md"}   # PolyForm Noncommercial 1.0.0
 authors = [{name = "Özgür Güzeldereli"}]
 requires-python = ">=3.11"
 dependencies = ["ttf-ternary", "numpy", "tokenizers", "gguf"]
