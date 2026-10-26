@@ -41,7 +41,9 @@ WTYPES = {"tq2_0": QT.TQ2_0, "tq1_0": QT.TQ1_0, "q2_k": QT.Q2_K}
 FTYPES = {"tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0, "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
           "q2_k": gguf.LlamaFileType.MOSTLY_Q2_K}
 FTYPES_EMB = {"f32": QT.F32, "f16": QT.F16, "bf16": QT.BF16, "q8_0": QT.Q8_0, "q6_k": QT.Q6_K, "q5_k": QT.Q5_K,
-              "q4_k": QT.Q4_K}
+              "q4_k": QT.Q4_K, "q4_1": QT.Q4_1}
+# int-k embedding / head: Q4_1 from the codes (exact), else the float W through the type asked for
+INTK_GGUF = {"token_embd.weight": "model.embed_tokens.weight", "output.weight": "lm_head.weight"}
 QK = 256
 
 
@@ -122,6 +124,20 @@ def ggml_quantize(w: np.ndarray, qtype) -> np.ndarray:
     return out
 
 
+def pack_q4_1_intk(codes: torch.Tensor, lo: torch.Tensor, sc: torch.Tensor) -> np.ndarray:
+    """int-k codes q [N, K] (< 16) with W = lo + s q per group of g >= 32 ([N, K / g] each) -> Q4_1 blocks (d = s,
+    m = lo, the codes as they are): exact up to the fp16 rounding of s and lo"""
+    N, K = codes.shape
+    g = K // lo.shape[1]
+    assert g % 32 == 0 and int(codes.max()) < 16, (g, int(codes.max()))
+    q = codes.to(torch.uint8).numpy().reshape(N * K // 32, 32)
+    rep = g // 32
+    d = sc.float().numpy().astype(np.float16).repeat(rep, axis=1).reshape(-1, 1)
+    m = lo.float().numpy().astype(np.float16).repeat(rep, axis=1).reshape(-1, 1)
+    qs = (q[:, :16] | (q[:, 16:] << 4)).astype(np.uint8)
+    return np.concatenate([d.view(np.uint8), m.view(np.uint8), qs], axis=1).reshape(N, -1)
+
+
 # ---------------------------------------------------------------------------------------------- the checkpoint
 
 class TTFCheckpoint:
@@ -151,7 +167,7 @@ class TTFCheckpoint:
         sd = {k[3:]: v for k, v in sd.items() if k.startswith("hf.")} or dict(sd)
         # a model trained from scratch (ttf.model.BitTransformer, Meta layout): HF Llama names; its per-head query
         # temperature exp(s_h) (--qk-temp) goes into the query rows' scale
-        self.scratch = "tok_emb.weight" in sd
+        self.scratch = "tok_emb.weight" in sd or "tok_emb.m.codes" in sd
         self.out_scale = {}
         if self.scratch:
             if any(".experts." in k for k in sd):
@@ -181,9 +197,19 @@ class TTFCheckpoint:
             else:
                 self.linears.setdefault(m.group(1), {})[{"lin": "main", "ad.0": "d", "ad.1": "u"}[m.group(2)]] = b
         self.floats = {k: v for k, v in sd.items() if k not in used and not k.endswith("frozen_scale")}
-        intk = [k for k in self.floats if "intk" in k or k.endswith((".codes", ".lo", ".s"))]
-        if intk:
-            raise NotImplementedError(f"int-k embedding / head tensors ({intk[:3]} ...): dequantize first")
+        # int-k embedding / head (--intk-emb): W = lo + s q per group; the float W for the converter, the codes for
+        # an exact Q4_1 export
+        self.intk = {}
+        for b in ("model.embed_tokens", "lm_head"):
+            if f"{b}.m.codes" in self.floats:
+                q, lo, sc = (self.floats.pop(f"{b}.m.{n}") for n in ("codes", "lo", "s"))
+                N, K = q.shape
+                g = K // lo.shape[1]
+                self.floats[f"{b}.weight"] = (lo.float()[..., None] + sc.float()[..., None]
+                                              * q.float().reshape(N, K // g, g)).reshape(N, K)
+                self.intk[f"{b}.weight"] = (q, lo, sc)
+        left = [k for k in self.floats if k.endswith((".codes", ".m.lo", ".m.s"))]
+        assert not left, f"unknown int-k tensors {left[:3]}"
 
     def part(self, b, K):
         """sub-layer b -> (T int8 [N, K], s = r * beta fp32 [N], c [K] | None, mu [K] | None, bias [N] | None)"""
@@ -211,6 +237,10 @@ _SCRATCH = {"attn.wq": "self_attn.q_proj", "attn.wk": "self_attn.k_proj", "attn.
 def _scratch_name(k):
     if k == "tok_emb.weight":
         return "model.embed_tokens.weight"
+    if k.startswith("tok_emb.m."):                   # int-k codes
+        return "model.embed_tokens" + k[len("tok_emb"):]
+    if k.startswith("lm_head.m."):
+        return k
     if k == "norm.weight":
         return "model.norm.weight"
     if k == "lm_head.weight":
@@ -255,10 +285,13 @@ LLAMA2_TOKENIZER = "~/.cache/huggingface/hub/models--hf-internal-testing--llama-
                    "d02ad6cb9dd2c2296a6332199fa2fdca5938fef0"
 
 
-def export(ckpt, hf_dir, out, wtype="tq2_0", emb="q6_k", head="q6_k", log=print):
+def export(ckpt, hf_dir, out, wtype="tq2_0", emb=None, head=None, log=print):
     """hf_dir: the base model's config and tokenizer (conversions), or for a model trained from scratch the
     tokenizer's directory (default: the Llama-2 32k tokenizer the data scripts use)"""
     ck = TTFCheckpoint(ckpt)
+    # default: int-k codes exactly (Q4_1), a float matrix as Q6_K
+    emb = emb or ("q4_1" if "model.embed_tokens.weight" in ck.intk else "q6_k")
+    head = head or ("q4_1" if "lm_head.weight" in ck.intk else "q6_k")
     hf_dir = Path(hf_dir or LLAMA2_TOKENIZER).expanduser()
     tmp = Path(tempfile.mkdtemp(prefix="ttfgguf_"))
     try:
@@ -304,6 +337,14 @@ def _make_class(base, ck, wq, eq, hq, log):
 
             def add_tensor(name, tensor, raw_shape=None, raw_dtype=None, **kw):
                 qt = {"token_embd.weight": eq, "output.weight": hq}.get(name)
+                ik = ck.intk.get(INTK_GGUF.get(name, ""))
+                if ik is not None and qt == QT.Q4_1:
+                    W = ck.floats[INTK_GGUF[name]]
+                    rows = slice(None, None, max(1, W.shape[0] // 64))     # the converter passed W through as is
+                    assert tuple(tensor.shape) == tuple(W.shape) and np.allclose(tensor[rows], W[rows].numpy(), atol=1e-6), \
+                        f"{name}: the converter changed the int-k matrix; export it with --emb / --head q6_k"
+                    log(f"{name}: int-k codes as Q4_1 (exact)")
+                    return add(name, pack_q4_1_intk(*ik), raw_shape=raw_shape, raw_dtype=QT.Q4_1, **kw)
                 if qt is not None and qt != QT.F32 and tensor.dtype == np.float32:
                     if tensor.shape[-1] % QK and qt not in (QT.F16, QT.BF16, QT.Q8_0):
                         qt = QT.Q8_0 if tensor.shape[-1] % 32 == 0 else QT.F16     # K-quants need rows of 256
@@ -424,8 +465,8 @@ def main():
     ap.add_argument("ckpt"); ap.add_argument("hf_dir", help="base model dir (config + tokenizer), or '-' for a "
                     "scratch model with the Llama-2 tokenizer"); ap.add_argument("out")
     ap.add_argument("--wtype", default="tq2_0", choices=sorted(WTYPES))
-    ap.add_argument("--emb", default="q6_k", choices=sorted(FTYPES_EMB))
-    ap.add_argument("--head", default="q6_k", choices=sorted(FTYPES_EMB))
+    ap.add_argument("--emb", default=None, choices=sorted(FTYPES_EMB), help="default: q4_1 for int-k codes (exact), else q6_k")
+    ap.add_argument("--head", default=None, choices=sorted(FTYPES_EMB))
     a = ap.parse_args()
     with torch.inference_mode():
         export(a.ckpt, None if a.hf_dir == "-" else a.hf_dir, a.out, a.wtype, a.emb, a.head)

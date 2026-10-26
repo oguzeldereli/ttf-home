@@ -11,7 +11,7 @@ Inference uses llama.cpp with two small patches (`llama.cpp/`), so a TTF model i
 
 | model | file | GPU decode | GPU prefill | CPU decode (8 threads) |
 |---|---|---|---|---|
-| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 23.3 tok/s | 690 tok/s | - |
+| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 23.3 tok/s | 690 tok/s | 3.0 tok/s |
 | same, `--wtype tq1_0` (1.69 bits) | 7.9 GiB | 16.8 tok/s | 510 tok/s | - |
 | Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 256 tok/s | 12.9k tok/s | 49 tok/s |
 | Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
@@ -77,6 +77,8 @@ Converting 0.8B models needs about 12 GB. A 27B conversion needs a 48 to 96 GB c
 - **Ternary matrices** are stored as `TQ2_0` (2.06 bits per weight, the default), `TQ1_0` (1.69 bits) or `Q2_K`.
   All three hold {-1, 0, +1}·d exactly, with the row scale folded into d.
   - Matrices whose width is not a multiple of 256 fall back to `Q8_0`, which is also exact.
+- **Embedding and head**: K-quants (Q6_K by default; a Q4_K embedding costs nothing measurable, a Q4_K head +0.011
+  NLL at 0.8B). Int-k codes (`--intk-emb`) export exactly as Q4_1 (d = s, m = lo, the codes as they are).
 - **TTF side tensors**, as F32 vectors per linear layer:
   - `<weight>.ttf_c`: input scale;
   - `.ttf_m`: centring, stored as -c·mu;

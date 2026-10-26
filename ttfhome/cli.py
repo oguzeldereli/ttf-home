@@ -384,7 +384,8 @@ def main(argv=None):
     p = sp.add_parser("export"); p.add_argument("ckpt"); p.add_argument("out")
     p.add_argument("--base", default=None, help="the base model's dir for a conversion (config + tokenizer)")
     p.add_argument("--wtype", default="tq2_0", choices=["tq2_0", "tq1_0", "q2_k"])
-    p.add_argument("--emb", default="q6_k"); p.add_argument("--head", default="q6_k")
+    p.add_argument("--emb", default=None, help="q6_k (float) / q4_1 (int-k codes, exact: the default for them) / q4_k ...")
+    p.add_argument("--head", default=None)
     for c in ("chat", "bench"):
         p = sp.add_parser(c); p.add_argument("model")
     p = sp.add_parser("generate"); p.add_argument("model"); p.add_argument("prompt"); p.add_argument("-n", default="128")
