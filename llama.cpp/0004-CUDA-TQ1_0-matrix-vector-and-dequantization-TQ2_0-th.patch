@@ -1,7 +1,7 @@
 From bb66cb5dce2d1b1ebbe090ba4f94035ec6c18347 Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 05:00:30 +0000
-Subject: [PATCH 4/9] CUDA: TQ1_0 matrix-vector and dequantization; TQ2_0
+Subject: [PATCH 04/10] CUDA: TQ1_0 matrix-vector and dequantization; TQ2_0
  through MMQ (the Q2_K kernels with unit sub-block scales)
 
 TQ1_0: one int of base-3 codes per thread, branch-free across the three code regions, two bytes per 16-bit lane;

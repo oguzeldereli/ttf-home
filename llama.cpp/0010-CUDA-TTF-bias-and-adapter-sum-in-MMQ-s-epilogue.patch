@@ -1,0 +1,292 @@
+From 3e00ffcef1133164b243be66b0e71f4a312753df Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 06:46:17 +0000
+Subject: [PATCH 10/10] CUDA: TTF bias and adapter sum in MMQ's epilogue
+
+The graph computes the adapter before the main product (ggml_add(u, main)), so the batched product can add the
+bias row vector and the adapter output where each tile is written once (the stream-k fixup adds the earlier
+partials after). 27B prefill 682 -> 708 tok/s on an RTX 4080 laptop. Not bit-identical (fp32 add order); the
+NLL moves within its noise (27B ladder 2.409259 -> 2.409343; CPU unchanged).
+---
+ ggml/src/ggml-cuda/common.cuh   |  1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu | 30 ++++++++++++++++--
+ ggml/src/ggml-cuda/mmq.cu       | 10 ++++--
+ ggml/src/ggml-cuda/mmq.cuh      | 55 ++++++++++++++++++++++++---------
+ src/llama-graph.cpp             |  3 +-
+ 5 files changed, 78 insertions(+), 21 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 18fc12f5d..a78c0c390 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1519,6 +1519,7 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_bias = nullptr;
+     const ggml_tensor * y_scale = nullptr;   // TTF: src1 * y_scale + y_shift per input channel, in the quantiser
+     const ggml_tensor * y_shift = nullptr;
++    const ggml_tensor * x_add = nullptr;     // TTF: a tensor of dst's layout added in MMQ's epilogue (x_bias: a row vector there)
+     const ggml_tensor * gate = nullptr;
+     const ggml_tensor * gate_bias = nullptr;
+     ggml_glu_op glu_op;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index dcbac7bc7..10f8c0d9f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4014,8 +4014,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.y_scale = c;
+                 fusion_data.y_shift = m;
+-                ggml_cuda_mul_mat_q(*cuda_ctx, w, x, nullptr, mm, &fusion_data);
+-                return k;
++                // and the epilogue: + b (a row vector), then + u (dst's layout: the adapter's output, computed earlier,
++                // since the graph puts it first), as long as each intermediate has no other use
++                ggml_tensor * dst = mm;
++                int n = k;
++                auto next_add = [&](const ggml_tensor * prev) -> const ggml_tensor * {
++                    if (i + n + 1 >= cgraph->n_nodes || !ggml_node_has_n_uses(cgraph, i + n, 1)) {
++                        return nullptr;
++                    }
++                    const ggml_tensor * a = cgraph->nodes[i + n + 1];
++                    if (a->op != GGML_OP_ADD || (a->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || a->type != GGML_TYPE_F32 ||
++                        !ggml_are_same_shape(a, prev)) {
++                        return nullptr;
++                    }
++                    return a->src[0] == prev ? a->src[1] : (a->src[1] == prev ? a->src[0] : nullptr);
++                };
++                const bool plain = ggml_is_contiguous(mm) && mm->ne[2] == 1 && mm->ne[3] == 1;
++                const ggml_tensor * o = plain ? next_add(dst) : nullptr;
++                if (o && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_nelements(o) == mm->ne[0]) {
++                    fusion_data.x_bias = o;
++                    dst = cgraph->nodes[i + ++n];
++                    o = next_add(dst);
++                }
++                if (o && o->type == GGML_TYPE_F32 && ggml_is_contiguous(o) && ggml_are_same_shape(o, mm)) {
++                    fusion_data.x_add = o;
++                    dst = cgraph->nodes[i + ++n];
++                }
++                ggml_cuda_mul_mat_q(*cuda_ctx, w, x, nullptr, dst, &fusion_data);   // writes dst = the last add
++                return n;
+             }
+             if (ok) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 4da9efbe5..0e634aeea 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -83,7 +83,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+ void ggml_cuda_mul_mat_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+-    GGML_ASSERT(!fusion || (!ids && fusion->y_scale && !fusion->x_bias && !fusion->gate));
++    GGML_ASSERT(!fusion || (!ids && !fusion->gate));     // TTF: input scale / shift, bias vector, addend
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -146,7 +146,7 @@ void ggml_cuda_mul_mat_q(
+                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                         ne11, ne12, ne13, stream);
+ 
+-            } else if (fusion) {
++            } else if (fusion && fusion->y_scale) {
+                 quantize_mmq_q8_1_scaled_cuda(src1_d, (const float *) fusion->y_scale->data,
+                     fusion->y_shift ? (const float *) fusion->y_shift->data : nullptr, src1_q8_1.get(), src0->type,
+                     ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+@@ -163,12 +163,16 @@ void ggml_cuda_mul_mat_q(
+                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+         const int64_t s13 = ne12*s12;
+ 
+-        const mmq_args args = {
++        mmq_args args = {
+             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+             ne00, ne01, ne1, s01, ne11, s1,
+             ne02, ne12, s02, s12, s2,
+             ne03, ne13, s03, s13, s3,
+             use_stream_k, ne1};
++        if (fusion) {
++            args.ep.bias = fusion->x_bias ? (const float *) fusion->x_bias->data : nullptr;
++            args.ep.add  = fusion->x_add  ? (const float *) fusion->x_add->data  : nullptr;
++        }
+         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+         return;
+     }
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index c77247498..9ff5799ca 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -17,7 +17,15 @@ using namespace ggml_cuda_mma;
+ typedef void (*load_tiles_mmq_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
+ typedef void (*vec_dot_mmq_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
+ typedef void (*mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
+-    float * __restrict__ dst, const int stride, const int i_max, const int j_max);
++    float * __restrict__ dst, const int stride, const int i_max, const int j_max,
++    const float * __restrict__ bias, const float * __restrict__ add);
++
++// TTF epilogue of a plain 2D product: dst = x y + bias[row] + add[col, row] (either may be null); applied once per
++// output, where the tile's last k block writes dst (the stream-k fixup then adds the earlier partial sums)
++struct mmq_epilogue {
++    const float * bias = nullptr;
++    const float * add  = nullptr;
++};
+ 
+ enum mmq_q8_1_ds_layout {
+     MMQ_Q8_1_DS_LAYOUT_D4,
+@@ -3326,7 +3334,7 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
+ template<int mmq_x, int mmq_y, bool need_check>
+ static __device__ __forceinline__ void mmq_write_back_dp4a(
+         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+-        const int stride, const int i_max, const int j_max) {
++        const int stride, const int i_max, const int j_max, const float * __restrict__ bias, const float * __restrict__ add) {
+     constexpr int nwarps = mmq_get_nwarps_device();
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+@@ -3346,7 +3354,14 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
+                 continue;
+             }
+ 
+-            dst[ids_dst[j]*stride + i] = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
++            float v = sum[(j0/nwarps) * (mmq_y/warp_size) + i0/warp_size];
++            if (bias) {
++                v += bias[i];
++            }
++            if (add) {
++                v += add[ids_dst[j]*stride + i];
++            }
++            dst[ids_dst[j]*stride + i] = v;
+         }
+     }
+ }
+@@ -3354,7 +3369,7 @@ static __device__ __forceinline__ void mmq_write_back_dp4a(
+ template<ggml_type type, int mmq_x, int mmq_y, bool need_check>
+ static __device__ __forceinline__ void mmq_write_back_mma(
+         const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+-        const int stride, const int i_max, const int j_max) {
++        const int stride, const int i_max, const int j_max, const float * __restrict__ bias, const float * __restrict__ add) {
+ 
+     constexpr int granularity = mmq_get_granularity_device(mmq_x);
+     constexpr int nwarps = mmq_get_nwarps_device();
+@@ -3394,7 +3409,14 @@ static __device__ __forceinline__ void mmq_write_back_mma(
+                     continue;
+                 }
+ 
+-                dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J + n)*tile_C::ne + l];
++                float v = sum[(j0/tile_C::J + n)*tile_C::ne + l];
++                if (bias) {
++                    v += bias[i];
++                }
++                if (add) {
++                    v += add[ids_dst[j]*stride + i];
++                }
++                dst[ids_dst[j]*stride + i] = v;
+             }
+         }
+     }
+@@ -3604,7 +3626,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+         const int stride_row_x, const int ncols_y, const int stride_col_dst,
+-        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
++        const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop, const mmq_epilogue ep = {}) {
+ 
+     constexpr int              warp_size  = ggml_cuda_get_physical_warp_size();
+     constexpr int              nwarps     = mmq_get_nwarps_device();
+@@ -3674,9 +3696,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+     }
+ 
+     if (fixup) {
+-        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x);
++        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(mmq_x*mmq_y), mmq_y, mmq_y, mmq_x, nullptr, nullptr);
+     } else {
+-        write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j);
++        write_back(sum, ids_dst, dst, stride_col_dst, tile_x_max_i, tile_y_max_j, ep.bias, ep.add);
+     }
+ }
+ 
+@@ -3701,7 +3723,7 @@ static __global__ void mul_mat_q(
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const uint3 ntx) {
++        const uint3 ntx, const mmq_epilogue ep) {
+ 
+     // Skip unused template specializations for faster compilation:
+     if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
+@@ -3786,7 +3808,8 @@ static __global__ void mul_mat_q(
+         constexpr bool fixup = false;
+         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
++             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z,
++             mmq_epilogue{ep.bias ? ep.bias + it*mmq_y : nullptr, ep.add ? ep.add + offset_dst : nullptr});
+         return;
+     }
+ #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+@@ -3866,7 +3889,8 @@ static __global__ void mul_mat_q(
+         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
+             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
+-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
++             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop,
++             mmq_epilogue{ep.bias ? ep.bias + it*mmq_y : nullptr, ep.add ? ep.add + offset_dst : nullptr});
+ 
+         kbc += blocks_per_ne00.z;
+         kbc -= fastmodulo(kbc, blocks_per_ne00);
+@@ -4083,6 +4107,7 @@ struct mmq_args {
+     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
+     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
+     bool use_stream_k; int64_t ncols_max;
++    mmq_epilogue ep = {};
+ };
+ 
+ template<ggml_type type>
+@@ -4136,7 +4161,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-                 ntx_fd);
++                 ntx_fd, args.ep);
+         } else {
+             constexpr bool need_check = true;
+             mul_mat_q<type, mmq_x, need_check><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+@@ -4144,7 +4169,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                  channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                  sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-                 ntx_fd);
++                 ntx_fd, args.ep);
+         }
+         return;
+     }
+@@ -4176,7 +4201,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd, args.ep);
+ 
+         if (!fixup_needed) {
+             return;
+@@ -4194,7 +4219,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+-             ntx_fd);
++             ntx_fd, args.ep);
+ 
+         if (!fixup_needed) {
+             return;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 76b8dd7e5..8728acd9c 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1118,7 +1118,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+         res = build_ttf_mm(w, cur, te->main);
+         if (te->d && te->u) {
+             ggml_tensor * h = build_ttf_mm(te->d, cur, te->dl);
+-            res = ggml_add(ctx0, res, build_ttf_mm(te->u, h, te->ul));
++            // the adapter as src[0]: the graph computes it before the main product, whose epilogue can then add it
++            res = ggml_add(ctx0, build_ttf_mm(te->u, h, te->ul), res);
+         }
+     } else {
+         res = ggml_mul_mat(ctx0, w, cur);
+-- 
+2.55.0
+

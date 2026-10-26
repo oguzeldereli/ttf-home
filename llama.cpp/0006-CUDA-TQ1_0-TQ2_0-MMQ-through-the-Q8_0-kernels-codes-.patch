@@ -1,7 +1,7 @@
 From ca76d9920a6e687d5fa1ecd09025e73e8f156d88 Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 05:19:20 +0000
-Subject: [PATCH 6/9] CUDA: TQ1_0 / TQ2_0 MMQ through the Q8_0 kernels (codes
+Subject: [PATCH 06/10] CUDA: TQ1_0 / TQ2_0 MMQ through the Q8_0 kernels (codes
  unpacked to int8 {-1, 0, 1} in the tile)
 
 One scale per 256 values needs no per-16 rescaling: the Q8_0 tensor-core path instead of Q2_K's. Prefill (pp512,
