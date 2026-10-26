@@ -11,7 +11,7 @@ Inference uses llama.cpp with two small patches (`llama.cpp/`), so a TTF model i
 
 | model | file | GPU decode | GPU prefill | CPU decode (8 threads) |
 |---|---|---|---|---|
-| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 26.6 tok/s | 708 tok/s | 3.0 tok/s |
+| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 26.6 tok/s | 708 tok/s | 3.9 tok/s |
 | same, `--wtype tq1_0` (1.69 bits) | 7.9 GiB | 18.2 tok/s | 510 tok/s | - |
 | same, TQ2_0 with `--head q4_k` (+0.005 NLL) | 8.9 GiB | 27.4 tok/s | 689 tok/s | - |
 | Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 256 tok/s | 12.9k tok/s | 49 tok/s |
