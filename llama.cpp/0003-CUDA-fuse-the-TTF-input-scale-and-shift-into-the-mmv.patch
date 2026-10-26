@@ -1,7 +1,7 @@
 From 950402bc328cb2e0ca42f25fd0f37c637a344316 Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 04:28:25 +0000
-Subject: [PATCH 3/5] CUDA: fuse the TTF input scale and shift into the mmvq
+Subject: [PATCH 3/6] CUDA: fuse the TTF input scale and shift into the mmvq
  activation quantiser, the bias into its epilogue
 
 x*c (+m) -> mul_mat (+b) runs as one matrix-vector product for decode: removes ~2400 small kernels per token on a
