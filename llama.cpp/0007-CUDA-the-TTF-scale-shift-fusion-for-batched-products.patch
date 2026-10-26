@@ -1,0 +1,173 @@
+From d99e111ae3a17a1598e16f5cd5df141b8a43c4aa Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 05:23:29 +0000
+Subject: [PATCH 7/7] CUDA: the TTF scale / shift fusion for batched products
+ too (in MMQ's activation quantiser)
+
+27B TTF prefill (pp512) 630 -> 691 tok/s; bit-identical NLL (0.8B 2.589127).
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 25 ++++++++++++++++++---
+ ggml/src/ggml-cuda/mmq.cu       |  8 ++++++-
+ ggml/src/ggml-cuda/mmq.cuh      |  3 ++-
+ ggml/src/ggml-cuda/quantize.cu  | 40 +++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/quantize.cuh |  6 +++++
+ 5 files changed, 75 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index aa83cf959..dcbac7bc7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3995,9 +3995,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 return v->type == GGML_TYPE_F32 && v->ne[0] == x->ne[0] && ggml_nelements(v) == v->ne[0] &&
+                        ggml_is_contiguous(v);
+             };
+-            const bool ok = mm->src[1] == cgraph->nodes[i + k - 1] && chan_vec(c) && ggml_are_same_shape(x, node) &&
+-                            (!add || ((add->src[0] == node || add->src[1] == node) && chan_vec(m))) &&
+-                            ggml_cuda_should_fuse_mul_mat_vec_q(mm);
++            const bool chain_ok = mm->src[1] == cgraph->nodes[i + k - 1] && chan_vec(c) && ggml_are_same_shape(x, node) &&
++                            (!add || ((add->src[0] == node || add->src[1] == node) && chan_vec(m)));
++            const bool ok = chain_ok && ggml_cuda_should_fuse_mul_mat_vec_q(mm);
++
++            // batched: the same scale / shift in MMQ's quantiser, when ggml_cuda_mul_mat would take MMQ
++            const ggml_tensor * w = mm->src[0];
++            const bool bad_padding = ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
++                                     ggml_nbytes(w) != ggml_backend_buffer_get_alloc_size(w->buffer, w) && w->view_src;
++            const int  dcc = ggml_cuda_info().devices[cuda_ctx->device].cc;
++            const bool ok_mmq = chain_ok && !ok && ggml_is_quantized(w->type) && !bad_padding &&
++                                w->type != GGML_TYPE_MXFP4 && w->type != GGML_TYPE_NVFP4 &&
++                                !ggml_backend_buft_is_cuda_split(w->buffer->buft) &&
++                                mm->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[0] % 4 == 0 &&
++                                !ggml_cuda_should_use_mmvq(w->type, dcc, x->ne[1]) &&
++                                ggml_cuda_should_use_mmq(w->type, dcc, x->ne[1], /*n_experts=*/0);
++            if (ok_mmq) {
++                ggml_cuda_mm_fusion_args_host fusion_data{};
++                fusion_data.y_scale = c;
++                fusion_data.y_shift = m;
++                ggml_cuda_mul_mat_q(*cuda_ctx, w, x, nullptr, mm, &fusion_data);
++                return k;
++            }
+             if (ok) {
+                 ggml_cuda_mm_fusion_args_host fusion_data{};
+                 fusion_data.y_scale = c;
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 96b37dd87..4da9efbe5 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -81,7 +81,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+ }
+ 
+ void ggml_cuda_mul_mat_q(
+-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++        const ggml_cuda_mm_fusion_args_host * fusion) {
++    GGML_ASSERT(!fusion || (!ids && fusion->y_scale && !fusion->x_bias && !fusion->gate));
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -144,6 +146,10 @@ void ggml_cuda_mul_mat_q(
+                 quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                         ne11, ne12, ne13, stream);
+ 
++            } else if (fusion) {
++                quantize_mmq_q8_1_scaled_cuda(src1_d, (const float *) fusion->y_scale->data,
++                    fusion->y_shift ? (const float *) fusion->y_shift->data : nullptr, src1_q8_1.get(), src0->type,
++                    ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+             } else {
+                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                                        ne11, ne12, ne13, stream);
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index dbe9931f0..c77247498 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -4322,7 +4322,8 @@ extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
+ // -------------------------------------------------------------------------------------------------------------------------
+ 
+ void ggml_cuda_mul_mat_q(
+-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++        const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
+ void ggml_cuda_op_mul_mat_q(
+     ggml_backend_cuda_context & ctx,
+diff --git a/ggml/src/ggml-cuda/quantize.cu b/ggml/src/ggml-cuda/quantize.cu
+index 7e4b2ae39..53f87ec9f 100644
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -284,7 +284,8 @@ template <mmq_q8_1_ds_layout ds_layout>
+ static __global__ void quantize_mmq_q8_1(
+         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+-        const int64_t ne0, const int ne1, const int ne2) {
++        const int64_t ne0, const int ne1, const int ne2,
++        const float * __restrict__ y_scale = nullptr, const float * __restrict__ y_shift = nullptr) {
+ 
+     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+@@ -314,7 +315,13 @@ static __global__ void quantize_mmq_q8_1(
+     const int64_t iqs = i0 % (4*QK8_1);                                             // quant index in block
+ 
+     // Load 4 floats per thread and calculate max. abs. value between them:
+-    const float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float4 xi = i0 < ne00 ? x4[(i03*s03 + i02*s02 + i01*s01 + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    if (y_scale && i0 < ne00) {
++        xi.x *= y_scale[i00 + 0]; xi.y *= y_scale[i00 + 1]; xi.z *= y_scale[i00 + 2]; xi.w *= y_scale[i00 + 3];
++        if (y_shift) {
++            xi.x += y_shift[i00 + 0]; xi.y += y_shift[i00 + 1]; xi.z += y_shift[i00 + 2]; xi.w += y_shift[i00 + 3];
++        }
++    }
+     float amax = fabsf(xi.x);
+     amax = fmaxf(amax, fabsf(xi.y));
+     amax = fmaxf(amax, fabsf(xi.z));
+@@ -442,6 +449,35 @@ void quantize_mmq_q8_1_cuda(
+     }
+ }
+ 
++void quantize_mmq_q8_1_scaled_cuda(
++        const float * x, const float * y_scale, const float * y_shift, void * vy, const ggml_type type_src0,
++        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
++    GGML_ASSERT(ne00 % 4 == 0);
++    GGML_ASSERT(ne0 % (4*QK8_1) == 0);
++
++    const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
++    const dim3 num_blocks(ne1, block_num_y, ne2*ne3);
++    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
++    switch (mmq_get_q8_1_ds_layout(type_src0)) {
++        case MMQ_Q8_1_DS_LAYOUT_D4:
++            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
++                <<<num_blocks, block_size, 0, stream>>>(x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, y_scale, y_shift);
++            break;
++        case MMQ_Q8_1_DS_LAYOUT_DS4:
++            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
++                <<<num_blocks, block_size, 0, stream>>>(x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, y_scale, y_shift);
++            break;
++        case MMQ_Q8_1_DS_LAYOUT_D2S6:
++            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
++                <<<num_blocks, block_size, 0, stream>>>(x, nullptr, vy, ne00, s01, s02, s03, ne0, ne1, ne2, y_scale, y_shift);
++            break;
++        default:
++            GGML_ABORT("fatal error");
++            break;
++    }
++}
++
+ void quantize_mmq_fp4_cuda(
+         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+diff --git a/ggml/src/ggml-cuda/quantize.cuh b/ggml/src/ggml-cuda/quantize.cuh
+index 9df3d67e0..73d6b636b 100644
+--- a/ggml/src/ggml-cuda/quantize.cuh
++++ b/ggml/src/ggml-cuda/quantize.cuh
+@@ -45,3 +45,9 @@ void quantize_row_q8_1_scaled_cuda(
+         const float * x, const float * y_scale, const float * y_shift, void * vy,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream);
++
++// the MMQ layout of src1 * y_scale + y_shift (per input channel; y_shift may be null)
++void quantize_mmq_q8_1_scaled_cuda(
++        const float * x, const float * y_scale, const float * y_shift, void * vy, const ggml_type type_src0,
++        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream);
+-- 
+2.55.0
+
