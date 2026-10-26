@@ -383,7 +383,8 @@ def main(argv=None):
     knobs(p)
     p = sp.add_parser("export"); p.add_argument("ckpt"); p.add_argument("out")
     p.add_argument("--base", default=None, help="the base model's dir for a conversion (config + tokenizer)")
-    p.add_argument("--wtype", default="tq2_0", choices=["tq2_0", "tq1_0", "q2_k"])
+    p.add_argument("--wtype", default="tq2_0", choices=["tq2_0", "tq1_0", "q2_k"],
+                   help="tq2_0: NVIDIA / CPU (fastest); tq1_0: 15%% smaller; q2_k: AMD / Intel (Vulkan), Mac (Metal)")
     p.add_argument("--emb", default=None, help="q6_k (float) / q4_1 (int-k codes, exact: the default for them) / q4_k ...")
     p.add_argument("--head", default=None)
     for c in ("chat", "bench"):

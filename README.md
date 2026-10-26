@@ -74,6 +74,9 @@ Converting 0.8B models needs about 12 GB. A 27B conversion needs a 48 to 96 GB c
 
 ## GGUF format
 
+- **Which `--wtype`**: `tq2_0` on NVIDIA GPUs and CPUs (fastest); `tq1_0` to save 15% of memory; `q2_k` (2.63
+  bits) for AMD / Intel GPUs (Vulkan) and Macs (Metal). llama.cpp has no TQ kernels there yet, but Q2_K runs
+  everywhere and holds ternary weights exactly too.
 - **Ternary matrices** are stored as `TQ2_0` (2.06 bits per weight, the default), `TQ1_0` (1.69 bits) or `Q2_K`.
   All three hold {-1, 0, +1}·d exactly, with the row scale folded into d.
   - Matrices whose width is not a multiple of 256 fall back to `Q8_0`, which is also exact.
