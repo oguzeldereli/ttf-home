@@ -1,7 +1,7 @@
 From 20b618655c9e9a4095a5b11081261ca49b540948 Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 00:44:27 +0000
-Subject: [PATCH 2/8] CUDA: TQ2_0 matrix-vector (dp4a, the Q2_K code layout
+Subject: [PATCH 2/9] CUDA: TQ2_0 matrix-vector (dp4a, the Q2_K code layout
  with one scale) and dequantization (prefill through cuBLAS)
 
 ---

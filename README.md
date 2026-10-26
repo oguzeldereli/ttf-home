@@ -11,7 +11,7 @@ Inference uses llama.cpp with two small patches (`llama.cpp/`), so a TTF model i
 
 | model | file | GPU decode | GPU prefill | CPU decode (8 threads) |
 |---|---|---|---|---|
-| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 25.6 tok/s | 690 tok/s | 3.0 tok/s |
+| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 26.5 tok/s | 690 tok/s | 3.0 tok/s |
 | same, `--wtype tq1_0` (1.69 bits) | 7.9 GiB | 18.2 tok/s | 510 tok/s | - |
 | Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 256 tok/s | 12.9k tok/s | 49 tok/s |
 | Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
@@ -89,6 +89,6 @@ Converting 0.8B models needs about 12 GB. A 27B conversion needs a 48 to 96 GB c
 - **Ternary adapters** are stored as `.ttf_d*` and `.ttf_u*`.
 - The patched llama.cpp applies all of these inside `build_lora_mm`, so every architecture llama.cpp supports gets
   them without per-model code.
-- **CUDA** (patches 0002-0008): matrix-vector kernels for `TQ2_0` and `TQ1_0`, prefill for both through the Q8_0 MMQ kernels, and
-  the side tensors fused into the activation quantiser of both (bit-identical; +10-20% tok/s), and one warp per row at batch 1 (+12% at 27B). `test-backend-ops`: 22 / 22
-  `TQ1_0` / `TQ2_0` matrix products match the CPU. `TQ2_0` is the fastest; `TQ1_0` is 15% smaller and 29% slower.
+- **CUDA** (patches 0002-0009): matrix-vector kernels for `TQ2_0` and `TQ1_0`, prefill for both through the Q8_0 MMQ kernels, and
+  the side tensors fused into the activation quantiser of both (bit-identical; +10-20% tok/s), and one warp per row and two ints per thread at batch 1 (+16% at 27B). `test-backend-ops`: 22 / 22
+  `TQ1_0` / `TQ2_0` matrix products match the CPU. `TQ2_0` is the fastest; `TQ1_0` is 15% smaller and 31% slower.

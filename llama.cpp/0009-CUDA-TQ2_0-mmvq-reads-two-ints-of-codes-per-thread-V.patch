@@ -1,0 +1,53 @@
+From 5403eeec5796866cd3b8852e9730c38d6f840cf6 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 06:10:18 +0000
+Subject: [PATCH 9/9] CUDA: TQ2_0 mmvq reads two ints of codes per thread (VDR
+ 2)
+
+27B decode 25.6 -> 26.5 tok/s on an RTX 4080 laptop; 0.8B within 1%. The int products of the two ints are summed before the block scale.
+---
+ ggml/src/ggml-cuda/vecdotq.cuh | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index dd85c1565..cb8fb700d 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -836,22 +836,28 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
+ 
+ // TQ2_0: the Q2_K code layout ({0, 1, 2} in 2 bits) with one scale per block and no sub-block scales / mins:
+ // value = (q - 1) * d. Blocks are 66 bytes, so the codes are read 2-byte aligned.
+-#define VDR_TQ2_0_Q8_1_MMVQ 1
++#ifndef VDR_TQ2_0_Q8_1_MMVQ
++#define VDR_TQ2_0_Q8_1_MMVQ 2
++#endif
+ 
+ static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+     const block_tq2_0 * bq = (const block_tq2_0 *) vbq + kbx;
+ 
+-    const int bq8_offset = QR2_K * (iqs / QI8_1);
+-    const int v = get_int_b2(bq->qs, iqs);
++    const int bq8_offset = QR2_K * (iqs / QI8_1);    // iqs is a multiple of VDR: its ints share the q8_1 blocks
+ 
+     float sumf = 0.0f;
+ #pragma unroll
+     for (int i = 0; i < QR2_K; ++i) {
+-        const int u  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+-        const int vi = (v >> (2*i)) & 0x03030303;
+-        sumf += __low2float(bq8_1[bq8_offset + i].ds) * (ggml_cuda_dp4a(vi, u, 0) - ggml_cuda_dp4a(0x01010101, u, 0));
++        int sumi = 0;
++#pragma unroll
++        for (int j = 0; j < VDR_TQ2_0_Q8_1_MMVQ; ++j) {
++            const int u  = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1 + j);
++            const int vi = (get_int_b2(bq->qs, iqs + j) >> (2*i)) & 0x03030303;
++            sumi = ggml_cuda_dp4a(vi, u, sumi) - ggml_cuda_dp4a(0x01010101, u, 0);
++        }
++        sumf += __low2float(bq8_1[bq8_offset + i].ds) * sumi;
+     }
+     return __half2float(bq->d) * sumf;
+ }
+-- 
+2.55.0
+
