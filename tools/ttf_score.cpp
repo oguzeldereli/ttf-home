@@ -57,7 +57,8 @@ int main(int argc, char ** argv) {
     llama_model * model = llama_model_load_from_file(model_path, mp);
     if (!model) { fprintf(stderr, "failed to load %s\n", model_path); return 1; }
     auto cp = llama_context_default_params();
-    cp.n_ctx = ctx; cp.n_batch = ctx; cp.n_ubatch = ub > 0 ? ub : ctx;   // -ub 1: the decode (matrix-vector) path cp.n_threads = threads; cp.n_threads_batch = threads;
+    cp.n_ctx = ctx; cp.n_batch = ctx; cp.n_ubatch = ub > 0 ? ub : ctx;   // -ub 1: the decode (matrix-vector) path
+    cp.n_threads = threads; cp.n_threads_batch = threads;
     llama_context * lctx = llama_init_from_model(model, cp);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
