@@ -31,7 +31,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-LLAMA = Path(os.environ.get("TTF_LLAMA_CPP", "~/Programs/llama.cpp")).expanduser()
+from .cli import engine_dir                    # noqa: E402  (the same llama.cpp tree `ttf engine build` makes)
+LLAMA = engine_dir()
 sys.path[:0] = [str(LLAMA / "gguf-py"), str(LLAMA)]
 import gguf                                    # noqa: E402
 from conversion import get_model_class         # noqa: E402

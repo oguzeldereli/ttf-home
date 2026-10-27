@@ -5,16 +5,18 @@ training it, fine-tune on your own text, and run the result fast on a consumer G
 
 Training uses TTF (two-timescale threshold flips, `ttf-core`): weights stay in {-1, 0, +1} the whole time, with a
 low-rank accumulator in place of master weights and Adam states, so training needs a fraction of the usual memory.
-Inference uses llama.cpp with two small patches (`llama.cpp/`), so a TTF model is an ordinary GGUF file.
+Inference uses llama.cpp with ten patches (`llama.cpp/`, on llama.cpp commit 0ef6f06d5), so a TTF model is an ordinary
+GGUF file.
 
 ## Measured (laptop: RTX 4080 Laptop 12 GB, i9-14900HX)
 
 | model | file | GPU decode | GPU prefill | CPU decode (8 threads) |
 |---|---|---|---|---|
 | Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 26.6 tok/s | 708 tok/s | 3.9 tok/s |
-| same, `--wtype tq1_0` (1.69 bits) | 7.9 GiB | 18.2 tok/s | 510 tok/s | - |
+| same, `--wtype tq1_0` (1.69 bits) | 7.9 GiB | 18.2 tok/s | 512 tok/s | - |
 | same, TQ2_0 with `--head q4_k` (+0.005 NLL) | 8.9 GiB | 27.4 tok/s | 689 tok/s | - |
 | Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 256 tok/s | 12.9k tok/s | 49 tok/s |
+| Qwen3.5-0.8B ternary (TQ1_0) | 0.58 GB | 208 tok/s | 11.1k tok/s | 45 tok/s |
 | Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
 
 The 27B model fits entirely on the 12 GB card, with a 17k-token context.
@@ -23,11 +25,13 @@ The export is exact: next-token loss in llama.cpp matches the trainer's own forw
 
 | model | trainer | llama.cpp |
 |---|---|---|
-| Qwen3.5-0.8B conversion | 2.5897 | 2.5883 |
+| Qwen3.5-0.8B conversion | 2.5897 | 2.5898 (CUDA) / 2.5911 (CPU) |
 | 340M scratch model | 2.3100 | 2.3107 |
 
 The small difference comes from activation quantisation: llama.cpp quantises activations per block of 32 or 256
 values, while training quantises them per token.
+
+The engine is looked for in `~/.cache/ttf/llama.cpp` (where `ttf engine build` puts it), or in `TTF_LLAMA_CPP`.
 
 ## Install
 
@@ -70,7 +74,10 @@ TTF knobs on `train`, `convert` and `finetune`:
 | 11 to 22 GB | medium | 340M |
 | 22 GB and up | large | 670M |
 
-Converting 0.8B models needs about 12 GB. A 27B conversion needs a 48 to 96 GB card; running the result needs about
+Converting 0.8B models needs about 12 GB. `ttf convert` on a 27B base needs a 24 GB card or larger and a cached teacher
+(`--kd-cache`, from ttf-core `scripts/quant/teacher_topk.py`): under 80 GB it keeps the TTF state in host memory at
+accumulator rank 256 with the embedding and head frozen (measured at a 21.7 GiB peak); on 80 GB and larger cards it uses
+the settings of our 27B run (rank 1536, the state on the GPU, int-k embedding and head). Running the result needs about
 10 GB.
 
 ## GGUF format
@@ -82,7 +89,9 @@ Converting 0.8B models needs about 12 GB. A 27B conversion needs a 48 to 96 GB c
   All three hold {-1, 0, +1}·d exactly, with the row scale folded into d.
   - Matrices whose width is not a multiple of 256 fall back to `Q8_0`, which is also exact.
 - **Embedding and head**: K-quants (Q6_K by default; a Q4_K embedding costs nothing measurable, a Q4_K head +0.011
-  NLL at 0.8B). Int-k codes (`--intk-emb`) export exactly as Q4_1 (d = s, m = lo, the codes as they are).
+  NLL at 0.8B). Int-k codes (`--intk-emb`) export exactly as Q4_1 (d = s, m = lo, the codes as they are). Q4_1 is 5
+  bits per weight, so 2- or 3-bit codes take more room in the file than in training: for the 27B, the int-k embedding
+  and head are 1.6 GB as Q4_1 against 0.95 GB at their own bits.
 - **TTF side tensors**, as F32 vectors per linear layer:
   - `<weight>.ttf_c`: input scale;
   - `.ttf_m`: centring, stored as -c·mu;

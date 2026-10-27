@@ -130,6 +130,9 @@ def _tokenizer(spec):
     from tokenizers import Tokenizer
     from .gguf_export import LLAMA2_TOKENIZER
     d = Path(LLAMA2_TOKENIZER if spec == "llama2" else spec).expanduser()
+    if spec == "llama2" and not (d / "tokenizer.json").exists():    # not in the HF cache yet: fetch it (~2 MB)
+        from huggingface_hub import snapshot_download
+        d = Path(snapshot_download("hf-internal-testing/llama-tokenizer", revision=d.name))
     tok = Tokenizer.from_file(str(d / "tokenizer.json"))
     cfg = json.loads((d / "tokenizer_config.json").read_text()) if (d / "tokenizer_config.json").exists() else {}
     eos = cfg.get("eos_token")
@@ -138,8 +141,8 @@ def _tokenizer(spec):
 
 
 def _docs(paths, tok_dir):
-    """the documents of the inputs: .txt / .md files (one document each, or blank-line separated with --split),
-    .jsonl with a "text" field, or chat "messages" (rendered with the tokenizer's chat template)"""
+    """the documents of the inputs: .txt / .md files (one document each), .jsonl with a "text" field, or chat
+    "messages" (rendered with the tokenizer's chat template)"""
     chat = None
     for p in paths:
         p = Path(p)
@@ -263,13 +266,27 @@ def _steps_for_hours(a, args, extra):
     return n
 
 
+def _conv_recipe(base, gib, convert=True):
+    """the conversion recipe for the base model and this GPU: qwen-27b.toml for the 27B (its settings are those of the
+    96 GB-card run; under 80 GiB the TTF state goes to host memory at rank 256, and a new conversion keeps the
+    embedding / head frozen: the setting measured at a 21.7 GiB peak), else qwen-0.8b.toml"""
+    hc = json.loads((Path(base) / "config.json").read_text())
+    big = (hc.get("text_config") or hc).get("hidden_size", 0) > 3000
+    recipe = Path(_conv_root()) / "recipes" / ("qwen-27b.toml" if big else "qwen-0.8b.toml")
+    small = ["--ttf-store", "fp12s", "--ttf-offload", "async", "--ttf-rank", 256] if big and gib < 80 else []
+    if small and convert:
+        small += ["--intk-emb", ""]          # (a fine-tune keeps the structure its checkpoint has)
+    return big, ["--recipe", recipe, *small]
+
+
 def cmd_convert(a, extra):
     gib = _mem_cap()
-    hc = json.loads((Path(a.base) / "config.json").read_text())
-    big = (hc.get("text_config") or hc).get("hidden_size", 0) > 3000         # 27B: the host-offloaded recipe
-    recipe = Path(_conv_root()) / "recipes" / ("qwen-27b.toml" if big else "qwen-0.8b.toml")
-    args = ["--recipe", recipe, "--init-hf", a.base, "--teacher", a.teacher or a.base,
-            *_data_args(a.data, "u32"), "--out-dir", a.out,
+    big, rec = _conv_recipe(a.base, gib)
+    if big and not (a.teacher or a.kd_cache):
+        raise SystemExit("a 27B conversion needs its distillation targets: --kd-cache DIR (ttf-core "
+                         "scripts/quant/teacher_topk.py) or --teacher M where the bf16 teacher (~54 GB) fits beside it")
+    kd = ["--kd-cache", a.kd_cache] if a.kd_cache else ["--teacher", a.teacher or a.base]
+    args = [*rec, "--init-hf", a.base, *kd, *_data_args(a.data, "u32"), "--out-dir", a.out,
             "--ext", "ttfconv.fold", *([] if big else ["--ext", "ttfconv.cd:sweeps=1"]),
             "--ext", f"ttfconv.adapters:rank={a.adapter_rank},alt=1,prop=1" + (",svd=rand" if big else ""),
             "--mem-cap-gib", f"{gib * 0.94:.1f}", "--resume"]
@@ -293,8 +310,7 @@ def cmd_finetune(a, extra):
         base = a.base or ca["init_hf"]
         if not Path(base).exists():
             raise SystemExit(f"the checkpoint was converted from {ca['init_hf']}: pass --base (its config + tokenizer)")
-        recipe = Path(_conv_root()) / "recipes" / "qwen-0.8b.toml"
-        args += ["--recipe", recipe, "--init-hf", base]
+        args += [*_conv_recipe(base, gib, convert=False)[1], "--init-hf", base]
         for e in ca.get("ext", []):
             args += ["--ext", e]
         if a.teacher:
@@ -377,6 +393,7 @@ def main(argv=None):
     knobs(p)
     p = sp.add_parser("convert"); p.add_argument("--base", required=True); p.add_argument("--data", required=True)
     p.add_argument("--out", required=True); p.add_argument("--teacher"); p.add_argument("--adapter-rank", default="0.2")
+    p.add_argument("--kd-cache", help="a cached teacher top-k (ttf-core scripts/quant/teacher_topk.py) instead of --teacher")
     knobs(p)
     p = sp.add_parser("finetune"); p.add_argument("--ckpt", required=True); p.add_argument("--data", required=True)
     p.add_argument("--out", required=True); p.add_argument("--base"); p.add_argument("--teacher")
