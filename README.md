@@ -5,7 +5,7 @@ training it, fine-tune on your own text, and run the result fast on a consumer G
 
 Training uses TTF (two-timescale threshold flips, `ttf-core`): weights stay in {-1, 0, +1} the whole time, with a
 low-rank accumulator in place of master weights and Adam states, so training needs a fraction of the usual memory.
-Inference uses llama.cpp with ten patches (`llama.cpp/`, on llama.cpp commit 0ef6f06d5), so a TTF model is an ordinary
+Inference uses llama.cpp with eleven patches (`llama.cpp/`, on llama.cpp commit 0ef6f06d5), so a TTF model is an ordinary
 GGUF file.
 
 ## Measured (laptop: RTX 4080 Laptop 12 GB, i9-14900HX)

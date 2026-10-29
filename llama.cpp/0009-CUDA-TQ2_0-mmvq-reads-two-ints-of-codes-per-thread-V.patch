@@ -1,7 +1,7 @@
 From 5403eeec5796866cd3b8852e9730c38d6f840cf6 Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 06:10:18 +0000
-Subject: [PATCH 09/10] CUDA: TQ2_0 mmvq reads two ints of codes per thread
+Subject: [PATCH 09/11] CUDA: TQ2_0 mmvq reads two ints of codes per thread
  (VDR 2)
 
 27B decode 25.6 -> 26.5 tok/s on an RTX 4080 laptop; 0.8B within 1%. The int products of the two ints are summed before the block scale.

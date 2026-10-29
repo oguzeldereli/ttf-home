@@ -7,6 +7,8 @@ Every TTF linear  y = r * beta * (T Q(c * (x - mu))) + b  [+ U(D(x))]  is writte
   <name>.ttf_c       c (F32 [K]),  <name>.ttf_m = -c * mu (F32 [K]),  <name>.ttf_b = b (F32 [N])
   <name>.ttf_d(_c/_m/_b), <name>.ttf_u(_c/_m/_b)   the ternary adapter's down and up layers, the same form; the
                      adapter rank is padded with zero trits to a multiple of 256 (the block size along K)
+  <name>.ttf_fd(_c), <name>.ttf_fu   the float low-rank adapter (F16), when the layer has a ternary adapter too
+                     (alone it takes the .ttf_d / .ttf_u names)
 Everything else (norms, conv, the float in_proj_a / b, the embedding, the head) goes through llama.cpp's own HF
 converter, so its renames, head reorders and +1 norm offsets apply unchanged; the ternary layers take the same row /
 column order by passing index matrices through the converter's modify_tensors.
@@ -433,10 +435,13 @@ def _make_class(base, ck, wq, eq, hq, log):
                         r = ck.parts[sub["main"]]["row_scale"].float()
                         if hb in ck.out_scale:
                             r = r * ck.out_scale[hb]
-                        self.gguf_writer.add_tensor(stem + ".ttf_d", Bt[:, ci].numpy().astype(np.float16), raw_dtype=QT.F16)
+                        f = ".ttf_fd" if "d" in sub else ".ttf_d"     # beside a ternary adapter: the second side adapter
+                        self.gguf_writer.add_tensor(stem + f, Bt[:, ci].numpy().astype(np.float16), raw_dtype=QT.F16)
                         if c is not None:
-                            self._vec(stem + ".ttf_d_c", c[ci])
-                        self.gguf_writer.add_tensor(stem + ".ttf_u", (r[:, None] * A)[ri].numpy().astype(np.float16),
+                            self._vec(stem + f + "_c", c[ci])
+                        if mu is not None:          # the adapter reads the centred input too: c (x - mu)
+                            self._vec(stem + f + "_m", -(c[ci] if c is not None else 1.0) * mu[ci])
+                        self.gguf_writer.add_tensor(stem + f[:-1] + "u", (r[:, None] * A)[ri].numpy().astype(np.float16),
                                                     raw_dtype=QT.F16)
                     if "d" in sub:
                         self._adapter(stem, sub, K, N, ri, ci)

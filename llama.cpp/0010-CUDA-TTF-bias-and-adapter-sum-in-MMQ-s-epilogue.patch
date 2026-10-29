@@ -1,7 +1,7 @@
 From 3e00ffcef1133164b243be66b0e71f4a312753df Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 06:46:17 +0000
-Subject: [PATCH 10/10] CUDA: TTF bias and adapter sum in MMQ's epilogue
+Subject: [PATCH 10/11] CUDA: TTF bias and adapter sum in MMQ's epilogue
 
 The graph computes the adapter before the main product (ggml_add(u, main)), so the batched product can add the
 bias row vector and the adapter output where each tile is written once (the stream-k fixup adds the earlier

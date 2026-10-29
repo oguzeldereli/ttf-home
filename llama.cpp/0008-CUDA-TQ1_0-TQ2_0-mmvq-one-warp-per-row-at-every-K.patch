@@ -1,7 +1,7 @@
 From 0bc43f5a163c1158f9414a266e037447973edce5 Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 06:05:04 +0000
-Subject: [PATCH 08/10] CUDA: TQ1_0 / TQ2_0 mmvq one warp per row at every K
+Subject: [PATCH 08/11] CUDA: TQ1_0 / TQ2_0 mmvq one warp per row at every K
 
 No cross-warp reduction for the ternary types at batch 1: 27B decode TQ2_0 23.2 -> 25.6 tok/s, TQ1_0 17.0 -> 18.2 on an RTX 4080 laptop; neutral at 0.8B. Results unchanged.
 ---

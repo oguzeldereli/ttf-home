@@ -1,7 +1,7 @@
 From bbc0ff2e07dce5d560b561ba78166c0c64daafba Mon Sep 17 00:00:00 2001
 From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
 Date: Mon, 26 Oct 2026 00:37:56 +0000
-Subject: [PATCH 01/10] TTF side tensors: per-input-channel scale, centring,
+Subject: [PATCH 01/11] TTF side tensors: per-input-channel scale, centring,
  bias and a low-rank ternary adapter on any weight
 
 Optional tensors next to a weight (<base>.ttf_c / ttf_m / ttf_b, <base>.ttf_d* / ttf_u*) are loaded by a generic
