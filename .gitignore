@@ -3,3 +3,5 @@ __pycache__/
 tools/ttf_score
 tools/ttf_score_cpu
 tools/ttf_score_cuda
+tools/ttf_dump
+tools/ttf_patch
