@@ -11,11 +11,11 @@ import torch
 from ttfhome.gguf_export import LLAMA2_TOKENIZER, TTFCheckpoint, export, gguf
 
 
-def _model(tmp_path, intk, dim=256, hidden_dim=768):
+def _model(tmp_path, intk):
     from ttf.config import ModelConfig
     from ttf.layers import build_kernel_transformer
     torch.manual_seed(0)
-    cfg = ModelConfig(vocab_size=32000, dim=dim, n_layers=2, n_heads=4, n_kv_heads=2, hidden_dim=hidden_dim, max_seq_len=256)
+    cfg = ModelConfig(vocab_size=32000, dim=256, n_layers=2, n_heads=4, n_kv_heads=2, hidden_dim=768, max_seq_len=256)
     m = build_kernel_transformer(cfg, grad_checkpoint=False, beta=True)
     sd = m.state_dict()
     g = torch.Generator().manual_seed(1)
@@ -71,32 +71,3 @@ def test_ternary_exact(tmp_path, wtype):
         W = (f16(lo) + f16(sc) * q.float().reshape(N, K // 64, 64)).reshape(N, K).numpy()
         got = gguf.quants.dequantize(e.data, e.tensor_type).reshape(W.shape)
         np.testing.assert_allclose(got, W, rtol=1e-6, atol=1e-7)
-
-
-def test_tq1_p_exact(tmp_path):
-    """TQ1_P (1.6 bpw, no block scale): the trits exactly, the row scale r * beta in .ttf_r (F32)"""
-    ck_path = _model(tmp_path, intk=False, dim=1024, hidden_dim=2048)
-    out = tmp_path / "m.gguf"
-    export(ck_path, LLAMA2_TOKENIZER, out, "tq1_p", log=lambda *a: None)
-    ck = TTFCheckpoint(ck_path)
-    t = {x.name: x for x in gguf.GGUFReader(str(out)).tensors}
-    names = {"self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k", "self_attn.v_proj": "attn_v",
-             "self_attn.o_proj": "attn_output", "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up",
-             "mlp.down_proj": "ffn_down"}
-    n = 0
-    for hb, sub in ck.linears.items():
-        L, mod = hb.split(".")[2], ".".join(hb.split(".")[3:])
-        stem = f"blk.{L}.{names[mod]}"
-        w = t[stem + ".weight"]
-        assert w.tensor_type == gguf.GGMLQuantizationType.TQ1_P
-        assert w.data.nbytes * 8 == int(np.prod(w.shape)) * 1.6015625    # 205 bytes per 1024 trits
-        K = int(w.shape[0])
-        T, s, c, mu, b = ck.part(sub["main"], K)
-        trits = gguf.quants.dequantize(w.data, w.tensor_type).reshape(T.shape)
-        r = np.asarray(t[stem + ".ttf_r"].data)
-        got, ref = trits * r[:, None], (T.float() * s[:, None]).numpy()
-        if mod in ("self_attn.q_proj", "self_attn.k_proj"):
-            got, ref = np.sort(got, axis=0), np.sort(ref, axis=0)
-        np.testing.assert_allclose(got, ref, rtol=1e-6, atol=0)
-        n += 1
-    assert n == 2 * 7

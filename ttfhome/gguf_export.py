@@ -3,9 +3,7 @@
 Every TTF linear  y = r * beta * (T Q(c * (x - mu))) + b  [+ U(D(x))]  is written as
   <name>.weight      the trits T with the row scale r * beta in the block scale (exact: TQ1_0, TQ2_0 and Q2_K
                      hold {-1, 0, 1} * d; d is fp16, so r * beta is rounded to fp16, finer than the bf16 the
-                     trainer's fused path multiplies by); TQ1_P (1.6 bpw, the ttf branch's own type: trits only, 1024
-                     per 205 bytes) has no block scale, so r * beta goes to <name>.ttf_r (F32 [N]) instead; a TQ1_P
-                     layer whose K is not a multiple of 1024 (a small adapter rank) falls back to TQ1_0
+                     trainer's fused path multiplies by)
   <name>.ttf_c       c (F32 [K]),  <name>.ttf_m = -c * mu (F32 [K]),  <name>.ttf_b = b (F32 [N])
   <name>.ttf_d(_c/_m/_b), <name>.ttf_u(_c/_m/_b)   the ternary adapter's down and up layers, the same form; the
                      adapter rank is padded with zero trits to a multiple of 256 (the block size along K)
@@ -19,7 +17,7 @@ The one difference from the trainer: the trainer quantises each layer input per 
 quantises it per block of 256 (CPU, Q8_K) or 32 (CUDA, Q8_1), finer, so the output is a little closer to the float
 layer than in training.
 
-  python -m ttfhome.gguf_export CKPT HF_DIR OUT.gguf [--wtype tq1_p|tq2_0|tq1_0|q2_k] [--emb q6_k] [--head q6_k]
+  python -m ttfhome.gguf_export CKPT HF_DIR OUT.gguf [--wtype tq2_0|tq1_0|q2_k] [--emb q6_k] [--head q6_k]
 HF_DIR: the base model's config.json and tokenizer files (no weights needed).
 """
 import argparse
@@ -42,9 +40,9 @@ import gguf                                    # noqa: E402
 from conversion import get_model_class         # noqa: E402
 
 QT = gguf.GGMLQuantizationType
-WTYPES = {"tq1_p": QT.TQ1_P, "tq2_0": QT.TQ2_0, "tq1_0": QT.TQ1_0, "q2_k": QT.Q2_K}
-FTYPES = {"tq1_p": gguf.LlamaFileType.MOSTLY_TQ1_P, "tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0,
-          "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0, "q2_k": gguf.LlamaFileType.MOSTLY_Q2_K}
+WTYPES = {"tq2_0": QT.TQ2_0, "tq1_0": QT.TQ1_0, "q2_k": QT.Q2_K}
+FTYPES = {"tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0, "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
+          "q2_k": gguf.LlamaFileType.MOSTLY_Q2_K}
 FTYPES_EMB = {"f32": QT.F32, "f16": QT.F16, "bf16": QT.BF16, "q8_0": QT.Q8_0, "q6_k": QT.Q6_K, "q5_k": QT.Q5_K,
               "q4_k": QT.Q4_K, "q4_1": QT.Q4_1}
 # int-k embedding / head: Q4_1 from the codes (exact), else the float W through the type asked for
@@ -401,16 +399,6 @@ def _make_class(base, ck, wq, eq, hq, log):
                 log(f"{name}: {T.shape[1]} columns, not a multiple of {QK}: stored as {qt.name}")
                 w = (T.float() * s.float()[:, None]).numpy()
                 self.gguf_writer.add_tensor(name, gguf.quants.quantize(w, qt), raw_dtype=qt)
-                return
-            if wq == QT.TQ1_P:
-                if T.shape[1] % 1024 == 0:
-                    rname = name[:-len(".weight")] + ".ttf_r" if name.endswith(".weight") else name + "_r"
-                    self.gguf_writer.add_tensor(name, gguf.quants.quantize(T.float().numpy(), QT.TQ1_P),
-                                                raw_dtype=QT.TQ1_P)
-                    self._vec(rname, s)
-                    return
-                log(f"{name}: {T.shape[1]} columns, not a multiple of 1024: stored as TQ1_0")
-                self.gguf_writer.add_tensor(name, pack_ternary(T, s, QT.TQ1_0), raw_dtype=QT.TQ1_0)
                 return
             self.gguf_writer.add_tensor(name, pack_ternary(T, s, wq), raw_dtype=wq)
 
