@@ -1,8 +1,9 @@
 """ttf: train, convert, fine-tune and run ternary (TTF) language models on a home computer.
 
   ttf doctor                                   what this machine has (GPU, memory, the engine, the trainer)
-  ttf engine build [--backend cuda|cpu|metal|vulkan]
-                                               build the inference engine (llama.cpp with the TTF patches)
+  ttf engine build [--backend cuda|cpu|metal|vulkan] [--q38]
+                                               build the inference engine (llama.cpp with the TTF patches);
+                                               --q38: the engine for Qwen3.8-Flash-Next (MoE) models
   ttf data INPUT... --out DATA [--tokenizer llama2|DIR] [--val 0.005]
                                                text / Markdown / JSONL (text or chat messages) -> token files
   ttf train --data DATA --out RUN [--size auto|tiny|small|medium|large] [--hours H] [TTF knobs]
@@ -27,24 +28,63 @@ import sys
 from pathlib import Path
 
 HOME = Path(__file__).resolve().parents[1]
-ENGINE_BASE = "0ef6f06d5"                    # the llama.cpp commit the patches apply to
+ENGINE_BASE = "0ef6f06d5"                    # the llama.cpp commit the patches in llama.cpp/ apply to
+ENGINE_BASE_Q38 = "ca89968a2"                # the commit the Qwen3.8-Flash-Next patches in llama.cpp/q38/ apply to
 ENGINE_URL = "https://github.com/ggml-org/llama.cpp"
+Q38_ARCH = "qwen4exp"                        # llama.cpp's architecture name for Qwen3.8-Flash-Next
 
 
 # ------------------------------------------------------------------------------------------------ environment
 
-def engine_dir():
+def engine_dir(q38=False):
+    if q38:
+        return Path(os.environ.get("TTF_LLAMA_CPP_Q38", "~/.cache/ttf/llama.cpp-q38")).expanduser()
     return Path(os.environ.get("TTF_LLAMA_CPP", "~/.cache/ttf/llama.cpp")).expanduser()
 
 
-def engine_bin(name):
+def engine_bin(name, q38=False):
     """a llama.cpp binary: the GPU build first"""
-    d = engine_dir()
+    d = engine_dir(q38)
     for b in ("build-cuda", "build-metal", "build-vulkan", "build-cpu", "build"):
         p = d / b / "bin" / name
         if p.exists():
             return p
-    raise SystemExit(f"{name} not found under {d}: run `ttf engine build` (or set TTF_LLAMA_CPP)")
+    how = "ttf engine build --q38` (or set TTF_LLAMA_CPP_Q38)" if q38 else "ttf engine build` (or set TTF_LLAMA_CPP)"
+    raise SystemExit(f"{name} not found under {d}: run `{how}")
+
+
+def gguf_arch(path):
+    """general.architecture of a GGUF file, read from its header (no gguf package needed)"""
+    import struct
+    size = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+    def u(f, fmt):
+        return struct.unpack("<" + fmt, f.read(struct.calcsize(fmt)))[0]
+
+    def skip(f, vt):
+        if vt == 8:
+            f.seek(u(f, "Q"), 1)
+        elif vt == 9:
+            et, n = u(f, "I"), u(f, "Q")
+            if et in size:
+                f.seek(n * size[et], 1)
+            else:
+                for _ in range(n):
+                    skip(f, et)
+        else:
+            f.seek(size[vt], 1)
+
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise SystemExit(f"{path}: not a GGUF file")
+        u(f, "I"); u(f, "Q")
+        for _ in range(u(f, "Q")):
+            key = f.read(u(f, "Q")).decode()
+            vt = u(f, "I")
+            if key == "general.architecture" and vt == 8:
+                return f.read(u(f, "Q")).decode()
+            skip(f, vt)
+    return None
 
 
 def gpu_info():
@@ -94,9 +134,12 @@ def cmd_doctor(a):
         print(f"ttf-conversion: {Path(ttfconv.__file__).parent}")
     except ImportError:
         print("ttf-conversion: not importable (needed by `ttf convert`)")
-    d = engine_dir()
-    bins = [b for b in ("build-cuda", "build-metal", "build-vulkan", "build-cpu", "build") if (d / b / "bin" / "llama-cli").exists()]
-    print(f"engine: {d} ({', '.join(bins) or 'not built: ttf engine build'})")
+    for q38 in (False, True):
+        d = engine_dir(q38)
+        bins = [b for b in ("build-cuda", "build-metal", "build-vulkan", "build-cpu", "build")
+                if (d / b / "bin" / "llama-cli").exists()]
+        what = "Flash-Next engine" if q38 else "engine"
+        print(f"{what}: {d} ({', '.join(bins) or 'not built: ttf engine build' + (' --q38' if q38 else '')})")
 
 
 def _max_params_b(gib):
@@ -107,13 +150,13 @@ def _max_params_b(gib):
 # ---------------------------------------------------------------------------------------------------- engine
 
 def cmd_engine(a):
-    d = engine_dir()
+    d = engine_dir(a.q38)
     if a.action == "build":
         if not (d / ".git").exists():
             d.parent.mkdir(parents=True, exist_ok=True)
             run(["git", "clone", ENGINE_URL, d])
-            run(["git", "-C", d, "checkout", "-B", "ttf", ENGINE_BASE])
-            patches = sorted((HOME / "llama.cpp").glob("*.patch"))
+            run(["git", "-C", d, "checkout", "-B", "ttf", ENGINE_BASE_Q38 if a.q38 else ENGINE_BASE])
+            patches = sorted((HOME / "llama.cpp" / ("q38" if a.q38 else "")).glob("*.patch"))
             run(["git", "-C", d, "-c", "user.name=ttf", "-c", "user.email=ttf@localhost", "am", *patches])
         flags = {"cuda": ["-DGGML_CUDA=ON"], "cpu": ["-DGGML_CUDA=OFF"], "metal": ["-DGGML_METAL=ON"],
                  "vulkan": ["-DGGML_VULKAN=ON"]}[a.backend]
@@ -332,24 +375,34 @@ def cmd_export(a, extra):
         export(a.ckpt, a.base, a.out, a.wtype, a.emb, a.head)
 
 
-def _ngl():
-    return ["-ngl", "999"] if gpu_info() or sys.platform == "darwin" else []
+def _engine(name, model, extra):
+    """(binary, GPU-offload flags) for a model: Flash-Next (MoE) models take the q38 engine and let llama.cpp fit the
+    experts that do not fit on the GPU into host memory (its default --fit); the dense ones go fully on the GPU"""
+    if gguf_arch(model) == Q38_ARCH:
+        return engine_bin(name, q38=True), []
+    gpu = gpu_info() or sys.platform == "darwin"
+    user = any(x in ("-ngl", "--n-gpu-layers", "--gpu-layers") for x in extra)
+    return engine_bin(name), (["-ngl", "999"] if gpu and not user else [])
 
 
 def cmd_chat(a, extra):
-    run([engine_bin("llama-cli"), "-m", a.model, *_ngl(), "-cnv", *extra])
+    b, ngl = _engine("llama-cli", a.model, extra)
+    run([b, "-m", a.model, *ngl, "-cnv", *extra])
 
 
 def cmd_generate(a, extra):
-    run([engine_bin("llama-completion"), "-m", a.model, *_ngl(), "-p", a.prompt, "-n", a.n, "-no-cnv", *extra])
+    b, ngl = _engine("llama-completion", a.model, extra)
+    run([b, "-m", a.model, *ngl, "-p", a.prompt, "-n", a.n, "-no-cnv", *extra])
 
 
 def cmd_serve(a, extra):
-    run([engine_bin("llama-server"), "-m", a.model, *_ngl(), "--port", a.port, "--host", a.host, *extra])
+    b, ngl = _engine("llama-server", a.model, extra)
+    run([b, "-m", a.model, *ngl, "--port", a.port, "--host", a.host, *extra])
 
 
 def cmd_bench(a, extra):
-    run([engine_bin("llama-bench"), "-m", a.model, *_ngl(), *extra])
+    b, ngl = _engine("llama-bench", a.model, extra)
+    run([b, "-m", a.model, *ngl, *extra])
 
 
 def cmd_score(a, extra):
@@ -379,6 +432,7 @@ def main(argv=None):
     p.add_argument("--backend", default="cuda" if gpu_info() else ("metal" if sys.platform == "darwin" else "cpu"),
                    choices=["cuda", "cpu", "metal", "vulkan"])
     p.add_argument("--cmake", nargs="*", default=[])
+    p.add_argument("--q38", action="store_true", help="the engine for Qwen3.8-Flash-Next models (llama.cpp/q38/)")
     p = sp.add_parser("data"); p.add_argument("inputs", nargs="+"); p.add_argument("--out", required=True)
     p.add_argument("--tokenizer", default="llama2", help="llama2 (scratch models) or the base model's dir (conversions)")
     p.add_argument("--val", type=float, default=0.005)

@@ -1,4 +1,5 @@
-"""Q38 (Qwen3.8-Flash-Next) TTF conversion -> GGUF for llama.cpp's qwen4exp (branch ttf-q38: TQ1_P + TTF format 2).
+"""Q38 (Qwen3.8-Flash-Next) TTF conversion -> GGUF for llama.cpp's qwen4exp (the patches in llama.cpp/q38/: TQ1_P +
+TTF format 2; `ttf engine build --q38` makes that tree, and its gguf-py is used here).
 
 Inputs: a slim TTF checkpoint (a directory of L{i}.pt = {"layer": layer i's trained tensors}, from the trainer's
 slim save), the HF slim directory (config, tokenizer and the non-expert float weights; the experts and the PLE table
@@ -30,7 +31,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-LLAMA = Path(os.environ.get("TTF_LLAMA", str(Path.home() / "Programs/llama.cpp")))
+from .cli import engine_dir                    # noqa: E402
+LLAMA = engine_dir(q38=True)
 sys.path[:0] = [str(LLAMA / "gguf-py"), str(LLAMA)]
 import gguf                                    # noqa: E402
 from conversion import get_model_class         # noqa: E402

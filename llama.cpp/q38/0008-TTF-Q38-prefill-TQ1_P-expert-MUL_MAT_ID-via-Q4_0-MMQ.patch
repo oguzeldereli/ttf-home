@@ -1,0 +1,174 @@
+From 1b73a5e9dae0d6f0ebb494bb1df94965776c8a01 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Sat, 7 Nov 2026 14:40:59 +0000
+Subject: [PATCH 8/8] TTF Q38 prefill: TQ1_P expert MUL_MAT_ID via Q4_0 MMQ;
+ per-expert side vectors stay off the -ncmoe CPU override
+
+- batched TQ1_P MUL_MAT_ID: expand the trits to Q4_0 (d = 1, nibble = v + 8, exact) in a pool buffer and run the
+  Q4_0 MMQ kernels instead of the per-expert fallback (host sync, dequantise + cuBLAS per expert); mmq.cu tolerates
+  a src0 with no buffer (the pool copy)
+- LLM_FFN_EXPS_REGEX skips .ttf_c/.ttf_m/.ttf_r/.ttf_b: on the CPU their GET_ROWS and the elementwise ops on
+  [n_ff, n_tokens*top_k] ran there and split the graph 167 times per ubatch
+
+Q38 r4s1000 (40.4 GB), 3090 Ti, -ncmoe 33 -lm none, pp2048 at ub 2048: 213 -> 787 tok/s; pp4096 at ub 4096 955.
+---
+ common/common.h                 |  4 ++-
+ ggml/src/ggml-cuda/convert.cu   | 32 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/convert.cuh  |  3 +++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 43 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmq.cu       |  2 +-
+ 5 files changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/common/common.h b/common/common.h
+index 4005275ca..9ca1134b9 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1255,7 +1255,9 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
+ // FFN offload utils
+ //
+ 
+-const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
++// TTF: the per-expert side vectors (.ttf_c/.ttf_m/.ttf_r/.ttf_b, ~10 MB per layer) stay with the compute: on the CPU
++// their GET_ROWS + the elementwise ops on [n_ff, n_tokens*top_k] split the graph (prefill 240 -> 705 tok/s on Q38)
++const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps(?!\\.ttf_[cmrb])";
+ 
+ const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
+ 
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 1af0598cc..9df982782 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -338,6 +338,38 @@ static void dequantize_row_tq1_p_cuda(const void * vx, dst_t * y, const int64_t
+     dequantize_block_tq1_p<<<nb, QK_TQ1_P, 0, stream>>>(vx, y);
+ }
+ 
++// TQ1_P -> Q4_0 with d = 1 (nibble = v + 8: the same values) for the MMQ expert path. Digit plane n of a TQ1_P block
++// (elements 32 n .. 32 n + 31 = digit n of bytes 0..31) is Q4_0 block 5 i + n; one thread per output qs byte.
++static __global__ void tq1_p_to_q4_0_kernel(const block_tq1_p * __restrict__ x, block_q4_0 * __restrict__ y, const int64_t n_out) {
++    const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (t >= n_out) {
++        return;
++    }
++    const int64_t i = t / (5*QK4_0/2);
++    const int     r = t % (5*QK4_0/2);
++    const int     n = r / (QK4_0/2);
++    const int     j = r % (QK4_0/2);
++    const uint32_t pow3[5] = {1, 3, 9, 27, 81};
++    const uint32_t ql = ((uint32_t) x[i].qs[j]           * pow3[n]) & 0xFF;
++    const uint32_t qh = ((uint32_t) x[i].qs[j + QK4_0/2] * pow3[n]) & 0xFF;
++    // digit = v + 1 in {0, 1, 2}; nibble = v + 8 = digit + 7
++    block_q4_0 & o = y[5*i + n];
++    o.qs[j] = (uint8_t) ((((ql * 3) >> 8) + 7) | ((((qh * 3) >> 8) + 7) << 4));
++    if (j == 0) {
++        o.d = __float2half(1.0f);
++    }
++}
++
++void ggml_cuda_tq1_p_to_q4_0(const void * vx, void * vy, const int64_t k, cudaStream_t stream) {
++    static_assert(QK_TQ1_P == 5*QK4_0, "TQ1_P block = 5 Q4_0 blocks");
++    const int64_t nb    = k / QK_TQ1_P;
++    const int64_t n_out = nb * (5*QK4_0/2);
++    if (n_out > 0) {
++        const int threads = 256;
++        tq1_p_to_q4_0_kernel<<<(n_out + threads - 1) / threads, threads, 0, stream>>>((const block_tq1_p *) vx, (block_q4_0 *) vy, n_out);
++    }
++}
++
+ template<typename dst_t>
+ static void dequantize_row_tq1_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = k / QK_K;
+diff --git a/ggml/src/ggml-cuda/convert.cuh b/ggml/src/ggml-cuda/convert.cuh
+index 91255ccf3..7a5a1590d 100644
+--- a/ggml/src/ggml-cuda/convert.cuh
++++ b/ggml/src/ggml-cuda/convert.cuh
+@@ -64,3 +64,6 @@ template<typename dst_t, typename src_t>
+         return float(x);
+     }
+ }
++
++// TQ1_P -> Q8_0 (d = 1): the batched TQ1_P expert products use the Q8_0 MMQ kernels (ggml-cuda.cu)
++void ggml_cuda_tq1_p_to_q4_0(const void * vx, void * vy, int64_t k, cudaStream_t stream);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cc3dde044..77f0fb0ad 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2315,6 +2315,40 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }
+ 
++// TQ1_P has no MMQ tile (its 160-value blocks do not divide MMQ_ITER_K): batched expert products expand the trits to
++// Q4_0 (d = 1, nibble = v + 8: the same values) in a pool buffer and use the Q4_0 MMQ kernels. Without this the
++// batched TQ1_P MUL_MAT_ID took the per-expert fallback (host sync, dequantise + cuBLAS per expert). Q4_0 rather than
++// Q8_0: the expand writes 4.5 instead of 8.5 bits per weight (Q38 prefill pp2048 705 -> 787 tok/s); the zero padding
++// has d = 0, so it reads as 0.
++static bool ggml_cuda_tq1_p_via_q4_0(const ggml_tensor * src0, const int cc, const int64_t ne12) {
++    return src0->type == GGML_TYPE_TQ1_P && ggml_is_contiguous(src0) && src0->ne[0] % QK4_0 == 0 &&
++        ggml_cuda_should_use_mmq(GGML_TYPE_Q4_0, cc, ne12, /*n_experts=*/src0->ne[2]);
++}
++
++static void ggml_cuda_mul_mat_id_tq1_p_q4_0(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
++                                           const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    cudaStream_t stream = ctx.stream();
++    const int64_t n      = ggml_nelements(src0);
++    const size_t  size   = (size_t) (n / QK4_0) * sizeof(block_q4_0);
++    // MMQ may read up to MATRIX_ROW_PADDING values past the last row (y is zero there): keep that tail finite
++    const size_t  pad    = (size_t) (MATRIX_ROW_PADDING / QK4_0) * sizeof(block_q4_0);
++    ggml_cuda_pool_alloc<char> q4(ctx.pool(), size + pad);
++    CUDA_CHECK(cudaMemsetAsync(q4.get() + size, 0, pad, stream));
++    ggml_cuda_tq1_p_to_q4_0(src0->data, q4.get(), n, stream);
++
++    ggml_tensor x = *src0;
++    x.type  = GGML_TYPE_Q4_0;
++    x.data  = q4.get();
++    x.nb[0] = sizeof(block_q4_0);
++    x.nb[1] = x.nb[0] * (x.ne[0] / QK4_0);
++    for (int i = 2; i < GGML_MAX_DIMS; ++i) {
++        x.nb[i] = x.nb[i - 1] * x.ne[i - 1];
++    }
++    x.buffer   = nullptr;   // (a pool buffer, already padded and cleared above)
++    x.view_src = nullptr;
++    ggml_cuda_mul_mat_q(ctx, &x, src1, ids, dst);
++}
++
+ // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
+ // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
+@@ -2341,6 +2375,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
+         return false;
+     }
+ 
++    if (ggml_cuda_tq1_p_via_q4_0(src0, cc, src1->ne[2])) {
++        return false;
++    }
++
+     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+         return false;
+     }
+@@ -2384,6 +2422,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+             return;
+         }
+ 
++        if (ggml_cuda_tq1_p_via_q4_0(src0, cc, ne12)) {
++            ggml_cuda_mul_mat_id_tq1_p_q4_0(ctx, src0, src1, ids, dst);
++            return;
++        }
++
+         if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+             return;
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 367657508..8d7f19038 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -209,7 +209,7 @@ void ggml_cuda_mul_mat_q(
+ 
+     // If src0 (or the fused gate weight) is a temporary compute buffer, clear any potential padding.
+     for (const ggml_tensor * t : { src0, gate }) {
+-        if (t && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        if (t && t->buffer && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {   // (no buffer: a pool copy, padded by its maker)
+             const size_t size_data  = ggml_nbytes(t);
+             const size_t size_alloc = ggml_backend_buffer_get_alloc_size(t->buffer, t);
+             if (size_alloc > size_data) {
+-- 
+2.55.0
+

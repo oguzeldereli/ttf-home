@@ -1,0 +1,431 @@
+From f2a4fb147f54adcf0f838118c1ca5a546a9165c9 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Sat, 7 Nov 2026 01:11:04 +0000
+Subject: [PATCH 7/8] llama: TTF format 2 (row scale, shared-input adapter,
+ expert side tensors) + PQ PLE table for qwen4exp
+
+ttf_r: row scale after the product (scale-free trit types); ttf_ad / ttf_au: adapter on the centred input.
+Expert weights [K, N, E] take [n, E] side vectors gathered by the routed ids, ttf_ad / ttf_au via mul_mat_id.
+qwen4exp: per_layer_token_embd.pq_cb (codebooks) + pq_blob (keep bitmap, ranks, codes; host) in place of the
+dense PLE table; the host maps rows to codebook entries, the rotation is folded into ple_key / ple_value.
+---
+ src/llama-graph.cpp        | 73 ++++++++++++++++++++++++++++++++-
+ src/llama-graph.h          |  7 ++++
+ src/llama-model-loader.cpp |  9 ++++
+ src/llama-model.cpp        | 34 ++++++++++++++-
+ src/llama-model.h          |  2 +
+ src/llama-ttf.h            |  8 ++++
+ src/models/qwen4exp.cpp    | 84 ++++++++++++++++++++++++++++++++++++--
+ 7 files changed, 210 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 92be20e36..3a04c796b 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1682,6 +1682,9 @@ ggml_tensor * llm_graph_context::build_ttf_mm(
+         cur = ggml_add(ctx0, cur, l.m);
+     }
+     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
++    if (l.r) {
++        res = ggml_mul(ctx0, res, l.r);
++    }
+     if (l.b) {
+         res = ggml_add(ctx0, res, l.b);
+     }
+@@ -1702,7 +1705,24 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+         }
+     }
+ 
+-    if (te) {
++    if (te && te->ad) {
++        // format 2: the adapter reads the main product's centred input
++        ggml_tensor * xc = cur;
++        if (te->main.c) {
++            xc = ggml_mul(ctx0, xc, te->main.c);
++        }
++        if (te->main.m) {
++            xc = ggml_add(ctx0, xc, te->main.m);
++        }
++        res = ggml_mul_mat(ctx0, w, xc);
++        if (te->main.r) {
++            res = ggml_mul(ctx0, res, te->main.r);
++        }
++        res = ggml_add(ctx0, res, ggml_mul_mat(ctx0, te->au, ggml_mul_mat(ctx0, te->ad, xc)));
++        if (te->main.b) {
++            res = ggml_add(ctx0, res, te->main.b);
++        }
++    } else if (te) {
+         res = build_ttf_mm(w, cur, te->main);
+         if (te->d && te->u) {
+             ggml_tensor * h = build_ttf_mm(te->d, cur, te->dl);
+@@ -1788,12 +1808,63 @@ llm_graph_amax_src1 llm_graph_context::build_amax_src1_f16(
+     return result;
+ }
+ 
++// TTF expert product: per expert e (ids), y = r_e * (W_e (c_e * x + m_e)) + au_e (ad_e (c_e * x + m_e)) + b_e.
++// The per-expert side vectors [n, E] are gathered by the flattened ids: [n, n_used * n_tokens] -> [n, n_used, n_tokens].
++ggml_tensor * llm_graph_context::build_ttf_mm_id(
++          ggml_tensor * w,
++          ggml_tensor * cur,
++          ggml_tensor * ids,
++          ggml_tensor * slots,
++  const llama_ttf_ext & te) const {
++    const int64_t n_used   = ids->ne[0];
++    const int64_t n_tokens = ids->ne[1];
++    ggml_tensor * ids_flat = nullptr;
++    auto sel = [&](ggml_tensor * v) -> ggml_tensor * {
++        if (ids_flat == nullptr) {
++            ids_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, ids), n_used * n_tokens);
++        }
++        return ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, v, ids_flat), v->ne[0], n_used, n_tokens);
++    };
++    ggml_tensor * xc = cur; // [K, 1 or n_used, n_tokens]
++    if (te.main.c) {
++        xc = ggml_mul(ctx0, sel(te.main.c), xc);
++    }
++    if (te.main.m) {
++        xc = ggml_add(ctx0, xc, sel(te.main.m));
++    }
++    ggml_tensor * res = slots == nullptr ?
++        ggml_mul_mat_id(ctx0, w, xc, ids) :
++        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), xc, slots);
++    if (te.main.r) {
++        res = ggml_mul(ctx0, res, sel(te.main.r));
++    }
++    if (te.ad && te.au) {
++        ggml_tensor * h = ggml_mul_mat_id(ctx0, te.ad, xc, ids);         // [R, n_used, n_tokens]
++        res = ggml_add(ctx0, res, ggml_mul_mat_id(ctx0, te.au, h, ids));
++    }
++    if (te.main.b) {
++        res = ggml_add(ctx0, res, sel(te.main.b));
++    }
++    return res;
++}
++
+ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * w,   // ggml_tensor * as
+           ggml_tensor * cur, // ggml_tensor * b
+           ggml_tensor * ids,
+           ggml_tensor * w_s,
+           ggml_tensor * slots) const {
++    const llama_ttf_ext * te = nullptr;
++    if (ttf && !ttf->empty()) {
++        auto it = ttf->find(w);
++        if (it != ttf->end()) {
++            te = &it->second;
++        }
++    }
++    if (te) {
++        return build_ttf_mm_id(w, cur, ids, slots, *te);
++    }
++
+     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
+     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+     // the experts in the MoE cache are selected by their slots
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index beaf7048f..a70347802 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1119,6 +1119,13 @@ struct llm_graph_context {
+               ggml_tensor * cur) const;
+ 
+     // x -> mul_mat(w, c * x + m) + b for one TTF part (c / m / b optional)
++    ggml_tensor * build_ttf_mm_id(
++              ggml_tensor * w,
++              ggml_tensor * cur,
++              ggml_tensor * ids,
++              ggml_tensor * slots,
++      const llama_ttf_ext & te) const;
++
+     ggml_tensor * build_ttf_mm(
+               ggml_tensor * w,
+               ggml_tensor * cur,
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 485483ba1..2d084a08b 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1206,6 +1206,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         } else if (hparams.router_layer >= 0 && tn.suffix != nullptr &&
+                 (strcmp(tn.suffix, "lora_a") == 0 || strcmp(tn.suffix, "lora_b") == 0)) {
+             op = GGML_OP_MUL_MAT_ID;
++        } else if (tn.suffix != nullptr && strncmp(tn.suffix, "ttf_", 4) == 0 &&
++                strcmp(tn.suffix, "ttf_d") != 0 && strcmp(tn.suffix, "ttf_u") != 0 && strcmp(tn.suffix, "ttf_fd") != 0 &&
++                strcmp(tn.suffix, "ttf_fu") != 0 && strcmp(tn.suffix, "ttf_ad") != 0 && strcmp(tn.suffix, "ttf_au") != 0) {
++            // TTF side vectors ([n] or [n, E]): elementwise / gathered
++            op = GGML_OP_ADD;
+         } else {
+             op = info.op;
+         }
+@@ -1224,6 +1229,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+         if (is_lazy) {
+             return lazy_read::buft();
+         }
++        // the TTF PQ PLE blob is read by the host (set_input), never by a graph op
++        if (tn.suffix != nullptr && strcmp(tn.suffix, "pq_blob") == 0) {
++            return lazy_read::buft();
++        }
+ 
+         // select the buffer type for this tensor
+         const buft_list_t * buft_list;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 931cbbd9a..1e366a3bc 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1966,12 +1966,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // TTF side tensors: optional, next to the weight they belong to (see llama-ttf.h)
+     {
+         const auto tn = LLM_TN(arch);
++        int64_t ttf_E = 1; // the expert count of the weight being loaded (1: a dense weight)
+         auto ttf_vec = [&](llm_tensor e, const char * suf, int bid, int64_t n) -> ggml_tensor * {
+             const std::string name = tn(e, suf, bid);
+             const ggml_tensor * meta = ml.get_tensor_meta(name.c_str());
+             if (!meta) {
+                 return nullptr;
+             }
++            if (ttf_E > 1) {
++                if (ggml_n_dims(meta) != 2 || meta->ne[0] != n || meta->ne[1] != ttf_E) {
++                    throw std::runtime_error(format("TTF tensor %s: expected [%lld, %lld]", name.c_str(), (long long) n, (long long) ttf_E));
++                }
++                return create_tensor(tn(e, suf, bid), {n, ttf_E}, TENSOR_NOT_REQUIRED);
++            }
+             if (ggml_n_dims(meta) != 1 || meta->ne[0] != n) {
+                 throw std::runtime_error(format("TTF tensor %s: expected [%lld]", name.c_str(), (long long) n));
+             }
+@@ -1986,18 +1993,33 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             // K or N may be the adapter rank (-1: take it from the file)
+             const int64_t k = K < 0 ? meta->ne[0] : K;
+             const int64_t n = N < 0 ? meta->ne[1] : N;
++            if (ttf_E > 1) {
++                return create_tensor(tn(e, suf, bid), {k, n, ttf_E}, TENSOR_NOT_REQUIRED);
++            }
+             return create_tensor(tn(e, suf, bid), {k, n}, TENSOR_NOT_REQUIRED);
+         };
+         auto ttf_load = [&](llm_tensor e, ggml_tensor * w, int bid) {
+-            if (!w || ggml_n_dims(w) != 2) {
++            if (!w || ggml_n_dims(w) < 2) {
+                 return;
+             }
+             const int64_t K = w->ne[0];
+             const int64_t N = w->ne[1];
++            ttf_E = ggml_n_dims(w) == 3 ? w->ne[2] : 1;
+             llama_ttf_ext te;
+             te.main.c = ttf_vec(e, "ttf_c", bid, K);
+             te.main.m = ttf_vec(e, "ttf_m", bid, K);
+             te.main.b = ttf_vec(e, "ttf_b", bid, N);
++            te.main.r = ttf_vec(e, "ttf_r", bid, N);
++            te.ad = ttf_mat(e, "ttf_ad", bid, K, -1);
++            if (te.ad) {
++                te.au = ttf_mat(e, "ttf_au", bid, te.ad->ne[1], N);
++                if (!te.au) {
++                    throw std::runtime_error(format("TTF adapter %s has a down layer but no up layer", tn(e, "ttf_ad", bid).str().c_str()));
++                }
++            }
++            if (ttf_E > 1 && (te.d || te.fd)) {
++                throw std::runtime_error("TTF: expert weights take only format-2 side tensors");
++            }
+             te.d = ttf_mat(e, "ttf_d", bid, K, -1);
+             if (te.d) {
+                 const int64_t r = te.d->ne[1];
+@@ -2026,9 +2048,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 te.ful.m = ttf_vec(e, "ttf_fu_m", bid, r);
+                 te.ful.b = ttf_vec(e, "ttf_fu_b", bid, N);
+             }
+-            if (te.main.c || te.main.m || te.main.b || te.d || te.fd) {
++            if (te.main.c || te.main.m || te.main.b || te.main.r || te.d || te.fd || te.ad) {
+                 ttf[w] = te;
+             }
++            ttf_E = 1;
+         };
+         {
+             for (int i = 0; i < n_layer_all; ++i) {
+@@ -2046,6 +2069,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 ttf_load(LLM_TENSOR_SSM_OUT,    layer.ssm_out,   i);
+                 ttf_load(LLM_TENSOR_SSM_ALPHA,  layer.ssm_alpha, i);
+                 ttf_load(LLM_TENSOR_SSM_BETA,   layer.ssm_beta,  i);
++                ttf_load(LLM_TENSOR_FFN_GATE_SHEXP,   layer.ffn_gate_shexp,   i);
++                ttf_load(LLM_TENSOR_FFN_UP_SHEXP,     layer.ffn_up_shexp,     i);
++                ttf_load(LLM_TENSOR_FFN_DOWN_SHEXP,   layer.ffn_down_shexp,   i);
++                ttf_load(LLM_TENSOR_FFN_GATE_UP_EXPS, layer.ffn_gate_up_exps, i);
++                ttf_load(LLM_TENSOR_FFN_GATE_EXPS,    layer.ffn_gate_exps,    i);
++                ttf_load(LLM_TENSOR_FFN_UP_EXPS,      layer.ffn_up_exps,      i);
++                ttf_load(LLM_TENSOR_FFN_DOWN_EXPS,    layer.ffn_down_exps,    i);
+             }
+             if (!ttf.empty()) {
+                 LLAMA_LOG_INFO("%s: TTF side tensors on %zu weights\n", __func__, ttf.size());
+diff --git a/src/llama-model.h b/src/llama-model.h
+index ee201ff55..204411cec 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -860,6 +860,8 @@ struct llama_model {
+     struct ggml_tensor * altup_proj           = nullptr;
+     struct ggml_tensor * altup_unembd_proj    = nullptr;
+     struct ggml_tensor * per_layer_tok_embd   = nullptr;
++    struct ggml_tensor * ple_pq_cb            = nullptr; // TTF PQ PLE table: codebooks F32 [D, n_heads * n_sub * K + 1]
++    struct ggml_tensor * ple_pq_blob          = nullptr; // TTF PQ PLE table: keep bitmap, ranks, codes (host, see qwen4exp)
+ 
+     // limite value embeddings
+     struct ggml_tensor * value_embd = nullptr;
+diff --git a/src/llama-ttf.h b/src/llama-ttf.h
+index 3f5118c70..7187b834b 100644
+--- a/src/llama-ttf.h
++++ b/src/llama-ttf.h
+@@ -7,6 +7,11 @@
+ // the weight in the GGUF: <base>.ttf_c / ttf_m / ttf_b, <base>.ttf_d (+ _c / _m / _b), <base>.ttf_u (+ _c / _m / _b).
+ // A second adapter of the same form, <base>.ttf_fd / ttf_fu (+ _c / _m / _b), adds its output too: the float low-rank
+ // adapter of a layer that also has a ternary one.
++//
++// Format 2 (Q38, 7 Nov 2026): <base>.ttf_r is a row scale applied after the product (before ttf_b), so W can be a
++// scale-free trit type (TQ1_P); <base>.ttf_ad [K, R] / ttf_au [R, N] is an adapter that reads the main product's
++// centred input c * x + m (ttf_au carries all its scales). For expert weights [K, N, E] every side tensor has a
++// trailing expert dimension: ttf_c / ttf_m [K, E], ttf_r / ttf_b [N, E], ttf_ad [K, R, E], ttf_au [R, N, E].
+ 
+ #include "ggml.h"
+ 
+@@ -16,6 +21,7 @@ struct llama_ttf_lin {
+     ggml_tensor * c = nullptr; // [K] column scale
+     ggml_tensor * m = nullptr; // [K] -c * mu (centring)
+     ggml_tensor * b = nullptr; // [N] bias
++    ggml_tensor * r = nullptr; // [N] row scale (after the product, before b)
+ };
+ 
+ struct llama_ttf_ext {
+@@ -28,6 +34,8 @@ struct llama_ttf_ext {
+     llama_ttf_lin fdl;
+     ggml_tensor * fu = nullptr; // [r2, N] second adapter up
+     llama_ttf_lin ful;
++    ggml_tensor * ad = nullptr; // [K, R] adapter down on the centred input
++    ggml_tensor * au = nullptr; // [R, N] adapter up (scales folded)
+ };
+ 
+ using llama_ttf_map = std::unordered_map<const ggml_tensor *, llama_ttf_ext>;
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index c543edf0a..4dabe51e8 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -203,9 +203,27 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+             ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
+         }
+ 
++        // TTF: the product-quantised table (per_layer_token_embd.pq_cb / pq_blob) in place of the dense one
++        const std::string pq_cb_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "pq_cb").str();
++        const std::string pq_bl_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "pq_blob").str();
++        const ggml_tensor * pq_cb_meta = ml.get_tensor_meta(pq_cb_name.c_str());
++        const ggml_tensor * pq_bl_meta = ml.get_tensor_meta(pq_bl_name.c_str());
+         // the converter pads the table; a model synthesised from metadata has no tensor to ask
+         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
++        if (pq_cb_meta && pq_bl_meta) {
++            ple_pq_cb   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "pq_cb"),   { pq_cb_meta->ne[0], pq_cb_meta->ne[1] }, 0);
++            ple_pq_blob = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "pq_blob"), { pq_bl_meta->ne[0] }, TENSOR_READ_LAZY);
++            const int64_t D   = ple_pq_cb->ne[0];
++            const int64_t nS  = hparams.ple_head_dim / D;
++            const int64_t K   = (ple_pq_cb->ne[1] - 1) / ((int64_t) hparams.ple_n_heads * nS);
++            const int64_t n_w = (ple_rows + 63) / 64;
++            if (hparams.ple_head_dim % D != 0 || K * hparams.ple_n_heads * nS + 1 != ple_pq_cb->ne[1] || K > 256 ||
++                    ple_pq_blob->type != GGML_TYPE_I8 || ple_pq_blob->ne[0] < 12 * n_w) {
++                throw std::runtime_error("PLE PQ tensors do not match the PLE heads");
++            }
++            LLAMA_LOG_INFO("%s: PLE table product-quantised: D %" PRId64 ", K %" PRId64 ", %" PRId64 " rows kept of %" PRId64 "\n",
++                           __func__, D, K, (ple_pq_blob->ne[0] - 12 * n_w) / nS, ple_rows);
++        } else if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+             if (ple_w->tensor->ne[1] < ple_rows) {
+                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
+@@ -213,8 +231,10 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
+             ple_rows = ple_w->tensor->ne[1];
+         }
+ 
+-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
++        if (!ple_pq_cb) {
++            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
++                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
++        }
+     }
+ 
+     auto load_block = [&](int il, int flags) {
+@@ -1285,10 +1305,13 @@ public:
+ 
+     bool can_reuse(const llm_graph_params & params) override {
+         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
++        const int64_t n = (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
++        return rows ? rows->ne[0] == n : cidx->ne[0] == n * n_sub;
+     }
+ 
+     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
++    ggml_tensor * cidx = nullptr;   // TTF PQ table: I32 [n_sub * ple_n_heads * n_tokens] codebook entries (rows is null)
++    int64_t n_sub = 0;              // sub-vectors per head row (PQ)
+ 
+     const llama_model & model;
+ 
+@@ -1360,6 +1383,45 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+         }
+     }
+ 
++    if (cidx) {
++        // PQ table: row -> kept? (bitmap) -> rank -> n_sub codes -> codebook entries (h * n_sub + j) * K + code;
++        // a pruned row reads the zero entry (the last one)
++        const int64_t total = model.ple_pq_blob->ne[0];
++        const int64_t n_cb  = model.ple_pq_cb->ne[1];
++        const int64_t K     = (n_cb - 1) / (n_heads * n_sub);
++        int64_t n_rows = 0;
++        for (int64_t h = 0; h < n_heads; ++h) {
++            n_rows = std::max(n_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
++        }
++        const int64_t n_w = (n_rows + 63) / 64;
++        const uint8_t  * blob  = (const uint8_t *) model.ple_pq_blob->data;
++        const uint64_t * bits  = (const uint64_t *) blob;
++        const uint32_t * rank  = (const uint32_t *) (blob + 8 * n_w);
++        const uint8_t  * codes = blob + 12 * n_w;
++        GGML_UNUSED(total);
++        std::vector<int32_t> ci(n_sub * n_heads * n_tokens);
++        for (int64_t q = 0; q < n_heads * n_tokens; ++q) {
++            const int64_t h = q % n_heads;
++            const uint64_t r = (uint64_t) idx[q];
++            const uint64_t w = bits[r >> 6];
++            const uint64_t b = r & 63;
++            int32_t * out = ci.data() + q * n_sub;
++            if ((w >> b) & 1) {
++                const uint64_t kr = rank[r >> 6] + (uint64_t) __builtin_popcountll(w & ((1ull << b) - 1));
++                const uint8_t * c = codes + kr * n_sub;
++                for (int64_t j = 0; j < n_sub; ++j) {
++                    out[j] = (int32_t) ((h * n_sub + j) * K + c[j]);
++                }
++            } else {
++                for (int64_t j = 0; j < n_sub; ++j) {
++                    out[j] = (int32_t) (n_cb - 1);
++                }
++            }
++        }
++        ggml_backend_tensor_set(cidx, ci.data(), 0, ci.size()*ggml_element_size(cidx));
++        return;
++    }
++
+     {
+         ggml_tensor * ple = model.per_layer_tok_embd;
+ 
+@@ -1410,6 +1472,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
+     // the attention cells see every ubatch regardless of the layer types
+     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
+ 
++    if (model.ple_pq_cb) {
++        // TTF PQ table: the host maps rows to codebook entries; the rotation back (Pi) is folded into ple_key / ple_value
++        const int64_t D = model.ple_pq_cb->ne[0];
++        ple_inp->n_sub = hparams.ple_head_dim / D;
++        ple_inp->cidx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ple_inp->n_sub * n_heads * n_tokens);
++        ggml_set_input(ple_inp->cidx);
++        ggml_tensor * cidx = ple_inp->cidx;
++        res->add_input(std::move(ple_inp));
++        ggml_tensor * emb = ggml_get_rows(ctx0, model.ple_pq_cb, cidx);
++        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
++        cb(emb, "ple_embd", -1);
++        return emb;
++    }
++
+     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+     ggml_set_input(ple_inp->rows);
+     ggml_tensor * rows = ple_inp->rows;
+-- 
+2.55.0
+
