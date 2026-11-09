@@ -40,7 +40,7 @@ The whole model, 10.2 GB, fits on one 12 GB NVIDIA GPU. Without one it runs on t
 threads of an i9-14900HX).
 
 Options after `--` go to llama.cpp unchanged, for example `ttf chat MODEL -- -c 8192 -t 8`. Choose the backend with
-`ttf engine build --backend cuda|cpu|metal|vulkan`:
+`ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when `nvidia-smi` finds a GPU):
 - `cuda` and `cpu` have fast kernels for the ternary types;
 - on `metal` (Macs) and `vulkan` (AMD / Intel GPUs), llama.cpp runs the ternary matrices on the CPU.
 
@@ -63,6 +63,16 @@ Measured on an RTX 3090 Ti (24 GB) with 12 CPU threads, using `ttf chat MODEL --
 - with all experts on the CPU (`-ncmoe 99`): 22 tokens/s decode at 6.2 GB of VRAM.
 
 Use the number of physical cores for `-t`; hyper-threads make decoding slower.
+
+`-ncmoe 18` (18 layers' experts on the CPU) assumes a 24 GB card with nothing else on it. When you set `-ncmoe`,
+llama.cpp's `--fit` switches off, so on a card that is partly in use, leave `-ncmoe` out and let `--fit` place the
+experts. `ttf bench` puts all experts on the CPU unless you pass `-ncmoe` (llama-bench has no `--fit`).
+
+**Building on older toolchains.** Extra CMake options go after `--` (or in `--cmake="..."`):
+- `Error: unsupported instruction` while compiling: the assembler is older than the CPU. Build without
+  `-march=native`: `ttf engine build -- -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON`.
+- `undefined reference to cudaMemcpyAsync@libcudart.so...` at link time: point the linker at the CUDA libraries, e.g.
+  `-- -DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link,/usr/local/cuda/lib64 -DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath-link,/usr/local/cuda/lib64`.
 
 ## Released models
 
@@ -147,7 +157,8 @@ Running the result needs about 10 GB.
 | Qwen3.5-0.8B ternary (TQ1_0) | 0.58 GB | 208 tok/s | 11.1k tok/s | 45 tok/s |
 | Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
 
-The released 27B file has the layout of the third row, plus a rank-16 float adapter on each linear.
+The released 27B file has the layout of the third row, plus a rank-16 float adapter on each linear. It decodes at
+37.2 tok/s on an RTX 4070 Ti SUPER.
 
 The export is exact: next-token loss in llama.cpp matches the trainer's own forward. On 10 x 512 tokens of Wikipedia:
 

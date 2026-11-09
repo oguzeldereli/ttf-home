@@ -22,6 +22,7 @@ TTF knobs (train / convert / finetune; the defaults are the measured best):
 import argparse
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -88,7 +89,7 @@ def gguf_arch(path):
 
 
 def gpu_info():
-    """[(name, total GiB)] of the CUDA devices (empty without torch / CUDA)"""
+    """[(name, total GiB)] of the CUDA devices: from torch, else from nvidia-smi (running models needs no torch)"""
     try:
         import torch
         if torch.cuda.is_available():
@@ -96,6 +97,13 @@ def gpu_info():
                     for i in range(torch.cuda.device_count())]
     except Exception:
         pass
+    if shutil.which("nvidia-smi"):
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+                                 capture_output=True, text=True, timeout=30).stdout
+            return [(n.strip(), float(m) / 1024) for n, m in (l.rsplit(",", 1) for l in out.splitlines() if "," in l)]
+        except Exception:
+            pass
     return []
 
 
@@ -149,7 +157,7 @@ def _max_params_b(gib):
 
 # ---------------------------------------------------------------------------------------------------- engine
 
-def cmd_engine(a):
+def cmd_engine(a, extra=()):
     d = engine_dir(a.q38)
     if a.action == "build":
         if not (d / ".git").exists():
@@ -164,7 +172,7 @@ def cmd_engine(a):
         flags = {"cuda": ["-DGGML_CUDA=ON"], "cpu": ["-DGGML_CUDA=OFF"], "metal": ["-DGGML_METAL=ON"],
                  "vulkan": ["-DGGML_VULKAN=ON"]}[a.backend]
         b = d / f"build-{a.backend}"
-        run(["cmake", "-S", d, "-B", b, "-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_CURL=OFF", *flags, *a.cmake])
+        run(["cmake", "-S", d, "-B", b, "-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_CURL=OFF", *flags, *shlex.split(a.cmake), *extra])
         run(["cmake", "--build", b, "-j", str(os.cpu_count()), "--target", "llama-cli", "llama-server",
              "llama-bench", "llama-completion", "llama-perplexity"])
         print(f"engine built: {b / 'bin'}")
@@ -382,7 +390,9 @@ def _engine(name, model, extra):
     """(binary, GPU-offload flags) for a model: Flash-Next (MoE) models take the q38 engine and let llama.cpp fit the
     experts that do not fit on the GPU into host memory (its default --fit); the dense ones go fully on the GPU"""
     if gguf_arch(model) == Q38_ARCH:
-        return engine_bin(name, q38=True), []
+        # llama-bench has no --fit: without an -ncmoe of the user's, all experts go to host memory (~6 GB of VRAM)
+        moe = name == "llama-bench" and not any(x in ("-ncmoe", "--n-cpu-moe", "-cmoe", "--cpu-moe") for x in extra)
+        return engine_bin(name, q38=True), (["-ncmoe", "99"] if moe else [])
     gpu = gpu_info() or sys.platform == "darwin"
     user = any(x in ("-ngl", "--n-gpu-layers", "--gpu-layers") for x in extra)
     return engine_bin(name), (["-ngl", "999"] if gpu and not user else [])
@@ -434,7 +444,8 @@ def main(argv=None):
     p = sp.add_parser("engine"); p.add_argument("action", choices=["build"])
     p.add_argument("--backend", default="cuda" if gpu_info() else ("metal" if sys.platform == "darwin" else "cpu"),
                    choices=["cuda", "cpu", "metal", "vulkan"])
-    p.add_argument("--cmake", nargs="*", default=[])
+    p.add_argument("--cmake", default="", help='extra CMake options as one string (--cmake="-DGGML_NATIVE=OFF ..."), '
+                   "or after `--`")
     p.add_argument("--q38", action="store_true", help="the engine for Qwen3.8-Flash-Next models (llama.cpp/q38/)")
     p = sp.add_parser("data"); p.add_argument("inputs", nargs="+"); p.add_argument("--out", required=True)
     p.add_argument("--tokenizer", default="llama2", help="llama2 (scratch models) or the base model's dir (conversions)")
@@ -470,7 +481,7 @@ def main(argv=None):
     p.add_argument("--u16", action="store_true")
     a = ap.parse_args(argv)
     f = globals()[f"cmd_{a.cmd}"]
-    return f(a) if a.cmd in ("doctor", "engine", "data") else f(a, extra)
+    return f(a) if a.cmd in ("doctor", "data") else f(a, extra)
 
 
 if __name__ == "__main__":
