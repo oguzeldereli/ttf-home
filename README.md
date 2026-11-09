@@ -29,15 +29,19 @@ models needs no PyTorch.
 git clone https://github.com/oguzeldereli/ttf-home && cd ttf-home
 pip install -e . huggingface_hub
 ttf doctor                       # what this machine has and can run
-ttf engine build                 # llama.cpp + the TTF patches, into ~/.cache/ttf/llama.cpp (CUDA when a GPU is found)
+ttf engine build --q38           # llama.cpp + the TTF patches, into ~/.cache/ttf/llama.cpp-q38 (CUDA when a GPU is found)
 
 hf download oguzeldereli/ttf-Qwen3.8-27B-GGUF --local-dir models/ttf-27b
-ttf chat models/ttf-27b/ttf-Qwen3.8-27B-TQ2_0.gguf
-ttf serve models/ttf-27b/ttf-Qwen3.8-27B-TQ2_0.gguf --port 8080     # OpenAI-compatible API at http://127.0.0.1:8080/v1
+ttf chat models/ttf-27b/ttf-Qwen3.8-27B-TQ1_P.gguf
+ttf serve models/ttf-27b/ttf-Qwen3.8-27B-TQ1_P.gguf --port 8080     # OpenAI-compatible API at http://127.0.0.1:8080/v1
 ```
 
-The whole model, 10.2 GB, fits on one 12 GB NVIDIA GPU. Without one it runs on the CPU, slower (3.9 tokens/s on 8
-threads of an i9-14900HX).
+The whole model, 8.2 GB (1.6 bits per ternary weight), fits on one 12 GB NVIDIA GPU: 29 tokens/s decode and 748
+tokens/s prefill on an RTX 3090 Ti. Without a GPU it runs on the CPU, slower.
+
+There are two engines. Both released models use TQ1_P weights (160 trits in 32 bytes), which only the second one,
+`--q38` (the patches in `llama.cpp/q38/`), has; `ttf` picks the engine from the GGUF file. Models you export yourself
+with the default `--wtype tq2_0` run in the first one (`ttf engine build`, the patches in `llama.cpp/`).
 
 Options after `--` go to llama.cpp unchanged, for example `ttf chat MODEL -- -c 8192 -t 8`. Choose the backend with
 `ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when `nvidia-smi` finds a GPU):
@@ -46,11 +50,9 @@ Options after `--` go to llama.cpp unchanged, for example `ttf chat MODEL -- -c 
 
 ## Quickstart: Qwen3.8-Flash-Next (MoE)
 
-The Flash-Next model needs its own engine (llama.cpp's `qwen4exp` architecture, with the patches in `llama.cpp/q38/`).
-`ttf` picks it from the GGUF file:
+The Flash-Next model runs in the same `--q38` engine (llama.cpp's `qwen4exp` architecture):
 
 ```bash
-ttf engine build --q38           # into ~/.cache/ttf/llama.cpp-q38
 hf download oguzeldereli/ttf-Qwen3.8-Flash-Next-GGUF --local-dir models/ttf-flash
 ttf chat models/ttf-flash/ttf-Qwen3.8-Flash-Next-TQ1_P.gguf
 ```
@@ -78,7 +80,7 @@ experts. `ttf bench` puts all experts on the CPU unless you pass `-ncmoe` (llama
 
 | model | file | quality | made by |
 |---|---|---|---|
-| [ttf-Qwen3.8-27B-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-27B-GGUF) | 10.2 GB, TQ2_0 + Q4_K head | GSM8K 0.895 (full precision 0.895), HumanEval 0.841 (0.933), IFEval 0.735 (0.787) | ttf-conversion + 72M tokens of TTF recovery training |
+| [ttf-Qwen3.8-27B-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-27B-GGUF) | 8.2 GB, TQ1_P (1.6 bits) + Q4_K embedding / head | GSM8K 0.895 (full precision 0.895), HumanEval 0.841 (0.933), IFEval 0.735 (0.787) | ttf-conversion + 72M tokens of TTF recovery training |
 | [ttf-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-Flash-Next-GGUF) | 40.4 GB, TQ1_P (1.6 bits) | GSM8K 0.905 (FP8 0.905), HumanEval 0.848 (0.927), TriviaQA 0.538 (0.776) | ttf-conversion + 1000 steps of TTF recovery training |
 
 GSM8K is scored on the first 200 problems, IFEval (strict) on the first 200 prompts. Knowledge recall (TriviaQA) is
@@ -157,8 +159,8 @@ Running the result needs about 10 GB.
 | Qwen3.5-0.8B ternary (TQ1_0) | 0.58 GB | 208 tok/s | 11.1k tok/s | 45 tok/s |
 | Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
 
-The released 27B file has the layout of the third row, plus a rank-16 float adapter on each linear. It decodes at
-37.2 tok/s on an RTX 4070 Ti SUPER.
+The released 27B is TQ1_P (8.2 GB), not in this table. Its TQ2_0 export (the third row's layout plus a rank-16 float
+adapter on each linear) decodes at 37.2 tok/s on an RTX 4070 Ti SUPER.
 
 The export is exact: next-token loss in llama.cpp matches the trainer's own forward. On 10 x 512 tokens of Wikipedia:
 
