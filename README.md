@@ -31,9 +31,9 @@ pip install -e . huggingface_hub
 ttf doctor                       # what this machine has and can run
 ttf engine build --q38           # llama.cpp + the TTF patches, into ~/.cache/ttf/llama.cpp-q38 (CUDA when a GPU is found)
 
-hf download oguzeldereli/ttf-Qwen3.8-27B-GGUF --local-dir models/ttf-27b
-ttf chat models/ttf-27b/ttf-Qwen3.8-27B-TQ1_P.gguf
-ttf serve models/ttf-27b/ttf-Qwen3.8-27B-TQ1_P.gguf --port 8080     # OpenAI-compatible API at http://127.0.0.1:8080/v1
+hf download oguzeldereli/ttf-Qwen3.8-27B-GGUF ttf-Qwen3.8-27B-adapters-r0.2-TQ1_P.gguf --local-dir models/ttf-27b
+ttf chat models/ttf-27b/ttf-Qwen3.8-27B-adapters-r0.2-TQ1_P.gguf
+ttf serve models/ttf-27b/ttf-Qwen3.8-27B-adapters-r0.2-TQ1_P.gguf --port 8080     # OpenAI-compatible API at http://127.0.0.1:8080/v1
 ```
 
 The whole model, 8.2 GB (1.6 bits per ternary weight), fits on one 12 GB NVIDIA GPU: 29 tokens/s decode and 748
