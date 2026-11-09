@@ -27,6 +27,7 @@ models needs no PyTorch.
 
 ```bash
 git clone https://github.com/oguzeldereli/ttf-home && cd ttf-home
+pip install -U pip "setuptools>=68"   # an editable install needs setuptools 64+ (PEP 660)
 pip install -e . huggingface_hub
 ttf doctor                       # what this machine has and can run
 ttf engine build --q38           # llama.cpp + the TTF patches, into ~/.cache/ttf/llama.cpp-q38 (CUDA when a GPU is found)
@@ -97,7 +98,9 @@ pip install "ttf-ternary[qwen] @ git+https://github.com/oguzeldereli/ttf-ternary
             "ttf-conversion @ git+https://github.com/oguzeldereli/ttf-conversion" -e ".[convert]"
 ```
 
-Install from a clone (`pip install -e`): `ttf engine build` reads the patches from the repository.
+Install from a clone (`pip install -e`): `ttf engine build` reads the patches from the repository. If pip says the
+build backend "is missing the 'build_editable' hook", the build ran without isolation (`--no-build-isolation`,
+`PIP_NO_BUILD_ISOLATION`, or a pip config) on a setuptools older than 64: `pip install -U "setuptools>=68"` and rerun.
 
 ## Use
 
