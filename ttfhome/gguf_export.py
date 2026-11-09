@@ -17,7 +17,8 @@ The one difference from the trainer: the trainer quantises each layer input per 
 quantises it per block of 256 (CPU, Q8_K) or 32 (CUDA, Q8_1), finer, so the output is a little closer to the float
 layer than in training.
 
-  python -m ttfhome.gguf_export CKPT HF_DIR OUT.gguf [--wtype tq2_0|tq1_0|q2_k] [--emb q6_k] [--head q6_k]
+  python -m ttfhome.gguf_export CKPT HF_DIR OUT.gguf [--wtype tq2_0|tq1_0|q2_k|tq1_p] [--emb q6_k] [--head q6_k]
+  (tq1_p needs the q38 engine: llama.cpp branch ttf-q38)
 HF_DIR: the base model's config.json and tokenizer files (no weights needed).
 """
 import argparse
@@ -43,6 +44,13 @@ QT = gguf.GGMLQuantizationType
 WTYPES = {"tq2_0": QT.TQ2_0, "tq1_0": QT.TQ1_0, "q2_k": QT.Q2_K}
 FTYPES = {"tq2_0": gguf.LlamaFileType.MOSTLY_TQ2_0, "tq1_0": gguf.LlamaFileType.MOSTLY_TQ1_0,
           "q2_k": gguf.LlamaFileType.MOSTLY_Q2_K}
+if hasattr(QT, "TQ1_P"):
+    # TQ1_P (llama.cpp branch ttf-q38 / ttf-home's q38 series): 160 trits in 32 bytes, 1.6 bpw, no block scale. The
+    # main weights carry the row scale in a separate <name>.ttf_r (F32 [N], TTF format 2); widths that are not a
+    # multiple of 160, and the ternary adapters (whose side tensors have no ttf_r), are written as TQ1_0 with the row
+    # scale in the block scale. gguf-py defines no file type for it: the file type says TQ1_0.
+    WTYPES["tq1_p"] = QT.TQ1_P
+    FTYPES["tq1_p"] = gguf.LlamaFileType.MOSTLY_TQ1_0
 FTYPES_EMB = {"f32": QT.F32, "f16": QT.F16, "bf16": QT.BF16, "q8_0": QT.Q8_0, "q6_k": QT.Q6_K, "q5_k": QT.Q5_K,
               "q4_k": QT.Q4_K, "q4_1": QT.Q4_1}
 # int-k embedding / head: Q4_1 from the codes (exact), else the float W through the type asked for
@@ -392,7 +400,16 @@ def _make_class(base, ck, wq, eq, hq, log):
         def _vec(self, name, v):
             self.gguf_writer.add_tensor(name, np.ascontiguousarray(v.float().numpy()), raw_dtype=QT.F32)
 
-        def _w(self, name, T, s):
+        def _w(self, name, T, s, main=False):
+            """-> True when the row scale s is left to the caller (TQ1_P main weight: <name>.ttf_r)"""
+            if getattr(QT, "TQ1_P", None) is not None and wq == QT.TQ1_P:
+                if main and T.shape[1] % 160 == 0:
+                    from .q38_export import enc_tq1p
+                    self.gguf_writer.add_tensor(name, np.ascontiguousarray(enc_tq1p(T)), raw_dtype=QT.TQ1_P)
+                    return True
+                if T.shape[1] % QK == 0:
+                    self.gguf_writer.add_tensor(name, pack_ternary(T, s, QT.TQ1_0), raw_dtype=QT.TQ1_0)
+                    return False
             if T.shape[1] % QK:
                 # rows not a multiple of 256 (small scratch models): Q8_0 holds {-1, 0, 1} d exactly too, at 8.5 bits
                 qt = QT.Q8_0 if T.shape[1] % 32 == 0 else QT.F16
@@ -401,6 +418,7 @@ def _make_class(base, ck, wq, eq, hq, log):
                 self.gguf_writer.add_tensor(name, gguf.quants.quantize(w, qt), raw_dtype=qt)
                 return
             self.gguf_writer.add_tensor(name, pack_ternary(T, s, wq), raw_dtype=wq)
+            return False
 
         def _write_ttf(self):
             nb = 0
@@ -422,7 +440,8 @@ def _make_class(base, ck, wq, eq, hq, log):
                     mag = (mag[0], mag[1] * e[:, None]) if mag is not None else None
                 for gname, ri, ci in self._perm(hname, bid, N, K):
                     stem = gname[:-len(".weight")]
-                    self._w(gname, T[ri][:, ci], s[ri])
+                    if self._w(gname, T[ri][:, ci], s[ri], main=True):
+                        self._vec(stem + ".ttf_r", s[ri])
                     if c is not None:
                         self._vec(stem + ".ttf_c", c[ci])
                     if mu is not None:
