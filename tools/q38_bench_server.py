@@ -4,7 +4,7 @@ with enable_thinking=False, greedy, max 512 new tokens), so score_bench.py score
   python q38_bench_server.py --url http://127.0.0.1:8080 --tok HF_DIR --ref GEN_DIR --out OUT_DIR \
       [--tasks gsm8k:200,humaneval:164] [--par 4]
 GEN_DIR: a q38_gen_kv output dir (its jsonl files give the items and prompts, in their order)."""
-import argparse, json, os, sys, time
+import argparse, json, os, time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 

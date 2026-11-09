@@ -467,7 +467,7 @@ def _make_class(base, ck, wq, eq, hq, log):
             log(f"TTF: {len(ck.linears)} linears, {nb / 1e6:.1f} M trits as {wq.name}")
 
         def _adapter(self, stem, sub, K, N, ri, ci):
-            Dp, Up = ck.parts[sub["d"]], ck.parts[sub["u"]]
+            Dp = ck.parts[sub["d"]]
             r = Dp["wpacked"].shape[0]
             rp = -(-r // QK) * QK
             Td, sd_, cd, mud, bd = ck.part(sub["d"], K)
