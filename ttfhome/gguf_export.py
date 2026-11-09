@@ -18,7 +18,7 @@ quantises it per block of 256 (CPU, Q8_K) or 32 (CUDA, Q8_1), finer, so the outp
 layer than in training.
 
   python -m ttfhome.gguf_export CKPT HF_DIR OUT.gguf [--wtype tq2_0|tq1_0|q2_k|tq1_p] [--emb q6_k] [--head q6_k]
-  (tq1_p needs the q38 engine: llama.cpp branch ttf-q38)
+  (tq1_p is written with, and runs in, the Flash-Next engine: `ttf engine build --q38`)
 HF_DIR: the base model's config.json and tokenizer files (no weights needed).
 """
 import argparse
@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 from .cli import engine_dir                    # noqa: E402  (the same llama.cpp tree `ttf engine build` makes)
-LLAMA = engine_dir()
+LLAMA = engine_dir(q38=os.environ.get("TTF_EXPORT_Q38") == "1" or "tq1_p" in sys.argv)
 sys.path[:0] = [str(LLAMA / "gguf-py"), str(LLAMA)]
 import gguf                                    # noqa: E402
 from conversion import get_model_class         # noqa: E402

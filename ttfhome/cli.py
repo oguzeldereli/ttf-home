@@ -33,6 +33,7 @@ ENGINE_BASE = "0ef6f06d5"                    # the llama.cpp commit the patches 
 ENGINE_BASE_Q38 = "ca89968a2"                # the commit the Qwen3.8-Flash-Next patches in llama.cpp/q38/ apply to
 ENGINE_URL = "https://github.com/ggml-org/llama.cpp"
 Q38_ARCH = "qwen4exp"                        # llama.cpp's architecture name for Qwen3.8-Flash-Next
+TQ1_P_TYPE = 44                              # ggml type id of TQ1_P (llama.cpp/q38/ patch 0006)
 
 
 # ------------------------------------------------------------------------------------------------ environment
@@ -54,8 +55,8 @@ def engine_bin(name, q38=False):
     raise SystemExit(f"{name} not found under {d}: run `{how}")
 
 
-def gguf_arch(path):
-    """general.architecture of a GGUF file, read from its header (no gguf package needed)"""
+def gguf_info(path):
+    """(general.architecture, set of tensor type ids) of a GGUF file, read from its header (no gguf package needed)"""
     import struct
     size = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
 
@@ -75,17 +76,34 @@ def gguf_arch(path):
         else:
             f.seek(size[vt], 1)
 
+    arch, types = None, set()
     with open(path, "rb") as f:
         if f.read(4) != b"GGUF":
             raise SystemExit(f"{path}: not a GGUF file")
-        u(f, "I"); u(f, "Q")
-        for _ in range(u(f, "Q")):
+        u(f, "I")
+        nt, nkv = u(f, "Q"), u(f, "Q")
+        for _ in range(nkv):
             key = f.read(u(f, "Q")).decode()
             vt = u(f, "I")
             if key == "general.architecture" and vt == 8:
-                return f.read(u(f, "Q")).decode()
-            skip(f, vt)
-    return None
+                arch = f.read(u(f, "Q")).decode()
+            else:
+                skip(f, vt)
+        for _ in range(nt):
+            f.seek(u(f, "Q"), 1)                     # name
+            f.seek(8 * u(f, "I"), 1)                 # dims
+            types.add(u(f, "I")); f.seek(8, 1)       # type, offset
+    return arch, types
+
+
+def gguf_arch(path):
+    return gguf_info(path)[0]
+
+
+def needs_q38(path):
+    """the Flash-Next engine runs qwen4exp models and any file with TQ1_P weights (160 trits / 32 B)"""
+    arch, types = gguf_info(path)
+    return arch == Q38_ARCH or TQ1_P_TYPE in types
 
 
 def gpu_info():
@@ -380,6 +398,8 @@ def cmd_finetune(a, extra):
 # ------------------------------------------------------------------------------------------------------ run
 
 def cmd_export(a, extra):
+    if a.wtype == "tq1_p":
+        os.environ["TTF_EXPORT_Q38"] = "1"           # TQ1_P exists in the Flash-Next engine's gguf-py only
     from .gguf_export import export
     import torch
     with torch.inference_mode():
@@ -389,10 +409,14 @@ def cmd_export(a, extra):
 def _engine(name, model, extra):
     """(binary, GPU-offload flags) for a model: Flash-Next (MoE) models take the q38 engine and let llama.cpp fit the
     experts that do not fit on the GPU into host memory (its default --fit); the dense ones go fully on the GPU"""
-    if gguf_arch(model) == Q38_ARCH:
-        # llama-bench has no --fit: without an -ncmoe of the user's, all experts go to host memory (~6 GB of VRAM)
-        moe = name == "llama-bench" and not any(x in ("-ncmoe", "--n-cpu-moe", "-cmoe", "--cpu-moe") for x in extra)
-        return engine_bin(name, q38=True), (["-ncmoe", "99"] if moe else [])
+    if needs_q38(model):
+        if gguf_arch(model) == Q38_ARCH:
+            # llama-bench has no --fit: without an -ncmoe of the user's, all experts go to host memory (~6 GB of VRAM)
+            moe = name == "llama-bench" and not any(x in ("-ncmoe", "--n-cpu-moe", "-cmoe", "--cpu-moe") for x in extra)
+            return engine_bin(name, q38=True), (["-ncmoe", "99"] if moe else [])
+        gpu = gpu_info() or sys.platform == "darwin"
+        user = any(x in ("-ngl", "--n-gpu-layers", "--gpu-layers") for x in extra)
+        return engine_bin(name, q38=True), (["-ngl", "999"] if gpu and not user else [])
     gpu = gpu_info() or sys.platform == "darwin"
     user = any(x in ("-ngl", "--n-gpu-layers", "--gpu-layers") for x in extra)
     return engine_bin(name), (["-ngl", "999"] if gpu and not user else [])
@@ -468,8 +492,8 @@ def main(argv=None):
     knobs(p)
     p = sp.add_parser("export"); p.add_argument("ckpt"); p.add_argument("out")
     p.add_argument("--base", default=None, help="the base model's dir for a conversion (config + tokenizer)")
-    p.add_argument("--wtype", default="tq2_0", choices=["tq2_0", "tq1_0", "q2_k"],
-                   help="tq2_0: NVIDIA / CPU (fastest); tq1_0: 15%% smaller; q2_k: AMD / Intel (Vulkan), Mac (Metal)")
+    p.add_argument("--wtype", default="tq2_0", choices=["tq2_0", "tq1_0", "q2_k", "tq1_p"],
+                   help="tq2_0: NVIDIA / CPU (fastest); tq1_0: 15%% smaller; q2_k: AMD / Intel (Vulkan), Mac (Metal); tq1_p: 1.6 bits, the smallest (Flash-Next engine, `ttf engine build --q38`)")
     p.add_argument("--emb", default=None, help="q6_k (float) / q4_1 (int-k codes, exact: the default for them) / q4_k ...")
     p.add_argument("--head", default=None)
     for c in ("chat", "bench"):
