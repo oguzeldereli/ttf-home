@@ -153,10 +153,13 @@ def cmd_engine(a):
     d = engine_dir(a.q38)
     if a.action == "build":
         if not (d / ".git").exists():
+            patches = sorted((HOME / "llama.cpp" / ("q38" if a.q38 else "")).glob("*.patch"))
+            if not patches:
+                raise SystemExit(f"no patches under {HOME / 'llama.cpp'}: install ttf-home from a clone "
+                                 "(git clone https://github.com/oguzeldereli/ttf-home && pip install -e ttf-home)")
             d.parent.mkdir(parents=True, exist_ok=True)
             run(["git", "clone", ENGINE_URL, d])
             run(["git", "-C", d, "checkout", "-B", "ttf", ENGINE_BASE_Q38 if a.q38 else ENGINE_BASE])
-            patches = sorted((HOME / "llama.cpp" / ("q38" if a.q38 else "")).glob("*.patch"))
             run(["git", "-C", d, "-c", "user.name=ttf", "-c", "user.email=ttf@localhost", "am", *patches])
         flags = {"cuda": ["-DGGML_CUDA=ON"], "cpu": ["-DGGML_CUDA=OFF"], "metal": ["-DGGML_METAL=ON"],
                  "vulkan": ["-DGGML_VULKAN=ON"]}[a.backend]

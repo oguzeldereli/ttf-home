@@ -1,43 +1,91 @@
 # ttf-home
 
-Ternary language models on a home computer: train one from scratch, convert a Qwen3.5 / 3.8 model to ternary and keep
-training it, fine-tune on your own text, and run the result fast on a consumer GPU or CPU.
+Ternary language models on a home computer:
+- run the released ternary Qwen3.8 models;
+- train a model from scratch;
+- convert a Qwen3.5 / 3.8 model to ternary and keep training it;
+- fine-tune on your own text;
+- run the result fast on a consumer GPU or CPU.
 
-Training uses TTF (two-timescale threshold flips, `ttf-core`): weights stay in {-1, 0, +1} the whole time, with a
-low-rank accumulator in place of master weights and Adam states, so training needs a fraction of the usual memory.
-Inference uses llama.cpp with eleven patches (`llama.cpp/`, on llama.cpp commit 0ef6f06d5), so a TTF model is an ordinary
-GGUF file.
+One command line, `ttf`, does all of it.
 
-## Measured (laptop: RTX 4080 Laptop 12 GB, i9-14900HX)
+Training uses TTF ([ttf-ternary](https://github.com/oguzeldereli/ttf-ternary)): the weights stay in {-1, 0, +1} the
+whole time, with a low-rank accumulator in place of master weights and Adam states, so training needs a fraction of the
+usual memory. Inference uses llama.cpp with the TTF patches in `llama.cpp/`, so a TTF model is an ordinary GGUF file
+that `llama-cli` / `llama-server` run.
 
-| model | file | GPU decode | GPU prefill | CPU decode (8 threads) |
-|---|---|---|---|---|
-| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 26.6 tok/s | 708 tok/s | 3.9 tok/s |
-| same, `--wtype tq1_0` (1.69 bits) | 7.9 GiB | 18.2 tok/s | 512 tok/s | - |
-| same, TQ2_0 with `--head q4_k` (+0.005 NLL) | 8.9 GiB | 27.4 tok/s | 689 tok/s | - |
-| Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 256 tok/s | 12.9k tok/s | 49 tok/s |
-| Qwen3.5-0.8B ternary (TQ1_0) | 0.58 GB | 208 tok/s | 11.1k tok/s | 45 tok/s |
-| Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
+| repository | what it does |
+|---|---|
+| [ttf-ternary](https://github.com/oguzeldereli/ttf-ternary) | the trainer (TTF), and the paper |
+| [ttf-conversion](https://github.com/oguzeldereli/ttf-conversion) | pretrained Hugging Face model to ternary checkpoint |
+| **ttf-home** (this one) | data, train, convert, fine-tune, export to GGUF, chat / serve |
 
-The 27B model fits entirely on the 12 GB card, with a 17k-token context.
+## Quickstart: chat with a ternary 27B model
 
-The export is exact: next-token loss in llama.cpp matches the trainer's own forward. On 10 x 512 tokens of Wikipedia:
+You need `git`, `cmake`, a C++ compiler and Python 3.11+; for an NVIDIA GPU, also the CUDA toolkit (`nvcc`). Running
+models needs no PyTorch.
 
-| model | trainer | llama.cpp |
-|---|---|---|
-| Qwen3.5-0.8B conversion | 2.5897 | 2.5898 (CUDA) / 2.5911 (CPU) |
-| 340M scratch model | 2.3100 | 2.3107 |
+```bash
+git clone https://github.com/oguzeldereli/ttf-home && cd ttf-home
+pip install -e . huggingface_hub
+ttf doctor                       # what this machine has and can run
+ttf engine build                 # llama.cpp + the TTF patches, into ~/.cache/ttf/llama.cpp (CUDA when a GPU is found)
 
-The small difference comes from activation quantisation: llama.cpp quantises activations per block of 32 or 256
-values, while training quantises them per token.
+hf download oguzeldereli/ttf-Qwen3.8-27B-GGUF --local-dir models/ttf-27b
+ttf chat models/ttf-27b/ttf-Qwen3.8-27B-TQ2_0.gguf
+ttf serve models/ttf-27b/ttf-Qwen3.8-27B-TQ2_0.gguf --port 8080     # OpenAI-compatible API at http://127.0.0.1:8080/v1
+```
 
-The engine is looked for in `~/.cache/ttf/llama.cpp` (where `ttf engine build` puts it), or in `TTF_LLAMA_CPP`.
+The whole model, 10.2 GB, fits on one 12 GB NVIDIA GPU. Without one it runs on the CPU, slower (3.9 tokens/s on 8
+threads of an i9-14900HX).
 
-## Install
+Options after `--` go to llama.cpp unchanged, for example `ttf chat MODEL -- -c 8192 -t 8`. Choose the backend with
+`ttf engine build --backend cuda|cpu|metal|vulkan`:
+- `cuda` and `cpu` have fast kernels for the ternary types;
+- on `metal` (Macs) and `vulkan` (AMD / Intel GPUs), llama.cpp runs the ternary matrices on the CPU.
 
-    pip install -e ../ttf-core -e .           # plus -e ../ttf-conversion for `ttf convert`
-    ttf doctor                                # what this machine can train and run
-    ttf engine build                          # llama.cpp + the TTF patches (CUDA, Metal, Vulkan or CPU)
+## Quickstart: Qwen3.8-Flash-Next (MoE)
+
+The Flash-Next model needs its own engine (llama.cpp's `qwen4exp` architecture, with the patches in `llama.cpp/q38/`).
+`ttf` picks it from the GGUF file:
+
+```bash
+ttf engine build --q38           # into ~/.cache/ttf/llama.cpp-q38
+hf download oguzeldereli/ttf-Qwen3.8-Flash-Next-GGUF --local-dir models/ttf-flash
+ttf chat models/ttf-flash/ttf-Qwen3.8-Flash-Next-TQ1_P.gguf
+```
+
+The file is 40.4 GB, so most of the experts stay in host memory: plan for 64 GB of RAM. llama.cpp's `--fit` (on by
+default) places what fits on the GPU.
+
+Measured on an RTX 3090 Ti (24 GB) with 12 CPU threads, using `ttf chat MODEL -- -ncmoe 18 -t 12`:
+- 29.7 tokens/s decode and 147 tokens/s prefill;
+- with all experts on the CPU (`-ncmoe 99`): 22 tokens/s decode at 6.2 GB of VRAM.
+
+Use the number of physical cores for `-t`; hyper-threads make decoding slower.
+
+## Released models
+
+| model | file | quality | made by |
+|---|---|---|---|
+| [ttf-Qwen3.8-27B-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-27B-GGUF) | 10.2 GB, TQ2_0 + Q4_K head | GSM8K 0.895 (full precision 0.895), HumanEval 0.841 (0.933), IFEval 0.735 (0.787) | ttf-conversion + 72M tokens of TTF recovery training |
+| [ttf-Qwen3.8-Flash-Next-GGUF](https://huggingface.co/oguzeldereli/ttf-Qwen3.8-Flash-Next-GGUF) | 40.4 GB, TQ1_P (1.6 bits) | GSM8K 0.905 (FP8 0.905), HumanEval 0.848 (0.927), TriviaQA 0.538 (0.776) | ttf-conversion + 1000 steps of TTF recovery training |
+
+GSM8K is scored on the first 200 problems, IFEval (strict) on the first 200 prompts. Knowledge recall (TriviaQA) is
+where ternary costs the most. The model cards on Hugging Face have the details.
+
+## Install for training
+
+Training, conversion, fine-tuning and export need an NVIDIA GPU, PyTorch and the trainer:
+
+```bash
+pip install "ttf-ternary @ git+https://github.com/oguzeldereli/ttf-ternary" -e ".[train]"
+# to convert Qwen models as well:
+pip install "ttf-ternary[qwen] @ git+https://github.com/oguzeldereli/ttf-ternary" \
+            "ttf-conversion @ git+https://github.com/oguzeldereli/ttf-conversion" -e ".[convert]"
+```
+
+Install from a clone (`pip install -e`): `ttf engine build` reads the patches from the repository.
 
 ## Use
 
@@ -52,6 +100,9 @@ The engine is looked for in `~/.cache/ttf/llama.cpp` (where `ttf engine build` p
     ttf chat q08-mine.gguf          # or: ttf serve q08-mine.gguf   (OpenAI-compatible HTTP API)
 
     ttf bench mine.gguf ; ttf score mine.gguf data/mine_val.bin
+
+`--base` is a local Hugging Face model directory (`hf download Qwen/Qwen3.5-0.8B-Base --local-dir Qwen3.5-0.8B-Base`).
+For a conversion, run `ttf data` with `--tokenizer Qwen3.5-0.8B-Base` so the tokens match the base model.
 
 TTF knobs on `train`, `convert` and `finetune`:
 
@@ -74,36 +125,87 @@ TTF knobs on `train`, `convert` and `finetune`:
 | 11 to 22 GB | medium | 340M |
 | 22 GB and up | large | 670M |
 
-Converting 0.8B models needs about 12 GB. `ttf convert` on a 27B base needs a 24 GB card or larger and a cached teacher
-(`--kd-cache`, from ttf-core `scripts/quant/teacher_topk.py`): under 80 GB it keeps the TTF state in host memory at
-accumulator rank 256 with the embedding and head frozen (measured at a 21.7 GiB peak); on 80 GB and larger cards it uses
-the settings of our 27B run (rank 1536, the state on the GPU, int-k embedding and head). Running the result needs about
-10 GB.
+Converting 0.8B models needs about 12 GB.
+
+`ttf convert` on a 27B base needs a 24 GB card or larger and a cached teacher (`--kd-cache`, from ttf-ternary
+`scripts/quant/teacher_topk.py`):
+- Under 80 GB, it keeps the TTF state in host memory at accumulator rank 256, with the embedding and head frozen
+  (measured at a 21.7 GiB peak).
+- On 80 GB and larger cards, it uses the settings of our 27B run: rank 1536, the state on the GPU, and int-k embedding
+  and head.
+
+Running the result needs about 10 GB.
+
+## Speed and exactness (laptop: RTX 4080 Laptop 12 GB, i9-14900HX)
+
+| model | file | GPU decode | GPU prefill | CPU decode (8 threads) |
+|---|---|---|---|---|
+| Qwen3.8-27B ternary (training-free conversion, rank-1024 ternary adapters) | 9.2 GiB | 26.6 tok/s | 708 tok/s | 3.9 tok/s |
+| same, `--wtype tq1_0` (1.69 bits) | 7.9 GiB | 18.2 tok/s | 512 tok/s | - |
+| same, TQ2_0 with `--head q4_k` (+0.005 NLL) | 8.9 GiB | 27.4 tok/s | 689 tok/s | - |
+| Qwen3.5-0.8B ternary (TQ2_0) | 0.61 GB | 256 tok/s | 12.9k tok/s | 49 tok/s |
+| Qwen3.5-0.8B ternary (TQ1_0) | 0.58 GB | 208 tok/s | 11.1k tok/s | 45 tok/s |
+| Qwen3.5-0.8B bf16 (reference) | 1.5 GB | 181 tok/s | 13.7k tok/s | 31 tok/s |
+
+The released 27B file has the layout of the third row, plus a rank-16 float adapter on each linear.
+
+The export is exact: next-token loss in llama.cpp matches the trainer's own forward. On 10 x 512 tokens of Wikipedia:
+
+| model | trainer | llama.cpp |
+|---|---|---|
+| Qwen3.5-0.8B conversion | 2.5897 | 2.5898 (CUDA) / 2.5911 (CPU) |
+| 340M scratch model | 2.3100 | 2.3107 |
+
+The small difference comes from activation quantisation: llama.cpp quantises activations per block of 32 or 256
+values, while training quantises them per token.
+
+`ttf` looks for the engines in `~/.cache/ttf/llama.cpp` and `~/.cache/ttf/llama.cpp-q38` (where `ttf engine build` puts
+them), or in `TTF_LLAMA_CPP` / `TTF_LLAMA_CPP_Q38`.
 
 ## GGUF format
 
-- **Which `--wtype`**: `tq2_0` on NVIDIA GPUs and CPUs (fastest); `tq1_0` to save 15% of memory; `q2_k` (2.63
-  bits) for AMD / Intel GPUs (Vulkan) and Macs (Metal). llama.cpp has no TQ kernels there yet, but Q2_K runs
-  everywhere and holds ternary weights exactly too.
+- **Which `--wtype`**:
+  - `tq2_0` on NVIDIA GPUs and CPUs (fastest);
+  - `tq1_0` to save 15% of memory;
+  - `q2_k` (2.63 bits) for AMD / Intel GPUs (Vulkan) and Macs (Metal). llama.cpp has no TQ kernels there yet, but Q2_K
+    runs everywhere and holds ternary weights exactly too.
 - **Ternary matrices** are stored as `TQ2_0` (2.06 bits per weight, the default), `TQ1_0` (1.69 bits) or `Q2_K`.
-  All three hold {-1, 0, +1}·d exactly, with the row scale folded into d.
+  - All three hold {-1, 0, +1}·d exactly, with the row scale folded into d.
   - Matrices whose width is not a multiple of 256 fall back to `Q8_0`, which is also exact.
-- **Embedding and head**: K-quants (Q6_K by default; a Q4_K embedding costs nothing measurable, a Q4_K head +0.011
-  NLL at 0.8B). Int-k codes (`--intk-emb`) export exactly as Q4_1 (d = s, m = lo, the codes as they are). Q4_1 is 5
-  bits per weight, so 2- or 3-bit codes take more room in the file than in training: for the 27B, the int-k embedding
-  and head are 1.6 GB as Q4_1 against 0.95 GB at their own bits.
+  - The Flash-Next engine adds `TQ1_P`: 160 trits in 32 bytes (1.6 bits), no block scale. The row scale is a side
+    tensor.
+- **Embedding and head**: K-quants (Q6_K by default).
+  - A Q4_K embedding costs nothing measurable; a Q4_K head costs +0.011 NLL at 0.8B.
+  - Int-k codes (`--intk-emb`) export exactly as Q4_1 (d = s, m = lo, the codes as they are).
+  - Q4_1 is 5 bits per weight, so 2- or 3-bit codes take more room in the file than in training. For the 27B, the int-k
+    embedding and head are 1.6 GB as Q4_1, against 0.95 GB at their own bits.
 - **TTF side tensors**, as F32 vectors per linear layer:
   - `<weight>.ttf_c`: input scale;
   - `.ttf_m`: centring, stored as -c·mu;
   - `.ttf_b`: output bias.
-- **Ternary adapters** are stored as `.ttf_d*` and `.ttf_u*`.
+- **Adapters**: ternary low-rank adapters are stored as `.ttf_d*` / `.ttf_u*`, float ones as `.ttf_fd` / `.ttf_fu`.
 - The patched llama.cpp applies all of these inside `build_lora_mm`, so every architecture llama.cpp supports gets
   them without per-model code.
-- **CUDA** (patches 0002-0010): matrix-vector kernels for `TQ2_0` and `TQ1_0`, prefill for both through the Q8_0 MMQ kernels, and
-  the side tensors fused into the activation quantiser of both (bit-identical; +10-20% tok/s), and one warp per row and two ints per thread at batch 1 (+16% at 27B). `test-backend-ops`: 22 / 22
-  `TQ1_0` / `TQ2_0` matrix products match the CPU. `TQ2_0` is the fastest; `TQ1_0` is 15% smaller and 31% slower.
+- **CUDA** (patches 0002-0010):
+  - matrix-vector kernels for `TQ2_0` and `TQ1_0`;
+  - prefill for both through the Q8_0 MMQ kernels;
+  - the side tensors fused into the activation quantiser of both (bit-identical; +10-20% tok/s);
+  - one warp per row and two ints per thread at batch 1 (+16% at 27B).
+- **Checks**: `test-backend-ops` passes 22 / 22: the `TQ1_0` / `TQ2_0` matrix products match the CPU.
+- **Speed**: `TQ2_0` is the fastest; `TQ1_0` is 15% smaller and 31% slower.
+
+Flash-Next GGUF files come from `python -m ttfhome.q38_export`. It takes a slim TTF checkpoint from ttf-ternary's
+`ttf.q38` trainer and the PQ PLE table from ttf-conversion's `scripts/q38`.
+
+## Tests
+
+    pip install -e ".[train,test]" && pytest -q tests
+
+`tests/test_export.py` checks that every ternary matrix exports exactly to TQ2_0 / TQ1_0 / Q2_K, and int-k to Q4_1. It
+needs the engine's `gguf-py`, so run `ttf engine build` first.
 
 ## Licence
 
 [PolyForm Noncommercial 1.0.0](LICENSE.md): free for personal, research and other noncommercial use; commercial use
-needs a separate licence. llama.cpp itself is MIT-licensed; the patches in `llama.cpp/` modify it.
+needs a separate licence. llama.cpp itself is MIT-licensed; the patches in `llama.cpp/` modify it. The released model
+weights keep the licence of their base models (Apache-2.0).
