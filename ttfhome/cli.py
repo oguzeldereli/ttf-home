@@ -13,7 +13,7 @@
   ttf finetune --ckpt CKPT --data DATA --out RUN [--steps 300]
                                                keep training a ternary model on your own data
   ttf export CKPT OUT.gguf [--base HF_DIR] [--wtype tq2_0|tq1_0|q2_k]
-  ttf generate MODEL.gguf "PROMPT" (base models) | ttf chat MODEL.gguf (chat models) | ttf serve MODEL.gguf [--port 8080] | ttf bench MODEL.gguf | ttf score MODEL.gguf DATA
+  ttf generate MODEL.gguf "PROMPT" (base models) | ttf chat MODEL.gguf (chat models) | ttf serve MODEL.gguf [--port 8080] [--ctx N] | ttf bench MODEL.gguf | ttf score MODEL.gguf DATA
 
 TTF knobs (train / convert / finetune; the defaults are the measured best):
   --theta 16 (firing threshold, in steps)   --rank R (accumulator rank)   --lr / --min-lr   --steps / --warmup
@@ -115,13 +115,20 @@ def gpu_info():
                     for i in range(torch.cuda.device_count())]
     except Exception:
         pass
-    if shutil.which("nvidia-smi"):
+    smi = shutil.which("nvidia-smi") or next((p for p in ("/usr/lib/wsl/lib/nvidia-smi", "/usr/bin/nvidia-smi")
+                                              if os.path.exists(p)), None)
+    if smi:
         try:
-            out = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            out = subprocess.run([smi, "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
                                  capture_output=True, text=True, timeout=30).stdout
-            return [(n.strip(), float(m) / 1024) for n, m in (l.rsplit(",", 1) for l in out.splitlines() if "," in l)]
+            gpus = [(n.strip(), float(m) / 1024) for n, m in (l.rsplit(",", 1) for l in out.splitlines() if "," in l)]
+            if gpus:
+                return gpus
         except Exception:
             pass
+    gpus = Path("/proc/driver/nvidia/gpus")       # the driver is loaded but nvidia-smi is missing: size unknown
+    if gpus.is_dir() and any(gpus.iterdir()):
+        return [("NVIDIA GPU (nvidia-smi not found)", 0.0) for _ in gpus.iterdir()]
     return []
 
 
@@ -187,8 +194,17 @@ def cmd_engine(a, extra=()):
             run(["git", "clone", ENGINE_URL, d])
             run(["git", "-C", d, "checkout", "-B", "ttf", ENGINE_BASE_Q38 if a.q38 else ENGINE_BASE])
             run(["git", "-C", d, "-c", "user.name=ttf", "-c", "user.email=ttf@localhost", "am", *patches])
+        if a.backend is None:
+            a.backend = "cuda" if gpu_info() else ("metal" if sys.platform == "darwin" else "cpu")
+            if a.backend == "cpu":
+                print("WARNING: no NVIDIA GPU found (nvidia-smi / /proc/driver/nvidia), building the CPU engine, "
+                      "which is slow. With an NVIDIA GPU, install the CUDA toolkit (nvcc) and run "
+                      "`ttf engine build --backend cuda`.", flush=True)
         flags = {"cuda": ["-DGGML_CUDA=ON"], "cpu": ["-DGGML_CUDA=OFF"], "metal": ["-DGGML_METAL=ON"],
                  "vulkan": ["-DGGML_VULKAN=ON"]}[a.backend]
+        if a.backend == "cuda" and not (shutil.which("nvcc") or os.path.exists("/usr/local/cuda/bin/nvcc")):
+            print("WARNING: nvcc not found: the CUDA build needs the CUDA toolkit (not only the driver). If CMake "
+                  "cannot find it, pass its path: --cmake=\"-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc\"", flush=True)
         b = d / f"build-{a.backend}"
         run(["cmake", "-S", d, "-B", b, "-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_CURL=OFF", *flags, *shlex.split(a.cmake), *extra])
         run(["cmake", "--build", b, "-j", str(os.cpu_count()), "--target", "llama-cli", "llama-server",
@@ -406,6 +422,25 @@ def cmd_export(a, extra):
         export(a.ckpt, a.base, a.out, a.wtype, a.emb, a.head)
 
 
+def _ctx_flags(a, extra):
+    """-c from --ctx; without one, llama.cpp takes the model's trained context (262k for Qwen3.5 / 3.8) and its
+    --fit shrinks it to what fits in free VRAM, silently: an agent that reads the context from the model then sends
+    more than the server holds. Print the rule so the number can be put in the agent's config."""
+    if getattr(a, "ctx", None):
+        return ["-c", str(a.ctx)]
+    if not any(x in ("-c", "--ctx-size") for x in extra):
+        print("note: no --ctx given: llama.cpp fits the context to free VRAM (see `n_ctx_slot` in the log or "
+              "GET /props). For an agent (opencode, Cline, ...), set --ctx N and the same N as the model's context "
+              "window in the agent; `-ctk q8_0 -ctv q8_0` halves the KV cache memory.", flush=True)
+    return []
+
+
+def _warn_cpu_engine(b):
+    if "build-cpu" in str(b) and gpu_info():
+        print(f"WARNING: {b} is a CPU-only build but this machine has an NVIDIA GPU: "
+              "`ttf engine build --backend cuda` (needs the CUDA toolkit) for GPU speed.", flush=True)
+
+
 def _engine(name, model, extra):
     """(binary, GPU-offload flags) for a model: Flash-Next (MoE) models take the q38 engine and let llama.cpp fit the
     experts that do not fit on the GPU into host memory (its default --fit); the dense ones go fully on the GPU"""
@@ -424,7 +459,8 @@ def _engine(name, model, extra):
 
 def cmd_chat(a, extra):
     b, ngl = _engine("llama-cli", a.model, extra)
-    run([b, "-m", a.model, *ngl, "-cnv", *extra])
+    _warn_cpu_engine(b)
+    run([b, "-m", a.model, *ngl, *(["-c", str(a.ctx)] if a.ctx else []), "-cnv", *extra])
 
 
 def cmd_generate(a, extra):
@@ -434,7 +470,8 @@ def cmd_generate(a, extra):
 
 def cmd_serve(a, extra):
     b, ngl = _engine("llama-server", a.model, extra)
-    run([b, "-m", a.model, *ngl, "--port", a.port, "--host", a.host, *extra])
+    _warn_cpu_engine(b)
+    run([b, "-m", a.model, *ngl, *_ctx_flags(a, extra), "--port", a.port, "--host", a.host, *extra])
 
 
 def cmd_bench(a, extra):
@@ -466,8 +503,8 @@ def main(argv=None):
     sp = ap.add_subparsers(dest="cmd", required=True)
     sp.add_parser("doctor")
     p = sp.add_parser("engine"); p.add_argument("action", choices=["build"])
-    p.add_argument("--backend", default="cuda" if gpu_info() else ("metal" if sys.platform == "darwin" else "cpu"),
-                   choices=["cuda", "cpu", "metal", "vulkan"])
+    p.add_argument("--backend", default=None, choices=["cuda", "cpu", "metal", "vulkan"],
+                   help="default: cuda when an NVIDIA GPU is found, metal on a Mac, else cpu")
     p.add_argument("--cmake", default="", help='extra CMake options as one string (--cmake="-DGGML_NATIVE=OFF ..."), '
                    "or after `--`")
     p.add_argument("--q38", action="store_true", help="the engine for Qwen3.8-Flash-Next models (llama.cpp/q38/)")
@@ -496,14 +533,21 @@ def main(argv=None):
                    help="tq2_0: NVIDIA / CPU (fastest); tq1_0: 15%% smaller; q2_k: AMD / Intel (Vulkan), Mac (Metal); tq1_p: 1.6 bits, the smallest (Flash-Next engine, `ttf engine build --q38`)")
     p.add_argument("--emb", default=None, help="q6_k (float) / q4_1 (int-k codes, exact: the default for them) / q4_k ...")
     p.add_argument("--head", default=None)
-    for c in ("chat", "bench"):
-        p = sp.add_parser(c); p.add_argument("model")
+    p = sp.add_parser("chat"); p.add_argument("model")
+    p.add_argument("--ctx", type=int, help="context length in tokens (default: what fits in free VRAM)")
+    p = sp.add_parser("bench"); p.add_argument("model")
     p = sp.add_parser("generate"); p.add_argument("model"); p.add_argument("prompt"); p.add_argument("-n", default="128")
     p = sp.add_parser("serve"); p.add_argument("model"); p.add_argument("--port", default="8080")
     p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--ctx", type=int, help="context length in tokens (default: what fits in free VRAM; "
+                   "set it, and the same number in your agent's config)")
     p = sp.add_parser("score"); p.add_argument("model"); p.add_argument("data"); p.add_argument("--chunks", default="40")
     p.add_argument("--u16", action="store_true")
-    a = ap.parse_args(argv)
+    a, unknown = ap.parse_known_args(argv)
+    if unknown:
+        if a.cmd not in ("chat", "generate", "serve", "bench", "score"):
+            ap.error(f"unrecognized arguments: {' '.join(unknown)}")
+        extra = unknown + extra
     f = globals()[f"cmd_{a.cmd}"]
     return f(a) if a.cmd in ("doctor", "data") else f(a, extra)
 

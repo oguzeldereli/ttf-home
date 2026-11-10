@@ -37,6 +37,12 @@ ttf chat models/ttf-27b/ttf-Qwen3.8-27B-adapters-r0.2-TQ1_P.gguf
 ttf serve models/ttf-27b/ttf-Qwen3.8-27B-adapters-r0.2-TQ1_P.gguf --port 8080     # OpenAI-compatible API at http://127.0.0.1:8080/v1
 ```
 
+For a coding agent (opencode, Cline, ...), set the context length and give the agent the same number:
+`ttf serve MODEL --ctx 65536 -fa on -ctk q8_0 -ctv q8_0`. Without `--ctx`, llama.cpp starts from the model's trained
+context (262k) and shrinks it to what fits in free VRAM (about 47k on a 12 GB GPU) without saying so; an agent that
+reads 262k from the model then sends more than the server holds and compacts in a loop. The real value is
+`n_ctx_slot` in the server log, or `curl http://127.0.0.1:8080/props`. `-ctk q8_0 -ctv q8_0` halves the KV cache.
+
 The whole model, 8.2 GB (1.6 bits per ternary weight), fits on one 12 GB NVIDIA GPU: 29 tokens/s decode and 748
 tokens/s prefill on an RTX 3090 Ti. Without a GPU it runs on the CPU, slower.
 
@@ -49,8 +55,8 @@ The 27B repo also has a 6.74 GB variant without ternary adapters, `ttf-Qwen3.8-2
 engine that is already there: if you built `--q38` before 10 Nov 2026, delete `~/.cache/ttf/llama.cpp-q38` and build
 it again. An older engine stops with "wrong number of tensors".
 
-Options after `--` go to llama.cpp unchanged, for example `ttf chat MODEL -- -c 8192 -t 8`. Choose the backend with
-`ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when `nvidia-smi` finds a GPU):
+Options `ttf` does not know go to llama.cpp unchanged, for example `ttf chat MODEL -t 8 -fa on` (or after `--`). Choose the backend with
+`ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when an NVIDIA GPU is found; the CUDA build needs the CUDA toolkit, `nvcc`, not only the driver; if CMake does not find it, add `--cmake="-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"`):
 - `cuda` and `cpu` have fast kernels for the ternary types;
 - on `metal` (Macs) and `vulkan` (AMD / Intel GPUs), llama.cpp runs the ternary matrices on the CPU.
 
