@@ -43,17 +43,31 @@ context (262k) and shrinks it to what fits in free VRAM (about 47k on a 12 GB GP
 reads 262k from the model then sends more than the server holds and compacts in a loop. The real value is
 `n_ctx_slot` in the server log, or `curl http://127.0.0.1:8080/props`. `-ctk q8_0 -ctv q8_0` halves the KV cache.
 
-The whole model, 8.2 GB (1.6 bits per ternary weight), fits on one 12 GB NVIDIA GPU: 29 tokens/s decode and 748
-tokens/s prefill on an RTX 3090 Ti. Without a GPU it runs on the CPU, slower.
+The whole model, 8.2 GB (1.6 bits per ternary weight), fits on one 12 GB NVIDIA GPU. Without a GPU it runs on the CPU,
+slower. Decode on an RTX 3090 Ti (`llama-bench -p 0 -n 128`, engine with `llama.cpp/q38/` patches 0010-0012):
+
+| file | decode | before 0010-0012 |
+|---|---|---|
+| `ttf-Qwen3.8-27B-adapters-r0.2-TQ1_P.gguf` (8.2 GB) | 34.8 tok/s | 29.4 tok/s |
+| `ttf-Qwen3.8-27B-noadapters-TQ1_P.gguf` (6.74 GB) | 73.0 tok/s | 43.8 tok/s |
+| the same weights with K padded to a multiple of 160 (6.67 GB) | 101.7 tok/s | - |
+
+TQ1_P packs 160 trits per 32 bytes, so a matrix whose width is not a multiple of 160 (the 27B's 17408-wide FFN down
+and 6144-wide output projections) was stored in a slower type; `ttf export --wtype tq1_p` now pads those with zero
+columns and the engine pads the input, which gives the same product with every matrix in TQ1_P. The speed comes from
+patches 0010-0012: a TQ1_P matrix-vector kernel, the TTF scale / centring / bias / adapter fused around it, and fused
+DeltaNet kernels (gates, q/k norm, output norm, conv state). Each fusion has an off switch for debugging:
+`GGML_CUDA_TTF_LINEAR_OFF=1`, `GGML_CUDA_DISABLE_GDN_GATES=1`, `GGML_CUDA_DISABLE_GDN_L2=1`,
+`GGML_CUDA_DISABLE_GDN_OUT_NORM=1`, `GGML_CUDA_DISABLE_CONV_STATE=1`.
 
 There are two engines. Both released models use TQ1_P weights (160 trits in 32 bytes), which only the second one,
 `--q38` (the patches in `llama.cpp/q38/`), has; `ttf` picks the engine from the GGUF file. Models you export yourself
 with the default `--wtype tq2_0` run in the first one (`ttf engine build`, the patches in `llama.cpp/`).
 
 The 27B repo also has a 6.74 GB variant without ternary adapters, `ttf-Qwen3.8-27B-noadapters-TQ1_P.gguf`. It needs
-`llama.cpp/q38/` patch 0009 (an optional bias on the DeltaNet beta projection). `ttf engine build` does not update an
-engine that is already there: if you built `--q38` before 10 Nov 2026, delete `~/.cache/ttf/llama.cpp-q38` and build
-it again. An older engine stops with "wrong number of tensors".
+`llama.cpp/q38/` patch 0009 (an optional bias on the DeltaNet beta projection). `ttf engine build` applies the patches
+an existing engine does not have yet and rebuilds, so after `git pull` in ttf-home, run `ttf engine build --q38` again
+(an engine without patch 0009 stops with "wrong number of tensors" on that file).
 
 Options `ttf` does not know go to llama.cpp unchanged, for example `ttf chat MODEL -t 8 -fa on` (or after `--`). Choose the backend with
 `ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when an NVIDIA GPU is found; the CUDA build needs the CUDA toolkit, `nvcc`, not only the driver; `ttf engine build` finds it on PATH, in CUDA_HOME / CUDA_PATH or the newest /usr/local/cuda-X.Y (CUDA 12 and 13 both work); elsewhere, add `--cmake="-DCMAKE_CUDA_COMPILER=/path/to/bin/nvcc"`):
@@ -77,6 +91,9 @@ Measured on an RTX 3090 Ti (24 GB) with 12 CPU threads, using `ttf chat MODEL --
 - with all experts on the CPU (`-ncmoe 99`): 22 tokens/s decode at 6.2 GB of VRAM.
 
 Use the number of physical cores for `-t`; hyper-threads make decoding slower.
+
+Patches 0010-0012 change little here: with the experts on the CPU, the CPU sets the speed (`-ncmoe 20`: 30.7 vs 29.9
+tokens/s; `-ncmoe 99`: 22.9 tokens/s).
 
 `-ncmoe 18` (18 layers' experts on the CPU) assumes a 24 GB card with nothing else on it. When you set `-ncmoe`,
 llama.cpp's `--fit` switches off, so on a card that is partly in use, leave `-ncmoe` out and let `--fit` place the

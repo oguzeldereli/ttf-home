@@ -211,15 +211,29 @@ def _cuda_toolkit_flags(user):
 def cmd_engine(a, extra=()):
     d = engine_dir(a.q38)
     if a.action == "build":
+        patches = sorted((HOME / "llama.cpp" / ("q38" if a.q38 else "")).glob("*.patch"))
+        base = ENGINE_BASE_Q38 if a.q38 else ENGINE_BASE
+        am = ["git", "-C", d, "-c", "user.name=ttf", "-c", "user.email=ttf@localhost", "am"]
         if not (d / ".git").exists():
-            patches = sorted((HOME / "llama.cpp" / ("q38" if a.q38 else "")).glob("*.patch"))
             if not patches:
                 raise SystemExit(f"no patches under {HOME / 'llama.cpp'}: install ttf-home from a clone "
                                  "(git clone https://github.com/oguzeldereli/ttf-home && pip install -e ttf-home)")
             d.parent.mkdir(parents=True, exist_ok=True)
             run(["git", "clone", ENGINE_URL, d])
-            run(["git", "-C", d, "checkout", "-B", "ttf", ENGINE_BASE_Q38 if a.q38 else ENGINE_BASE])
-            run(["git", "-C", d, "-c", "user.name=ttf", "-c", "user.email=ttf@localhost", "am", *patches])
+            run(["git", "-C", d, "checkout", "-B", "ttf", base])
+            run([*am, *patches])
+        else:
+            # an engine built from an older ttf-home: apply the patches added since (the first n are in place)
+            try:
+                n = int(subprocess.run(["git", "-C", str(d), "rev-list", "--count", f"{base}..HEAD"],
+                                       capture_output=True, text=True, check=True).stdout)
+            except (subprocess.CalledProcessError, ValueError):
+                n = None
+            if n is None:
+                print(f"note: {d} is not a ttf engine checkout; building it as it is", flush=True)
+            elif n < len(patches):
+                print(f"engine at {n} of {len(patches)} patches: applying {len(patches) - n} new ones", flush=True)
+                run([*am, *patches[n:]])
         if a.backend is None:
             a.backend = "cuda" if gpu_info() else ("metal" if sys.platform == "darwin" else "cpu")
             if a.backend == "cpu":

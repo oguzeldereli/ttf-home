@@ -1,0 +1,281 @@
+From 66ed54f9a0753fad8aa3aa620408206a243dd0b7 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Tue, 10 Nov 2026 19:13:42 +0000
+Subject: [PATCH 12/12] CUDA: fused decode conv of DeltaNet layers (state
+ gather, concat, conv + silu, state store)
+
+One kernel per layer for one token of one sequence: reads the conv state row
+from the recurrent cache by its row id (the GET_ROWS is skipped), the new
+column x, writes silu(conv) and the shifted state into the cache cell. Replaces
+get_rows + concat + ssm_conv/silu + the state cpy. The ssm_conv may come later
+in the graph: it is computed at the concat when no node between writes over its
+output, and skipped at its place. When the output reuses x's buffer at another
+offset, one block reads everything before writing.
+
+27B TQ1_P on an RTX 3090 Ti, tg128: 99.1 -> 101.1 tok/s, 9.82 GPU ms/token,
+985 kernels/token (was 1129); KLD vs the unfused decode unchanged (1.43e-4).
+GGML_CUDA_DISABLE_CONV_STATE=1 turns it off.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 154 +++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/ssm-conv.cu  |  51 +++++++++++
+ ggml/src/ggml-cuda/ssm-conv.cuh |   9 ++
+ 3 files changed, 212 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 1596d1bcd..ac1077d2d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3539,6 +3539,148 @@ static bool ggml_cuda_gdn_state_gather_skip(const ggml_cgraph * cgraph, int i) {
+     return false;
+ }
+ 
++static const ggml_tensor * ggml_cuda_strip_views(const ggml_tensor * t);
++static int ggml_cuda_next_compute(const ggml_cgraph * cgraph, int j);
++
++// decode conv of a DeltaNet layer: concat(state gathered by GET_ROWS, transposed x), the cpy of its last KC-1 columns
++// into the cache cell, ssm_conv + silu, as one kernel that reads the state from the cache (the GET_ROWS is skipped,
++// ggml_cuda_conv_state_skip). ci: the CONCAT. Returns the index of the silu, or 0.
++static bool ggml_cuda_conv_state_disabled() {
++    static const bool off = ggml_cuda_env_flag("GGML_CUDA_DISABLE_CONV_STATE");
++    return off;
++}
++
++static int ggml_cuda_conv_state_match(const ggml_cgraph * cgraph, int ci, ggml_cuda_conv_state & p) {
++    const ggml_tensor * cc = cgraph->nodes[ci];
++    if (ggml_cuda_conv_state_disabled() || cc->op != GGML_OP_CONCAT || cc->type != GGML_TYPE_F32 ||
++            ggml_get_op_params_i32(cc, 0) != 0 || (cc->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return 0;
++    }
++    const int64_t KC = cc->ne[0], C = cc->ne[1];
++    if (KC != 4 || cc->ne[2] != 1 || cc->ne[3] != 1 || !ggml_is_contiguous(cc)) {
++        return 0;
++    }
++    const ggml_tensor * a = cc->src[0], * b = cc->src[1];
++    const ggml_tensor * gr = ggml_cuda_strip_views(a);
++    if (!gr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            a->ne[0] != KC - 1 || a->ne[1] != C || !ggml_is_contiguous(a) || gr->ne[0] != (KC - 1) * C ||
++            ggml_nelements(gr) != (KC - 1) * C) {
++        return 0;
++    }
++    const ggml_tensor * rows = gr->src[0], * ids = gr->src[1];
++    if (rows->type != GGML_TYPE_F32 || rows->nb[0] != sizeof(float) || rows->ne[0] != gr->ne[0] || rows->data == nullptr ||
++            ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || rows->nb[1] % sizeof(float) != 0) {
++        return 0;
++    }
++    if (b->type != GGML_TYPE_F32 || b->ne[0] != 1 || b->ne[1] != C || b->ne[2] != 1 || b->nb[1] != sizeof(float) ||
++            b->data == nullptr) {
++        return 0;
++    }
++    // cpy of the last KC-1 columns into the cell, then ssm_conv + silu, with only views between
++    const int pi = ggml_cuda_next_compute(cgraph, ci);
++    if (pi < 0) {
++        return 0;
++    }
++    const ggml_tensor * cp = cgraph->nodes[pi];
++    if (cp->op != GGML_OP_CPY || cp->src[0]->view_src != cc || cp->src[0]->view_offs != sizeof(float) ||
++            cp->src[0]->ne[0] != KC - 1 || cp->src[0]->ne[1] != C || cp->src[0]->nb[1] != cc->nb[1] ||
++            cp->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(cp->src[1]) ||
++            ggml_nelements(cp->src[1]) != (KC - 1) * C || cp->src[1]->data == nullptr) {
++        return 0;
++    }
++    // the ssm_conv may come later (other nodes of the layer between): the kernel computes it here, at the concat, so
++    // no node between may write over its output; the conv and silu are skipped at their place (ggml_cuda_conv_state_skip)
++    constexpr int SCAN = 96;
++    int si = -1;
++    for (int k = pi + 1; k < cgraph->n_nodes && k < pi + SCAN; ++k) {
++        if (cgraph->nodes[k]->op == GGML_OP_SSM_CONV && cgraph->nodes[k]->src[0] == cc) {
++            si = k;
++            break;
++        }
++    }
++    if (si < 0 || si + 1 >= cgraph->n_nodes) {
++        return 0;
++    }
++    const ggml_tensor * sc = cgraph->nodes[si], * u = cgraph->nodes[si + 1];
++    if (sc->op != GGML_OP_SSM_CONV || sc->src[0] != cc || (sc->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            u->op != GGML_OP_UNARY || ggml_get_unary_op(u) != GGML_UNARY_OP_SILU || u->src[0] != sc ||
++            u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u) || ggml_nelements(u) != C) {
++        return 0;
++    }
++    const ggml_tensor * w = sc->src[1];
++    if (w->type != GGML_TYPE_F32 || w->ne[0] != KC || w->ne[1] != C || !ggml_is_contiguous(w)) {
++        return 0;
++    }
++    // no other reader of the gathered rows, the concat or the raw conv
++    {
++        const ggml_tensor * mids[3] = { gr, cc, sc };
++        const ggml_tensor * inside[4] = { cc, cp, sc, u };
++        if (!ggml_cuda_only_inside_readers(cgraph, mids, 3, inside, 4)) {
++            return 0;
++        }
++    }
++    // the output may share its base with x (same element, same thread) but not overlap x otherwise, nor the cache
++    auto overlap = [](const void * p0, size_t n0, const void * p1, size_t n1) {
++        const char * a0 = (const char *) p0, * b0 = (const char *) p1;
++        return a0 < b0 + n1 && b0 < a0 + n0;
++    };
++    const size_t nu = C * sizeof(float);
++    if (C > 1024 * 16 || overlap(u->data, nu, rows->data, ggml_nbytes(rows)) ||
++            overlap(u->data, nu, cp->src[1]->data, ggml_nbytes(cp->src[1])) || overlap(u->data, nu, w->data, ggml_nbytes(w))) {
++        return 0;
++    }
++    for (int k = pi + 1; k < si; ++k) {
++        const ggml_tensor * n = cgraph->nodes[k];
++        if (!ggml_cuda_is_view_or_noop(n) && n->data && overlap(u->data, nu, n->data, ggml_nbytes(n))) {
++            return 0;
++        }
++    }
++    p.rows = (const float *) rows->data; p.ids = (const int32_t *) ids->data; p.row_stride = rows->nb[1] / sizeof(float);
++    p.x = (const float *) b->data; p.w = (const float *) w->data; p.cell = (float *) cp->src[1]->data;
++    p.dst = (float *) u->data; p.C = (int) C; p.KC = (int) KC;
++    p.one_block = overlap(u->data, nu, b->data, nu) && u->data != b->data;
++    return si + 1;
++}
++
++// a GET_ROWS read by a fused conv-state kernel (ggml_cuda_conv_state_match): not computed
++static bool ggml_cuda_conv_state_skip(const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * gr = cgraph->nodes[i];
++    if (ggml_cuda_conv_state_disabled()) {
++        return false;
++    }
++    const ggml_tensor * cc = nullptr;
++    if (gr->op == GGML_OP_SSM_CONV) {
++        cc = gr->src[0];
++    } else if (gr->op == GGML_OP_UNARY && ggml_get_unary_op(gr) == GGML_UNARY_OP_SILU && gr->src[0]->op == GGML_OP_SSM_CONV) {
++        cc = gr->src[0]->src[0];
++    }
++    if (cc) {
++        if (cc->op != GGML_OP_CONCAT) {
++            return false;
++        }
++        for (int j = i - 1; j >= 0 && j > i - 128; --j) {
++            if (cgraph->nodes[j] == cc) {
++                ggml_cuda_conv_state p;
++                const int last = ggml_cuda_conv_state_match(cgraph, j, p);
++                return last > 0 && (last == i || last - 1 == i);
++            }
++        }
++        return false;
++    }
++    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32) {
++        return false;
++    }
++    constexpr int SCAN = 256;
++    for (int j = i + 1; j < cgraph->n_nodes && j < i + SCAN; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n->op == GGML_OP_CONCAT && ggml_cuda_strip_views(n->src[0]) == gr) {
++            ggml_cuda_conv_state p;
++            return ggml_cuda_conv_state_match(cgraph, j, p) > 0;
++        }
++    }
++    return false;
++}
++
+ // match ssm_scan + the strided cpy that scatters its state snapshots into the cache, so the kernel writes them and skips the cpy
+ static int ggml_cuda_try_ssm_scan_cache_fusion(
+         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_state_cpy) {
+@@ -4867,6 +5009,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    if (node->op == GGML_OP_CONCAT) {
++        ggml_cuda_conv_state p;
++        if (ggml_cuda_conv_state_match(cgraph, i, p) > 0) {
++            ggml_cuda_conv_state_launch(*cuda_ctx, p);
++            return ggml_cuda_next_compute(cgraph, i) - i;      // the concat and the cpy; conv + silu skipped later
++        }
++    }
++
+     if (node->op == GGML_OP_RMS_NORM) {
+         ggml_cuda_gdn_out_norm p;
+         const int last = ggml_cuda_gdn_out_norm_match(cgraph, i, p);
+@@ -5887,8 +6037,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
+-                if (!ggml_cuda_fusion_disabled() && ggml_cuda_gdn_state_gather_skip(cgraph, i)) {
+-                    continue;   // read by its gated_delta_net from the cache
++                if (!ggml_cuda_fusion_disabled() && (ggml_cuda_gdn_state_gather_skip(cgraph, i) || ggml_cuda_conv_state_skip(cgraph, i))) {
++                    continue;   // read by its gated_delta_net / fused conv from the cache
+                 }
+ 
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index f41438b31..d05b4f266 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -205,3 +205,54 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+     }
+ }
++
++// PER > 1, one block: every x and state value is read before any output is written, so dst may overlap x (a buffer the
++// allocator reused) at any offset. PER == 1: a thread per channel over many blocks (dst apart from x, or at its base)
++template <int KC, int T, int PER>
++static __global__ void __launch_bounds__(T) k_conv_state(const ggml_cuda_conv_state p) {
++    const float * rows = p.rows + (int64_t) p.ids[0] * p.row_stride;
++    float x[PER][KC];
++#pragma unroll
++    for (int r = 0; r < PER; ++r) {
++        const int c = PER == 1 ? blockIdx.x * T + threadIdx.x : r * T + threadIdx.x;
++        if (c < p.C) {
++#pragma unroll
++            for (int t = 0; t < KC - 1; ++t) {
++                x[r][t] = rows[(int64_t) c * (KC - 1) + t];
++            }
++            x[r][KC - 1] = p.x[c];
++        }
++    }
++    if (PER > 1) {
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < PER; ++r) {
++        const int c = PER == 1 ? blockIdx.x * T + threadIdx.x : r * T + threadIdx.x;
++        if (c < p.C) {
++            const float * w = p.w + (int64_t) c * KC;
++            float sumf = 0.0f;
++#pragma unroll
++            for (int j = 0; j < KC; ++j) {
++                sumf += x[r][j] * w[j];
++            }
++            float * cell = p.cell + (int64_t) c * (KC - 1);
++#pragma unroll
++            for (int t = 0; t < KC - 1; ++t) {
++                cell[t] = x[r][t + 1];
++            }
++            p.dst[c] = ggml_cuda_op_silu_single(sumf);
++        }
++    }
++}
++
++void ggml_cuda_conv_state_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state & p) {
++    GGML_ASSERT(p.KC == 4);
++    if (p.one_block) {
++        GGML_ASSERT(p.C <= 1024 * 16);
++        k_conv_state<4, 1024, 16><<<1, 1024, 0, ctx.stream()>>>(p);
++    } else {
++        constexpr int T = 128;
++        k_conv_state<4, T, 1><<<(p.C + T - 1) / T, T, 0, ctx.stream()>>>(p);
++    }
++}
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 8514ca849..c6be16350 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -1,3 +1,12 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
++
++// decode (one token, one sequence) of a conv layer whose state is gathered from the recurrent cache: reads the state row
++// ids[0] of rows and the new column x, writes silu(conv) to dst and the shifted state to cell (may be the same row)
++struct ggml_cuda_conv_state {
++    const float * rows; const int32_t * ids; int64_t row_stride;   // floats
++    const float * x; const float * w; float * cell; float * dst; int C; int KC;
++    bool one_block;   // dst overlaps x at another offset: read everything before writing
++};
++void ggml_cuda_conv_state_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state & p);
+-- 
+2.55.0
+

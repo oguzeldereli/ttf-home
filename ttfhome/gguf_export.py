@@ -438,14 +438,24 @@ def _make_class(base, ck, wq, eq, hq, log):
                     e = ck.out_scale[hb]
                     s, b = s * e, (b * e if b is not None else None)
                     mag = (mag[0], mag[1] * e[:, None]) if mag is not None else None
+                # TQ1_P needs K % 160 == 0: other widths (Qwen3.8-27B: ffn_down 17408, ssm_out / attn_output 6144)
+                # get zero columns, c = m = 0 there and zero adapter rows, and the engine pads the input with zeros, so
+                # the product is unchanged. Not beside a ternary adapter (its down layer is TQ1_0, K % 256).
+                Kp = K
+                if getattr(QT, "TQ1_P", None) is not None and wq == QT.TQ1_P and K % 160 and "d" not in sub:
+                    Kp = -(-K // 160) * 160
+                    log(f"{hname}: K {K} padded to {Kp} for TQ1_P")
+
+                def padk(t):
+                    return t if Kp == K else torch.cat([t, t.new_zeros(*t.shape[:-1], Kp - K)], -1)
                 for gname, ri, ci in self._perm(hname, bid, N, K):
                     stem = gname[:-len(".weight")]
-                    if self._w(gname, T[ri][:, ci], s[ri], main=True):
+                    if self._w(gname, padk(T[ri][:, ci]), s[ri], main=True):
                         self._vec(stem + ".ttf_r", s[ri])
                     if c is not None:
-                        self._vec(stem + ".ttf_c", c[ci])
+                        self._vec(stem + ".ttf_c", padk(c[ci]))
                     if mu is not None:
-                        self._vec(stem + ".ttf_m", -(c[ci] if c is not None else 1.0) * mu[ci])
+                        self._vec(stem + ".ttf_m", padk(-(c[ci] if c is not None else 1.0) * mu[ci]))
                     if b is not None:
                         self._vec(stem + ".ttf_b", b[ri])
                     nb += T.numel()
@@ -455,11 +465,11 @@ def _make_class(base, ck, wq, eq, hq, log):
                         if hb in ck.out_scale:
                             r = r * ck.out_scale[hb]
                         f = ".ttf_fd" if "d" in sub else ".ttf_d"     # beside a ternary adapter: the second side adapter
-                        self.gguf_writer.add_tensor(stem + f, Bt[:, ci].numpy().astype(np.float16), raw_dtype=QT.F16)
+                        self.gguf_writer.add_tensor(stem + f, padk(Bt[:, ci]).numpy().astype(np.float16), raw_dtype=QT.F16)
                         if c is not None:
-                            self._vec(stem + f + "_c", c[ci])
+                            self._vec(stem + f + "_c", padk(c[ci]))
                         if mu is not None:          # the adapter reads the centred input too: c (x - mu)
-                            self._vec(stem + f + "_m", -(c[ci] if c is not None else 1.0) * mu[ci])
+                            self._vec(stem + f + "_m", padk(-(c[ci] if c is not None else 1.0) * mu[ci]))
                         self.gguf_writer.add_tensor(stem + f[:-1] + "u", (r[:, None] * A)[ri].numpy().astype(np.float16),
                                                     raw_dtype=QT.F16)
                     if "d" in sub:
