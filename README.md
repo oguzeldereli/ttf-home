@@ -44,6 +44,11 @@ There are two engines. Both released models use TQ1_P weights (160 trits in 32 b
 `--q38` (the patches in `llama.cpp/q38/`), has; `ttf` picks the engine from the GGUF file. Models you export yourself
 with the default `--wtype tq2_0` run in the first one (`ttf engine build`, the patches in `llama.cpp/`).
 
+The 27B repo also has a 6.74 GB variant without ternary adapters, `ttf-Qwen3.8-27B-noadapters-TQ1_P.gguf`. It needs
+`llama.cpp/q38/` patch 0009 (an optional bias on the DeltaNet beta projection). `ttf engine build` does not update an
+engine that is already there: if you built `--q38` before 10 Nov 2026, delete `~/.cache/ttf/llama.cpp-q38` and build
+it again. An older engine stops with "wrong number of tensors".
+
 Options after `--` go to llama.cpp unchanged, for example `ttf chat MODEL -- -c 8192 -t 8`. Choose the backend with
 `ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when `nvidia-smi` finds a GPU):
 - `cuda` and `cpu` have fast kernels for the ternary types;

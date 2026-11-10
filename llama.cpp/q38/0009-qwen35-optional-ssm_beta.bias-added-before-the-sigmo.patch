@@ -1,0 +1,48 @@
+From 08bfb320f03b36ef4405a31cfc7583f1cce2d2b5 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Tue, 10 Nov 2026 13:36:38 +0000
+Subject: [PATCH] qwen35: optional ssm_beta.bias, added before the sigmoid
+ (centred float in_proj_b folded to a bias)
+
+---
+ src/llama-model.h     | 1 +
+ src/models/qwen35.cpp | 4 ++++
+ 2 files changed, 5 insertions(+)
+
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 204411cec..1752af41c 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -586,6 +586,7 @@ struct llama_layer {
+     struct ggml_tensor * ssm_f_a    = nullptr;
+     struct ggml_tensor * ssm_f_b    = nullptr;
+     struct ggml_tensor * ssm_beta   = nullptr;
++    struct ggml_tensor * ssm_beta_b = nullptr;   // optional bias before the sigmoid (the centred float in_proj_b folded to a bias)
+     struct ggml_tensor * ssm_g_a    = nullptr;
+     struct ggml_tensor * ssm_g_b    = nullptr;
+     struct ggml_tensor * ssm_o_norm = nullptr;
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index d0b4f4c2c..e4c96310e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -84,6 +84,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
+             layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
+             layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
+             layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
++            layer.ssm_beta_b     = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "bias",   il), { n_v_heads }, TENSOR_NOT_REQUIRED);
+             layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
+             layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
+             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
+@@ -355,6 +356,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     ggml_tensor * z         = qkvz.second;
+ 
+     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
++    if (model.layers[il].ssm_beta_b) {   // the centred float in_proj_b, folded to a bias
++        beta = ggml_add(ctx0, beta, model.layers[il].ssm_beta_b);
++    }
+     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+     cb(beta, "beta", il);
+ 
+-- 
+2.55.0
+
