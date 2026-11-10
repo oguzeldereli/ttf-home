@@ -182,6 +182,32 @@ def _max_params_b(gib):
 
 # ---------------------------------------------------------------------------------------------------- engine
 
+def _cuda_toolkit_flags(user):
+    """CMake flags that point at the CUDA toolkit when nvcc is not on PATH: a versioned install
+    (/usr/local/cuda-13.2 without the /usr/local/cuda link, or one outside PATH) is otherwise not found, or CMake
+    finds an older toolkit than the driver. The newest /usr/local/cuda-X.Y wins; CUDA_HOME / CUDA_PATH first."""
+    if "CMAKE_CUDA_COMPILER" in user:
+        return []
+    nvcc = shutil.which("nvcc")
+    if not nvcc:
+        import glob
+        roots = [os.environ.get(v) for v in ("CUDA_HOME", "CUDA_PATH")] + ["/usr/local/cuda"]
+        def ver(p):
+            try:
+                return tuple(int(x) for x in p.rsplit("-", 1)[1].split("."))
+            except (IndexError, ValueError):
+                return ()
+        roots += sorted(glob.glob("/usr/local/cuda-*"), key=ver, reverse=True) + ["/opt/cuda"]
+        nvcc = next((os.path.join(r, "bin", "nvcc") for r in roots if r and os.path.exists(os.path.join(r, "bin", "nvcc"))), None)
+        if not nvcc:
+            print("WARNING: nvcc not found: the CUDA build needs the CUDA toolkit (not only the driver). If CMake "
+                  "cannot find it, pass its path: --cmake=\"-DCMAKE_CUDA_COMPILER=/path/to/cuda/bin/nvcc\"", flush=True)
+            return []
+        print(f"CUDA toolkit: {os.path.dirname(os.path.dirname(nvcc))} (nvcc not on PATH)", flush=True)
+    root = os.path.dirname(os.path.dirname(os.path.realpath(nvcc)))
+    return [f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DCUDAToolkit_ROOT={root}"]
+
+
 def cmd_engine(a, extra=()):
     d = engine_dir(a.q38)
     if a.action == "build":
@@ -202,9 +228,8 @@ def cmd_engine(a, extra=()):
                       "`ttf engine build --backend cuda`.", flush=True)
         flags = {"cuda": ["-DGGML_CUDA=ON"], "cpu": ["-DGGML_CUDA=OFF"], "metal": ["-DGGML_METAL=ON"],
                  "vulkan": ["-DGGML_VULKAN=ON"]}[a.backend]
-        if a.backend == "cuda" and not (shutil.which("nvcc") or os.path.exists("/usr/local/cuda/bin/nvcc")):
-            print("WARNING: nvcc not found: the CUDA build needs the CUDA toolkit (not only the driver). If CMake "
-                  "cannot find it, pass its path: --cmake=\"-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc\"", flush=True)
+        if a.backend == "cuda":
+            flags += _cuda_toolkit_flags(a.cmake + " " + " ".join(extra))
         b = d / f"build-{a.backend}"
         run(["cmake", "-S", d, "-B", b, "-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_CURL=OFF", *flags, *shlex.split(a.cmake), *extra])
         run(["cmake", "--build", b, "-j", str(os.cpu_count()), "--target", "llama-cli", "llama-server",

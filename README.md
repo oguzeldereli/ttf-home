@@ -56,7 +56,7 @@ engine that is already there: if you built `--q38` before 10 Nov 2026, delete `~
 it again. An older engine stops with "wrong number of tensors".
 
 Options `ttf` does not know go to llama.cpp unchanged, for example `ttf chat MODEL -t 8 -fa on` (or after `--`). Choose the backend with
-`ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when an NVIDIA GPU is found; the CUDA build needs the CUDA toolkit, `nvcc`, not only the driver; if CMake does not find it, add `--cmake="-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc"`):
+`ttf engine build --backend cuda|cpu|metal|vulkan` (the default is `cuda` when an NVIDIA GPU is found; the CUDA build needs the CUDA toolkit, `nvcc`, not only the driver; `ttf engine build` finds it on PATH, in CUDA_HOME / CUDA_PATH or the newest /usr/local/cuda-X.Y (CUDA 12 and 13 both work); elsewhere, add `--cmake="-DCMAKE_CUDA_COMPILER=/path/to/bin/nvcc"`):
 - `cuda` and `cpu` have fast kernels for the ternary types;
 - on `metal` (Macs) and `vulkan` (AMD / Intel GPUs), llama.cpp runs the ternary matrices on the CPU.
 
