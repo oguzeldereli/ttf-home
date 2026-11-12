@@ -453,7 +453,7 @@ def _train_recipe(base, gib):
 
 def cmd_import(a, extra):
     import torch
-    if gguf_info(a.gguf)[0] == Q38_ARCH:              # Qwen3.8-Flash-Next (MoE): the q38 trainer's inputs, a directory
+    if gguf_info(a.gguf)[0] in (Q38_ARCH, "qwen35moe"):   # MoE (Flash-Next, Tiel-Coder): the q38 trainer's inputs, a dir
         from .q38_import import import_q38
         with torch.inference_mode():
             import_q38(a.gguf, a.base, a.out)
