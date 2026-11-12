@@ -165,9 +165,11 @@ class TTFCheckpoint:
             self.cfg = json.loads(meta.get("ttf_config", "{}"))
             self.use_beta = bool(self.cfg.get("beta", True))
             self.args = {}
+            self.top = {}
         else:
             ck = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
             sd = ck.get("model", ck)
+            self.top = {k: v for k, v in ck.items() if k not in _NOT_META and not torch.is_tensor(v)}
             self.use_beta = bool(ck.get("beta", True))
             args = ck.get("args", {}) or {}
             self.args = args if isinstance(args, dict) else vars(args)
@@ -248,6 +250,54 @@ class TTFCheckpoint:
         A [N, k]) or None"""
         p = self.parts[b]
         return (p["mag_B"].float().t().contiguous(), p["mag_A"].float()) if "mag_A" in p else None
+
+
+_NOT_META = ("model", "optim", "optimizer", "opt", "sched", "scheduler", "scaler", "rng", "state", "args", "cfg")
+# trainer args that name local files (dropped from ttf.ckpt_meta); any other absolute path keeps its basename only
+_PATH_ARGS = ("ckpt", "out", "out_dir", "save", "resume", "data", "train", "val", "data_dir", "teacher", "cache",
+              "log", "log_dir", "db", "teacher_cache")
+
+
+_ABS = re.compile(r"(?<![\w.])[/~][^\s,;:=]*")
+
+
+def _public(v):
+    """an arg value for ttf.ckpt_meta: absolute / home paths (also inside a string, e.g. an --ext option) reduced to
+    their basename, the rest as JSON allows"""
+    if isinstance(v, str):
+        return _ABS.sub(lambda m: os.path.basename(m.group(0).rstrip("/")), v)
+    if isinstance(v, (list, tuple)):
+        return [_public(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _public(x) for k, x in v.items()}
+    if v is None or isinstance(v, (bool, int, float)):
+        return v
+    return str(v)
+
+
+def ckpt_meta(ck: "TTFCheckpoint", hparams: dict) -> dict:
+    """the GGUF KV ttf.ckpt_meta: what a GGUF -> trainable checkpoint importer needs to rebuild the model: the
+    trainer's non-path args (the ext list among them), the checkpoint's other scalars (beta, rank, ...), the scratch
+    model config, the HF arch / base model id and each TTF linear's adapter ranks (HF base name -> ternary rank, 0:
+    none; float_adapter_rank for the float low-rank adapters)"""
+    # the checkpoint's small top-level entries (flags, step, rank, ...); trainer state (ts_state, touched, ...) is not
+    # a recipe
+    m = {k: _public(v) for k, v in ck.top.items() if len(json.dumps(_public(v))) <= 512}
+    m["args"] = {k: _public(v) for k, v in ck.args.items() if k not in _PATH_ARGS}
+    if ck.cfg is not None:
+        m["cfg"] = _public(ck.cfg)
+    m["beta"] = ck.use_beta
+    m["arch"] = (hparams.get("architectures") or [None])[0]
+    base = hparams.get("_name_or_path") or ck.args.get("init_hf") or ck.args.get("hf") or ck.args.get("model")
+    m["base_model"] = _public(base) if base else None
+    m["scratch"] = ck.scratch
+    m["adapter_rank"] = {k: int(ck.parts[l["d"]]["wpacked"].shape[0]) if "d" in l else 0
+                         for k, l in sorted(ck.linears.items())}
+    fr = {k: int(ck.parts[l["main"]]["mag_A"].shape[1]) for k, l in sorted(ck.linears.items())
+          if "mag_A" in ck.parts[l["main"]]}
+    if fr:
+        m["float_adapter_rank"] = fr
+    return m
 
 
 _PART_KEYS = ("wpacked", "row_scale", "col_scale", "in_mean", "out_bias", "mag_A", "mag_B")
@@ -346,6 +396,8 @@ def _make_class(base, ck, wq, eq, hq, log):
             super().set_gguf_parameters()
             self.gguf_writer.add_uint32("ttf.format", 1)
             self.gguf_writer.add_string("ttf.act_quant", "trained with int8 per token")
+            # for a GGUF -> checkpoint importer (ttfhome.gguf_import): the recipe and the adapter ranks
+            self.gguf_writer.add_string("ttf.ckpt_meta", json.dumps(ckpt_meta(ck, self.hparams), sort_keys=True))
 
         def tensor_force_quant(self, name, new_name, bid, n_dims):
             if new_name in ("token_embd.weight", "output.weight"):
