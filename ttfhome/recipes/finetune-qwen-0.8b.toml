@@ -1,0 +1,21 @@
+# Fine-tuning a ternary Qwen3.5-0.8B (a TTF checkpoint, or one `ttf import` rebuilt from a released GGUF): the training
+# settings of the 0.8B recovery runs. 32k tokens per step (16 micro-batches of one 2048-token sequence).
+mode = "ttf"
+data-dtype = "u32"
+seq-len = 2048
+batch-size = 1
+accum = 16
+steps = 1000
+warmup = 100
+lr = 1.5e-3
+min-lr = 1.5e-4
+ttf-rank = 256
+kd-weight = 0.75
+loss-chunk = 512
+adapter-rank = 0
+ckpt-skip = 3
+eval-interval = 100
+eval-iters = 8
+save-secs = 1800
+qk-temp = false
+mem-cap-gib = 11.5

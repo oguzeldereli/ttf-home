@@ -438,6 +438,24 @@ def _conv_recipe(base, gib, convert=True):
     return big, ["--recipe", recipe, *small]
 
 
+def _finetune_recipe(base, gib):
+    """ttf-home's fine-tune recipe for the base model and this GPU (no ttf-conversion needed)"""
+    hc = json.loads((Path(base) / "config.json").read_text())
+    big = (hc.get("text_config") or hc).get("hidden_size", 0) > 3000
+    recipe = Path(__file__).resolve().parent / "recipes" / ("finetune-qwen-27b.toml" if big else "finetune-qwen-0.8b.toml")
+    small = ["--ttf-store", "fp12s", "--ttf-offload", "async", "--ttf-rank", 256] if big and gib < 80 else []
+    return ["--recipe", recipe, *small]
+
+
+def cmd_import(a, extra):
+    from .gguf_import import import_gguf
+    import torch
+    with torch.inference_mode():
+        import_gguf(a.gguf, a.base, a.out)
+    print(f"{a.out}: a fresh TTF checkpoint (step 0). Fine-tune it: ttf finetune --ckpt {a.out} --base {a.base} "
+          f"--data DATA --out RUN_DIR")
+
+
 def cmd_convert(a, extra):
     gib = _mem_cap()
     big, rec = _conv_recipe(a.base, gib)
@@ -469,7 +487,10 @@ def cmd_finetune(a, extra):
         base = a.base or ca["init_hf"]
         if not Path(base).exists():
             raise SystemExit(f"the checkpoint was converted from {ca['init_hf']}: pass --base (its config + tokenizer)")
-        args += [*_conv_recipe(base, gib, convert=False)[1], "--init-hf", base]
+        if ck.get("imported"):   # rebuilt from a GGUF (`ttf import`): ttf-home's own recipe and structure plug-in
+            args += [*_finetune_recipe(base, gib), "--init-hf", base]
+        else:
+            args += [*_conv_recipe(base, gib, convert=False)[1], "--init-hf", base]
         for e in ca.get("ext", []):
             args += ["--ext", e]
         if a.teacher:
@@ -617,6 +638,9 @@ def main(argv=None):
     p = sp.add_parser("finetune"); p.add_argument("--ckpt", required=True); p.add_argument("--data", required=True)
     p.add_argument("--out", required=True); p.add_argument("--base"); p.add_argument("--teacher")
     knobs(p)
+    p = sp.add_parser("import", help="a released TTF GGUF -> a trainable checkpoint (for `ttf finetune`)")
+    p.add_argument("gguf"); p.add_argument("out"); p.add_argument("--base", required=True,
+                   help="the base model's dir (config + tokenizer), as for export")
     p = sp.add_parser("export"); p.add_argument("ckpt"); p.add_argument("out")
     p.add_argument("--base", default=None, help="the base model's dir for a conversion (config + tokenizer)")
     p.add_argument("--wtype", default="tq2_0", choices=["tq2_0", "tq1_0", "q2_k", "tq1_p"],

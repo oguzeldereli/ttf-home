@@ -22,3 +22,6 @@ ttf = "ttfhome.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ttfhome*"]
+
+[tool.setuptools.package-data]
+ttfhome = ["recipes/*.toml"]
