@@ -4,7 +4,7 @@ Ternary language and speech models on a home computer:
 - run ternary models fast on a consumer GPU or CPU, in our own runtime (`ttf-home`);
 - train a model from scratch;
 - convert a Qwen3.5 / 3.8 model to ternary and keep training it;
-- fine-tune on your own text.
+- keep training a converted or released model on your own text (all of it, not a fine-tune of a few parts).
 
 One command line, `ttf`, does all of it.
 
@@ -22,7 +22,7 @@ Inference has two paths:
 |---|---|
 | [ttf-ternary](https://github.com/oguzeldereli/ttf-ternary) | the trainer (TTF), the `.ttf` exporter, and the paper |
 | [ttf-conversion](https://github.com/oguzeldereli/ttf-conversion) | pretrained Hugging Face model to ternary checkpoint |
-| **ttf-home** (this one) | the runtime; data, train, convert, fine-tune, export, chat / serve |
+| **ttf-home** (this one) | the runtime; data, train, convert, keep training, import / export, chat / serve |
 
 ## The runtime: `ttf-home`
 

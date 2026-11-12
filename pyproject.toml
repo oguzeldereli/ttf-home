@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ttf-home"
 version = "0.1.0"
-description = "Train, convert, fine-tune and run ternary (TTF) language models on a home computer"
+description = "Train, convert and run ternary (TTF) language models on a home computer"
 readme = "README.md"
 license = {file = "LICENSE.md"}   # PolyForm Noncommercial 1.0.0
 authors = [{name = "Özgür Güzeldereli"}]
@@ -13,7 +13,7 @@ requires-python = ">=3.11"
 dependencies = ["numpy"]                                # running models needs only this and the engine
 
 [project.optional-dependencies]
-train = ["ttf-ternary>=0.3.0", "tokenizers", "gguf"]  # ttf data / train / finetune / export
+train = ["ttf-ternary>=0.3.0", "tokenizers", "gguf"]  # ttf data / train / import / export
 convert = ["ttf-home[train]", "ttf-conversion>=0.3.0", "transformers==5.19.0", "flash-linear-attention==0.5.2"]
 test = ["pytest"]
 

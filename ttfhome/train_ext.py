@@ -1,4 +1,4 @@
-"""--ext ttfhome.train_ext[:untie=1,rank=R]: the structure of a converted model, for training it (ttf finetune) from a
+"""--ext ttfhome.train_ext[:untie=1,rank=R]: the structure of a converted model, for training it (ttf train --init) from a
 checkpoint that gguf_import.py rebuilt from a GGUF. Structure only: nothing here fits or converts anything.
 
   untie=1   the head is its own tensor (not the embedding's): a GGUF with output.weight

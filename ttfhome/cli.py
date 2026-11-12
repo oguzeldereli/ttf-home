@@ -1,4 +1,4 @@
-"""ttf: train, convert, fine-tune and run ternary (TTF) language models on a home computer.
+"""ttf: train, convert and run ternary (TTF) language models on a home computer.
 
   ttf doctor                                   what this machine has (GPU, memory, the engine, the trainer)
   ttf engine build [--backend cuda|cpu] [--llama | --q38]
@@ -9,10 +9,12 @@
                                                text / Markdown / JSONL (text or chat messages) -> token files
   ttf train --data DATA --out RUN [--size auto|tiny|small|medium|large] [--hours H] [TTF knobs]
                                                a ternary model from scratch
+  ttf train --init CKPT --data DATA --out RUN [--base HF_DIR] [--steps N]
+                                               keep training a ternary model (all of it: trits, scales, adapters,
+                                               floats) from a checkpoint: a conversion's, a run's, or `ttf import`'s
   ttf convert --base HF_DIR --data DATA --out RUN [--steps 1000]
                                                a Qwen3.5 / 3.8 model -> ternary, then TTF recovery training
-  ttf finetune --ckpt CKPT --data DATA --out RUN [--steps 300]
-                                               keep training a ternary model on your own data
+  ttf import MODEL.gguf OUT.pt --base HF_DIR  a released TTF GGUF -> a checkpoint to train (`ttf train --init`)
   ttf export CKPT OUT.gguf [--base HF_DIR] [--wtype tq2_0|tq1_0|q2_k]
   ttf run MODEL.ttf "TEXT" [-n N | -o out.wav]  any .ttf model: a text model continues the text, a speech model
                                                speaks it (more options: ttf run MODEL.ttf --help)
@@ -21,7 +23,7 @@
   .gguf models (llama.cpp, `ttf engine build --llama` or `--q38`): ttf generate MODEL.gguf "PROMPT" (base models) |
     ttf chat MODEL.gguf | ttf serve MODEL.gguf [--port 8080] [--ctx N] | ttf bench MODEL.gguf | ttf score MODEL.gguf DATA
 
-TTF knobs (train / convert / finetune; the defaults are the measured best):
+TTF knobs (train / convert; the defaults are the measured best):
   --theta 16 (firing threshold, in steps)   --rank R (accumulator rank)   --lr / --min-lr   --steps / --warmup
   --seq-len / --batch / --accum            any other trainer option after `--` (python -m ttf.train --help)
 """
@@ -396,6 +398,8 @@ def _mem_cap():
 
 
 def cmd_train(a, extra):
+    if a.init:
+        return _train_from(a, extra)
     gib = _mem_cap()
     size = _auto_size(gib) if a.size == "auto" else a.size
     preset, mb, seq = SIZES[size]
@@ -434,15 +438,15 @@ def _conv_recipe(base, gib, convert=True):
     recipe = Path(_conv_root()) / "recipes" / ("qwen-27b.toml" if big else "qwen-0.8b.toml")
     small = ["--ttf-store", "fp12s", "--ttf-offload", "async", "--ttf-rank", 256] if big and gib < 80 else []
     if small and convert:
-        small += ["--intk-emb", ""]          # (a fine-tune keeps the structure its checkpoint has)
+        small += ["--intk-emb", ""]          # (training from a checkpoint keeps the structure it has)
     return big, ["--recipe", recipe, *small]
 
 
-def _finetune_recipe(base, gib):
-    """ttf-home's fine-tune recipe for the base model and this GPU (no ttf-conversion needed)"""
+def _train_recipe(base, gib):
+    """ttf-home's training recipe for a converted base model and this GPU (no ttf-conversion needed)"""
     hc = json.loads((Path(base) / "config.json").read_text())
     big = (hc.get("text_config") or hc).get("hidden_size", 0) > 3000
-    recipe = Path(__file__).resolve().parent / "recipes" / ("finetune-qwen-27b.toml" if big else "finetune-qwen-0.8b.toml")
+    recipe = Path(__file__).resolve().parent / "recipes" / ("qwen-27b.toml" if big else "qwen-0.8b.toml")
     small = ["--ttf-store", "fp12s", "--ttf-offload", "async", "--ttf-rank", 256] if big and gib < 80 else []
     return ["--recipe", recipe, *small]
 
@@ -452,7 +456,7 @@ def cmd_import(a, extra):
     import torch
     with torch.inference_mode():
         import_gguf(a.gguf, a.base, a.out)
-    print(f"{a.out}: a fresh TTF checkpoint (step 0). Fine-tune it: ttf finetune --ckpt {a.out} --base {a.base} "
+    print(f"{a.out}: a TTF checkpoint to train from (step 0): ttf train --init {a.out} --base {a.base} "
           f"--data DATA --out RUN_DIR")
 
 
@@ -476,19 +480,26 @@ def _conv_root():
 
 
 def cmd_finetune(a, extra):
+    """(the old name of `ttf train --init`)"""
+    a.init = a.ckpt
+    _train_from(a, extra)
+
+
+def _train_from(a, extra):
+    """full training (every trit, scale, adapter and float, as the conversion's recovery run) from a checkpoint"""
     import torch
     gib = _mem_cap()
-    ck = torch.load(a.ckpt, map_location="cpu", weights_only=False, mmap=True)
+    ck = torch.load(a.init, map_location="cpu", weights_only=False, mmap=True)
     ca = ck.get("args", {}) or {}
     ca = ca if isinstance(ca, dict) else vars(ca)
-    args = ["--init-ckpt", a.ckpt, *_data_args(a.data, "u32" if ca.get("init_hf") else None), "--out-dir", a.out,
-            "--mem-cap-gib", f"{gib * 0.94:.1f}", "--resume", "--steps", a.steps or 300]
+    args = ["--init-ckpt", a.init, *_data_args(a.data, "u32" if ca.get("init_hf") else None), "--out-dir", a.out,
+            "--mem-cap-gib", f"{gib * 0.94:.1f}", "--resume"]
     if ca.get("init_hf"):
         base = a.base or ca["init_hf"]
         if not Path(base).exists():
             raise SystemExit(f"the checkpoint was converted from {ca['init_hf']}: pass --base (its config + tokenizer)")
         if ck.get("imported"):   # rebuilt from a GGUF (`ttf import`): ttf-home's own recipe and structure plug-in
-            args += [*_finetune_recipe(base, gib), "--init-hf", base]
+            args += [*_train_recipe(base, gib), "--init-hf", base]
         else:
             args += [*_conv_recipe(base, gib, convert=False)[1], "--init-hf", base]
         for e in ca.get("ext", []):
@@ -499,7 +510,6 @@ def cmd_finetune(a, extra):
             args += ["--kd-weight", 0]
     else:
         args += ["--recipe", "scratch-110m", "--preset", ca.get("preset", "small")]
-    a.steps = None
     _trainer(args + _knobs(a), extra)
 
 
@@ -630,15 +640,19 @@ def main(argv=None):
             p.add_argument(o, type=int)
     p = sp.add_parser("train"); p.add_argument("--data", required=True); p.add_argument("--out", required=True)
     p.add_argument("--size", default="auto", choices=["auto", *SIZES]); p.add_argument("--hours", type=float)
+    p.add_argument("--init", help="train from this checkpoint (a conversion's, a run's, or `ttf import`'s) instead of "
+                   "from scratch: every part of the model trains")
+    p.add_argument("--base", help="--init of a converted model: the base model's dir (config + tokenizer)")
+    p.add_argument("--teacher", help="--init of a converted model: distil from this model (default: no distillation)")
     knobs(p)
     p = sp.add_parser("convert"); p.add_argument("--base", required=True); p.add_argument("--data", required=True)
     p.add_argument("--out", required=True); p.add_argument("--teacher"); p.add_argument("--adapter-rank", default="0.2")
     p.add_argument("--kd-cache", help="a cached teacher top-k (ttf-core scripts/quant/teacher_topk.py) instead of --teacher")
     knobs(p)
-    p = sp.add_parser("finetune"); p.add_argument("--ckpt", required=True); p.add_argument("--data", required=True)
+    p = sp.add_parser("finetune", help="(the old name of `ttf train --init`)"); p.add_argument("--ckpt", required=True); p.add_argument("--data", required=True)
     p.add_argument("--out", required=True); p.add_argument("--base"); p.add_argument("--teacher")
     knobs(p)
-    p = sp.add_parser("import", help="a released TTF GGUF -> a trainable checkpoint (for `ttf finetune`)")
+    p = sp.add_parser("import", help="a released TTF GGUF -> a checkpoint to train from (`ttf train --init`)")
     p.add_argument("gguf"); p.add_argument("out"); p.add_argument("--base", required=True,
                    help="the base model's dir (config + tokenizer), as for export")
     p = sp.add_parser("export"); p.add_argument("ckpt"); p.add_argument("out")

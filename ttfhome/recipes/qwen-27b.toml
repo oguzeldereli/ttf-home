@@ -1,5 +1,5 @@
-# Fine-tuning a ternary Qwen3.8-27B (a TTF checkpoint, or one `ttf import` rebuilt from a released GGUF): the training
-# settings of the 27B recovery run (2 x 96 GB; on smaller cards `ttf finetune` adds --ttf-store fp12s --ttf-offload async
+# Training a ternary Qwen3.8-27B from a checkpoint (`ttf train --init`: a TTF checkpoint, or one `ttf import` rebuilt
+# from a released GGUF), every part of it: the settings of the 27B recovery run (2 x 96 GB; on smaller cards `ttf train` adds --ttf-store fp12s --ttf-offload async
 # --ttf-rank 256). An imported checkpoint has a float embedding / head (the GGUF's), kept frozen.
 mode = "ttf"
 data-dtype = "u32"

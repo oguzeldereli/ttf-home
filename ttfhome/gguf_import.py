@@ -1,5 +1,5 @@
 """GGUF -> trainable TTF checkpoint: the inverse of gguf_export.py, so a released GGUF (the only file we publish) can
-be fine-tuned with `ttf finetune`.
+be trained further (`ttf train --init`, every part of the model).
 
 What the GGUF holds per TTF linear (gguf_export.py's docstring) is the whole trained state of that layer: the trits T,
 the row scale r * beta (in the block scale, or in <name>.ttf_r for TQ1_P), the column scale c (.ttf_c), the input mean
@@ -7,7 +7,7 @@ mu (from .ttf_m = -c mu) and the bias (.ttf_b); the ternary adapter's down / up 
 rank zero-padded), the float adapter (.ttf_fd / .ttf_fu, or .ttf_d / .ttf_u in F16 alone). This module reads them
 back, undoes the llama.cpp converter's renames, row / column reorders and affine maps (+1 norm gains, -exp(A_log)) by
 pushing index probes through the same converter, and writes the trainer's state dict (both of QwenTern's names for
-every decoder tensor) with the args `ttf finetune` needs.
+every decoder tensor) with the args `ttf train --init` needs.
 
 Not recoverable from a GGUF, and so different from the checkpoint the GGUF was made from:
   - the optimizer and the TTF accumulators (the import is a fresh start: --init-ckpt, step 0)
