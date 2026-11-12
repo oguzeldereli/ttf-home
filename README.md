@@ -250,6 +250,24 @@ TTF knobs on `train`, `convert` and `finetune`:
 | `--seq-len`, `--batch`, `--accum` | the batch shape (the default is 32k tokens per step) |
 | `-- ...` | any other trainer option (`python -m ttf.train --help`) |
 
+## Keep training a released model
+
+Every released GGUF is also a starting point for training: `ttf import` rebuilds the trainable TTF state from it
+(trits, row / column scales, centring, biases, adapters, floats), and training then updates all of it, the same as
+the recovery run that made the release.
+
+    ttf import ttf-Qwen3.8-27B-noadapters-TQ1_P.gguf q27.pt --base Qwen3.8-27B
+    ttf train --init q27.pt --base Qwen3.8-27B --data data/mine --out runs/q27-mine
+
+    ttf import ttf-Qwen3.8-Flash-Next-TQ1_P.gguf q38/ --base Qwen3.8-Flash-Next      # MoE: a directory
+    python -m ttf.q38.train --model q38/model --conv q38/conv --ple-pq q38/pq --out runs/q38-mine ...
+
+`--base` is the base model's directory; only its config and tokenizer are read. What a GGUF does not hold starts
+fresh: the optimiser and TTF accumulator state (step 0), and the MTP block. The 0.8B and 27B files import exactly; the
+embedding / head come back as stored (Q6_K / Q4_K / Q8_0 rounding). Mixture-of-experts files (Flash-Next, Tiel-Coder)
+come back as the `ttf.q38` trainer's inputs: the adapter's up factor is re-split into its trained parts, the same
+function up to fp16 rounding.
+
 ## Model sizes by GPU
 
 `ttf train --size auto` picks a size from GPU memory:

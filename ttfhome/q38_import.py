@@ -1,5 +1,5 @@
-"""Qwen3.8-Flash-Next TTF GGUF (q38_export.py, TTF format 2) -> what the q38 trainer (python -m ttf.q38.train) starts
-from: q38_export's inverse.
+"""MoE TTF GGUFs (TTF format 2: Qwen3.8-Flash-Next from q38_export.py; Tiel-Coder / Ornith-35B-A3B, qwen35moe, from
+the Tiel exporter, compact or not) -> what the q38 trainer (python -m ttf.q38.train) starts from: the exporters' inverse.
 
   OUT/model/   config.json + tokenizer files (from BASE_DIR) and model-L{i}.safetensors / model-globals.safetensors with
                every float weight under its HF name (model.safetensors.index.json), for --model
@@ -8,10 +8,16 @@ from: q38_export's inverse.
 
 Per TTF module (q38_export's docstring): T (TQ1_P, or TQ1_0 with block scale 1), ttf_r = r beta (beta from the trits
 per expert), c, m = -c mu, b; the adapter's down trits TB (.ttf_ad) and its up factor .ttf_au = r sa TA cb (F16): TA =
-sign(au), sa cb_k = the median of |au[n, k]| / r_n over the rows where TA is nonzero, split as sa = 1 / sqrt(R) (the
-trainer's init) and cb = that / sa: the same function (up to au's fp16 rounding), a different sa / cb split. The PQ
+sign(au), sa cb_k = the median of |au[n, k]| / r_n over the rows where TA is nonzero, split as sa = 1 (where the
+conversion puts it; training keeps it within 1%) and cb = that / sa: the same function (up to au's fp16 rounding),
+the trained sa / cb split within that 1%. The PQ
 rotation was folded into ple.key_proj / value_proj, so meta.pt's Pi is the identity. The floats come back through
 probes of llama.cpp's own converter (renames, V-head reorders, merges [a | b] and splits), as gguf_import.
+
+Compact files (Tiel v2): an expert's .ttf_ad is TQ1_0 [32, K] with cb_k as row k's block scale (rows past the rank
+zero) and its .ttf_au exact Q4_0 [N, 32] of a_n TA[n, :] (a = r sa): cb = |row scale| (its sign into TB), TA = sign,
+then the same sa / cb split; the expert side vectors are F16. Trits that are not TQ1_P (K % 160 != 0) are TQ1_0 with
+block scale 1.
 
 Not recoverable: the TTF / AdamW state (a fresh start), the MTP block, the PLE table's pruned rows (zero, as in the
 GGUF), the float tensors' storage rounding (the embedding / head as stored, Q8_0 by default).
@@ -37,6 +43,7 @@ sys.path[:0] = [str(LLAMA / "gguf-py"), str(LLAMA)]
 import gguf                                    # noqa: E402
 from conversion import get_model_class         # noqa: E402
 from .gguf_import import GGUF, Maps, dec_tq1p  # noqa: E402
+G_TQ1_P = getattr(gguf.GGMLQuantizationType, "TQ1_P", None)
 
 PFX = "model.language_model."
 EXPERTS = {"mlp.gu": "ffn_gate_up_exps", "mlp.dn": "ffn_down_exps"}
@@ -55,7 +62,8 @@ def _converter(base_dir, tmp):
 
     class Probe(base):
         model_arch = base.model_arch
-        _SHARED_INPUT_MERGES = tuple(m for m in base._SHARED_INPUT_MERGES if m[0] != gguf.MODEL_TENSOR.ATTN_QKV_GATE)
+        _SHARED_INPUT_MERGES = tuple(m for m in getattr(base, "_SHARED_INPUT_MERGES", ())
+                                     if m[0] != gguf.MODEL_TENSOR.ATTN_QKV_GATE)
 
         def index_tensors(self, remote_hf_model_id=None):
             hp = {**self.hparams, **self.hparams.get("text_config", {})}
@@ -108,32 +116,52 @@ def _ta_sa_cb(au, rs, R):
     m = torch.where(TA != 0, m, torch.full_like(m, float("nan")))
     v = m.nanmedian(1).values                                   # [E, R]: sa cb_k
     v = torch.nan_to_num(v, nan=0.0)
-    sa = torch.full((au.shape[0],), 1.0 / math.sqrt(R))
+    sa = torch.ones(au.shape[0])                                # (the conversion's sa, which training keeps near 1)
     return TA, sa, v / sa[:, None]
 
 
 def _trits3(G, n, e0, e1):
-    """experts e0:e1 of a 3-D TQ1_P tensor -> int8 [e1 - e0, N, K] (decoded per expert slice: bounded memory)"""
+    """experts e0:e1 of a 3-D ternary tensor -> (int8 [e1 - e0, N, K], row scales [e1 - e0, N] or None for TQ1_P),
+    decoded per expert slice (bounded memory). TQ1_0: T = round(w / s), s = the row's absmax (its block scale)"""
     t = G.t[n]
     K, N = int(t.shape[0]), int(t.shape[1])
-    a = np.asarray(t.data).reshape(-1, N, K // 160 * 32)[e0:e1]
-    return dec_tq1p(torch.from_numpy(np.ascontiguousarray(a, dtype=np.uint8)).reshape(-1, K // 160 * 32), K).view(e1 - e0, N, K)
+    raw = np.asarray(t.data)
+    a = np.ascontiguousarray(raw.reshape(-1, N, raw.shape[-1])[e0:e1])
+    if t.tensor_type == G_TQ1_P:
+        return dec_tq1p(torch.from_numpy(a.view(np.uint8)).reshape(-1, K // 160 * 32), K).view(e1 - e0, N, K), None
+    assert t.tensor_type == gguf.GGMLQuantizationType.TQ1_0, (n, t.tensor_type)
+    w = torch.from_numpy(gguf.quants.dequantize(a.reshape(-1, a.shape[-1]), t.tensor_type).astype(np.float32)).view(e1 - e0, N, K)
+    s = w.abs().amax(-1)
+    T = torch.where(s[..., None] > 0, w / s.clamp_min(1e-30)[..., None], torch.zeros_like(w)).round()
+    assert bool((T * s[..., None] - w).abs().le(1e-3 * s[..., None].clamp_min(1e-30)).all()), f"{n}: not trits x a row scale"
+    return T.to(torch.int8), s
 
 
 def _read(G, stem, E, K, e0=0, e1=None):
     """the GGUF tensors of one TTF module (or one part of a dense one) under stem, in the GGUF's order (experts e0:e1)"""
     e1 = E if e1 is None else e1
-    if E > 1:
-        Tg, TB = _trits3(G, stem + ".weight", e0, e1), _trits3(G, stem + ".ttf_ad", e0, e1)
-    else:
-        Tg, TB = G.trits(stem + ".weight")[0][None], G.trits(stem + ".ttf_ad")[0][None]
-    Tg, TB = Tg[..., :K], TB[..., :K]
     n = e1 - e0
-    N, R = Tg.shape[1], TB.shape[1]
+    if E > 1:
+        (Tg, _), (TB, sb) = _trits3(G, stem + ".weight", e0, e1), _trits3(G, stem + ".ttf_ad", e0, e1)
+    else:
+        Tg, (TB, sb) = G.trits(stem + ".weight")[0][None], G.trits(stem + ".ttf_ad")
+        TB, sb = TB[None], None if sb is None else sb[None]
+    Tg, TB = Tg[..., :K], TB[..., :K]
+    N = Tg.shape[1]
     f = lambda nm, *sh: G.float(stem + nm).reshape(E, *sh)[e0:e1]
+    if G.qtype(stem + ".ttf_au") == gguf.GGMLQuantizationType.Q4_0:       # compact: a TA (Q4_0), cb in TB's scales
+        R2 = TB.shape[1]
+        au = f(".ttf_au", N, R2)
+        used = (TB != 0).flatten(2).any(-1) | (au != 0).any(1)            # [n, R2]: rows past the rank are zero
+        R = max(8, -(-(int(used.nonzero()[:, 1].max()) + 1 if bool(used.any()) else 8) // 8) * 8)
+        TB, au = TB[:, :R], au[..., :R] * sb[:, None, :R]
+    else:
+        au = f(".ttf_au", N, TB.shape[1])
+        if sb is not None and bool((sb > 0).any()):
+            assert float((sb[sb > 0] - 1).abs().max()) < 1e-3, f"{stem}.ttf_ad: block scales != 1 (not a compact file)"
     return {"T": Tg, "TB": TB, "r": f(".ttf_r", N), "c": f(".ttf_c", -1)[..., :K],
             "m": f(".ttf_m", -1)[..., :K] if G.has(stem + ".ttf_m") else torch.zeros(n, K),
-            "b": f(".ttf_b", N) if G.has(stem + ".ttf_b") else torch.zeros(n, N), "au": f(".ttf_au", N, R)}
+            "b": f(".ttf_b", N) if G.has(stem + ".ttf_b") else torch.zeros(n, N), "au": au}
 
 
 def _dense(G, parts, N, K):
@@ -191,8 +219,7 @@ def import_q38(path, base_dir, out_dir, n_layers=None, log=print, pq_rows=None):
         index = {}
         for i in range(NL):
             L = m.layers[i]
-            ad_rank = int(G.t[f"blk.{i}.ffn_gate_up_exps.ttf_ad"].shape[1]) if G.has(f"blk.{i}.ffn_gate_up_exps.ttf_ad") else 16
-            swap_ternary(L, adapter_rank=ad_rank)
+            swap_ternary(L, adapter_rank=16)          # (the structure only; each module's rank comes from its file)
             tern = {n for n, mod in L.named_modules() if hasattr(mod, "wpacked")}
             convd = {}
             for s in sorted(tern):
@@ -218,8 +245,8 @@ def import_q38(path, base_dir, out_dir, n_layers=None, log=print, pq_rows=None):
             log(f"layer {i}: {len(convd)} TTF modules, {len(fl)} floats")
         g = {PFX + "embed_tokens.weight": G.float("token_embd.weight").to(torch.bfloat16),
              "lm_head.weight": G.float("output.weight").to(torch.bfloat16)}
-        g.update(_floats(G, conv, [(PFX + "hyper_connection_mixer." + n, tuple(t.shape))
-                                   for n, t in m.hyper_connection_mixer.named_parameters()]))
+        hcm = PFX + ("norm." if getattr(cfg, "plain", False) else "hyper_connection_mixer.")
+        g.update(_floats(G, conv, [(hcm + n, tuple(t.shape)) for n, t in m.hyper_connection_mixer.named_parameters()]))
         save_file({k: v.contiguous() for k, v in g.items()}, str(out / "model" / "model-globals.safetensors"))
         index.update({k: "model-globals.safetensors" for k in g})
         (out / "model" / "model.safetensors.index.json").write_text(json.dumps({"metadata": {"ttf_imported": str(path)},
