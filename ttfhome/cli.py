@@ -452,8 +452,15 @@ def _train_recipe(base, gib):
 
 
 def cmd_import(a, extra):
-    from .gguf_import import import_gguf
     import torch
+    if gguf_info(a.gguf)[0] == Q38_ARCH:              # Qwen3.8-Flash-Next (MoE): the q38 trainer's inputs, a directory
+        from .q38_import import import_q38
+        with torch.inference_mode():
+            import_q38(a.gguf, a.base, a.out)
+        print(f"{a.out}: train from it with ttf-core's MoE trainer: python -m ttf.q38.train --model {a.out}/model "
+              f"--conv {a.out}/conv --ple-pq {a.out}/pq --out RUN_DIR [its KD / data options]")
+        return
+    from .gguf_import import import_gguf
     with torch.inference_mode():
         import_gguf(a.gguf, a.base, a.out)
     print(f"{a.out}: a TTF checkpoint to train from (step 0): ttf train --init {a.out} --base {a.base} "
@@ -653,8 +660,8 @@ def main(argv=None):
     p.add_argument("--out", required=True); p.add_argument("--base"); p.add_argument("--teacher")
     knobs(p)
     p = sp.add_parser("import", help="a released TTF GGUF -> a checkpoint to train from (`ttf train --init`)")
-    p.add_argument("gguf"); p.add_argument("out"); p.add_argument("--base", required=True,
-                   help="the base model's dir (config + tokenizer), as for export")
+    p.add_argument("gguf"); p.add_argument("out", help="OUT.pt (a Flash-Next GGUF: a directory)")
+    p.add_argument("--base", required=True, help="the base model's dir (config + tokenizer), as for export")
     p = sp.add_parser("export"); p.add_argument("ckpt"); p.add_argument("out")
     p.add_argument("--base", default=None, help="the base model's dir for a conversion (config + tokenizer)")
     p.add_argument("--wtype", default="tq2_0", choices=["tq2_0", "tq1_0", "q2_k", "tq1_p"],

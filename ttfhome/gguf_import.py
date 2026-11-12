@@ -202,11 +202,11 @@ class Maps:
                 # -exp(x) (Qwen3.5 / 3.8: ssm_a = -exp(A_log)); the index probes go through it too
                 assert n <= 64, f"{name}: -exp map on a large tensor"
                 inv = lambda y: torch.log(-y)
-                idx = (torch.log(-h).round() * 1024 + torch.log(-l).round()).long()
+                idx = torch.log(-h).round().long() * 1024 + torch.log(-l).round().long()
             else:
                 assert bool((a.abs() > 1e-6).all()), f"{name} -> {gn}: not an affine map of the input"
                 inv = lambda y, a=a, b=b: (y - b) / a
-                idx = (((h - b) / a).round() * 1024 + ((l - b) / a).round()).long()
+                idx = ((h - b) / a).round().long() * 1024 + ((l - b) / a).round().long()   # (int64: > 2^24 elements)
             assert int(idx.min()) >= 0 and int(idx.max()) < n, (name, gn)
             out.append((gn, idx, inv))
         return out
