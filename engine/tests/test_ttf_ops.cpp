@@ -228,6 +228,17 @@ int main(int argc, char ** argv) {
         }
         return 0;
     }
+    if (argc > 5 && std::string(argv[1]) == "--bench-case") {  // --bench-case K N T rank: CUDA, side vectors, bf16
+#ifdef TTF_CUDA
+        ggml_backend_t gpu = ggml_backend_cuda_init(0);
+        const Case     cs  = { std::atoll(argv[2]), std::atoll(argv[3]), std::atoll(argv[4]), std::atoi(argv[5]), true, true };
+        std::vector<int8_t> tr(cs.N * cs.K, 1);
+        std::vector<float>  x(cs.K * cs.T, 0.5f), mu(cs.K, 0.0f), c(cs.K, 1.0f), mB(cs.K * cs.rank, 0.01f),
+            mA(cs.rank * cs.N, 0.01f), r(cs.N, 1.0f), b(cs.N, 0.0f), acc(cs.N * cs.T, 0.0f);
+        run(gpu, false, cs, tr, x, mu, c, mB, mA, r, b, acc, 0.01f, 300);
+#endif
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench") {
 #ifdef TTF_CUDA
         ggml_backend_t gpu = ggml_backend_cuda_init(0);
