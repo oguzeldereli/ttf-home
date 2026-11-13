@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <memory>
 #include <string>
@@ -151,6 +152,7 @@ struct Session {
     };
     std::map<std::string, std::unique_ptr<Built>> built;
     uint64_t                                      use_clock = 0;
+    std::set<std::string>                         seen_keys;  // keys called once (a second call keeps the graph)
     struct Const {
         ggml_context *        ctx = nullptr;
         ggml_tensor *         t   = nullptr;
@@ -220,6 +222,10 @@ struct SpeakParams {
     uint32_t seed        = 0;
     const std::vector<float> * noise = nullptr;  // fed noise, [patches, P, D] in order (parity runs); else mt19937
     bool     verbose     = false;
+    // VoxCPM2.generate: patches capped at text tokens * badcase_ratio + 10; retry_badcase attempts (1 = no retry; the
+    // VoxCPM API default is on: 3) while an attempt reaches text tokens * badcase_ratio, seed + 1 each (not with noise)
+    int      retry_badcase = 3;
+    float    badcase_ratio = 6.0f;
 };
 
 struct SpeakOut {
@@ -228,6 +234,8 @@ struct SpeakOut {
     std::vector<float> feat;         // generated latents [patches, P, D]
     int                n_patches = 0;
     double             ms_prefill = 0, ms_lm = 0, ms_dit = 0, ms_enc = 0, ms_vae = 0;
+    int                attempts = 1;  // retry_badcase
+    uint32_t           seed     = 0;  // the kept attempt's seed
 };
 
 // text_ids: the tokenizer's output (the driver appends audio_start)

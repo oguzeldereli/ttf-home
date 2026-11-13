@@ -903,9 +903,17 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     Built * e   = nullptr;
     bool    fresh = false;
     auto    hit = cacheable ? built.find(key) : built.end();
+    // kept from the second call with a key on (one-off shapes such as a vae_decode length are never kept)
+    bool keep = false;
+    if (cacheable && hit == built.end()) {
+        if (seen_keys.size() > 4096) {
+            seen_keys.clear();
+        }
+        keep = !seen_keys.insert(key).second;
+    }
     if (hit != built.end()) {
         e = hit->second.get();
-    } else if (cacheable) {
+    } else if (keep) {
         // measure in the scratch, then build again into exactly sized metadata kept with the entry
         Built probe;
         probe.ctx = scratch_ctx();
@@ -960,6 +968,23 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     ggml_gallocr_t ga    = e == &tmp ? gm.galloc : e->galloc;
     if (fresh && !ggml_gallocr_alloc_graph(ga, gf)) {
         throw std::runtime_error("graph allocation failed");
+    }
+    if (fresh && e != &tmp) {  // kept compute buffers capped (TTF_GRAPH_CACHE_MB, default 1024): drop the LRU others
+        static const size_t cap = (size_t) (std::getenv("TTF_GRAPH_CACHE_MB") ? std::atoll(std::getenv("TTF_GRAPH_CACHE_MB")) : 1024) << 20;
+        for (;;) {
+            size_t tot = 0;
+            auto   lru = built.end();
+            for (auto i = built.begin(); i != built.end(); ++i) {
+                tot += ggml_gallocr_get_buffer_size(i->second->galloc, 0);
+                if (i->second.get() != e && (lru == built.end() || i->second->use < lru->second->use)) {
+                    lru = i;
+                }
+            }
+            if (tot <= cap || lru == built.end()) {
+                break;
+            }
+            built.erase(lru);
+        }
     }
     prof_galloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
     for (auto & [name, t] : e->inputs) {

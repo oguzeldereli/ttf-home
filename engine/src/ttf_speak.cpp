@@ -35,7 +35,9 @@ std::vector<float> last_row(const Tensor & t) {  // [T, H] -> row T-1
 
 }  // namespace
 
-SpeakOut speak(Session & s, const std::vector<int32_t> & text_ids, const SpeakParams & p) {
+namespace {
+
+SpeakOut speak_once(Session & s, const std::vector<int32_t> & text_ids, const SpeakParams & p) {
     const json & drv = s.m.ir.at("driver");
     if (drv.at("name") != "lm_diffusion") {
         throw std::runtime_error("speak: driver is " + drv.at("name").get<std::string>());
@@ -51,7 +53,9 @@ SpeakOut speak(Session & s, const std::vector<int32_t> & text_ids, const SpeakPa
     const bool   zstar   = a.value("cfg_zero_star", true);
     const float  zfrac   = a.value("zero_init_frac", 0.04f);
     const int    min_len = p.min_len >= 0 ? p.min_len : a.value("min_len", 2);
-    const int    max_len = p.max_len > 0 ? p.max_len : a.value("max_len", 2000);
+    // VoxCPM2.generate: _inference's max_len = min(int(text tokens * ratio + 10), max_len), retry or not
+    const int    max_len = std::min(p.max_len > 0 ? p.max_len : a.value("max_len", 2000),
+                                    (int) ((double) text_ids.size() * p.badcase_ratio + 10));
     if (a.value("solver", std::string("euler")) != "euler" || a.value("mean_mode", false)) {
         throw std::runtime_error("speak: solver / mean_mode not supported");
     }
@@ -223,6 +227,28 @@ SpeakOut speak(Session & s, const std::vector<int32_t> & text_ids, const SpeakPa
     out.sample_rate = a.value("out_sample_rate", 48000);
     out.ms_vae      = ms_since(tv);
     return out;
+}
+
+}  // namespace
+
+// VoxCPM2.generate's retry_badcase: an attempt whose patches reach text tokens * ratio is a runaway; the next attempt
+// uses seed + 1 (up to retry_badcase attempts; the last one is kept)
+SpeakOut speak(Session & s, const std::vector<int32_t> & text_ids, const SpeakParams & p) {
+    SpeakParams q = p;
+    for (int k = 0;; ++k) {
+        SpeakOut o = speak_once(s, text_ids, q);
+        o.attempts = k + 1;
+        o.seed     = q.seed;
+        if (q.noise || k + 1 >= std::max(1, p.retry_badcase) ||
+            (double) o.n_patches < (double) text_ids.size() * p.badcase_ratio) {
+            return o;
+        }
+        if (p.verbose) {
+            std::fprintf(stderr, "speak: badcase (%d patches for %zu text tokens), retrying with seed %u\n", o.n_patches,
+                         text_ids.size(), q.seed + 1);
+        }
+        q.seed += 1;
+    }
 }
 
 }  // namespace ttf

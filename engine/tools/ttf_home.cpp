@@ -478,7 +478,8 @@ int run_speech(const ttf::Model & m, Args a) {
             }
             continue;
         }
-        std::fprintf(stderr, "%s: %.2f s audio in %.2f s (RTF %.3f)\n", jb.out.c_str(), sec, ms / 1000, ms / 1000 / sec);
+        std::fprintf(stderr, "%s: %.2f s audio in %.2f s (RTF %.3f)%s\n", jb.out.c_str(), sec, ms / 1000, ms / 1000 / sec,
+                     o.attempts > 1 ? (" after " + std::to_string(o.attempts) + " attempts, seed " + std::to_string(o.seed)).c_str() : "");
         if (a.verbose) {
             std::fprintf(stderr, "  %d patches; prefill %.0f ms, dit %.0f ms, lm %.0f ms (locenc %.0f), vae %.0f ms\n",
                          o.n_patches, o.ms_prefill, o.ms_dit, o.ms_lm, o.ms_enc, o.ms_vae);
@@ -547,7 +548,7 @@ const char * USAGE =
     "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3]\n"
     "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
-    "options: -n N  --temp T  --top-k K  --seed S  -o FILE  --timesteps N  --cfg F  --max-len N\n"
+    "options: -n N  --temp T  --top-k K  --seed S  -o FILE  --timesteps N  --cfg F  --max-len N  --retry-badcase N\n"
     "         --ids 1,2,3  --device cpu|cuda  --threads N  --ctx N  -v\n"
     "checks:  --dump FILE  --check-decode N  --graph NAME --in NAME=FILE [--out DIR]  --noise FILE  --feat FILE\n";
 
@@ -598,6 +599,8 @@ int main(int argc, char ** argv) {
             a.sp.timesteps = std::atoi(next().c_str());
         } else if (o == "--cfg") {
             a.sp.cfg = (float) std::atof(next().c_str());
+        } else if (o == "--retry-badcase") {  // speech: attempts on a runaway (VoxCPM default 3; 1 = off)
+            a.sp.retry_badcase = std::atoi(next().c_str());
         } else if (o == "--max-len") {
             a.sp.max_len = std::atoi(next().c_str());
         } else if (o == "--threads") {
