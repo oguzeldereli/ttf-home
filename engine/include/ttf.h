@@ -37,7 +37,8 @@ struct Part {
 
 struct Model {
     ~Model();
-    static std::unique_ptr<Model> load(const std::string & path, std::string * err);
+    // device: "cpu" or "cuda" (CUDA0; built with TTF_CUDA). Weights live in that device's buffer.
+    static std::unique_ptr<Model> load(const std::string & path, std::string * err, const std::string & device = "cpu");
 
     std::string kv_str(const std::string & key, const std::string & dflt = "") const;
 
@@ -46,7 +47,10 @@ struct Model {
     ggml_context * wctx = nullptr;  // derived tensors: TQ1_P trits, D copies
     json           ir, config;
     bool           d_bf16 = false;  // compute dtype D
-    bool           q2p    = true;   // runtime trit layout: Q2P (CPU) or TQ1_P
+    bool           q2p    = true;   // runtime trit layout: Q2P (CPU default) or TQ1_P (CUDA default)
+    std::string    device = "cpu";
+    ggml_backend_t backend = nullptr;  // the device's backend, shared by sessions
+    ggml_context * dctx    = nullptr;  // device copies (non-CPU)
     std::string    family;
 
     std::map<std::string, Part>          parts;    // by part name ("layers.0.attn.wq", "<p>.lin", ...)
@@ -86,6 +90,8 @@ struct Session {
         std::vector<bool> filled;
     };
     std::map<std::string, Kv> kv;
+    std::map<std::string, ggml_tensor *> conv;  // conv stream state [len, C]
+    std::map<std::string, ggml_tensor *> rec;   // delta-rule state [dv, dk, H, 1]
     ggml_gallocr_t            galloc = nullptr;
     std::vector<uint8_t>      gbuf;  // graph context memory
     double                    last_ms = 0;

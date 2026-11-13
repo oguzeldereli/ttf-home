@@ -1,10 +1,11 @@
 // ttf-run: run a .ttf model's lm driver on token ids (greedy), dump logits for parity.
-//   ttf-run MODEL --ids 1,2,3 [--gen N] [--threads N] [--ctx N] [--dump FILE] [--quiet]
+//   ttf-run MODEL --ids 1,2,3 [--gen N] [--threads N] [--ctx N] [--dump FILE] [--device cpu|cuda]
 //   --dump FILE: the prefill logits, f32 [T, n_vocab] raw
 
 #include "ttf.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,9 +32,9 @@ int main(int argc, char ** argv) {
     }
     std::string          path = argv[1];
     std::vector<int32_t> ids;
-    int                  n_gen = 0, n_threads = 4;
+    int                  n_gen = 0, n_threads = 4, check_dec = 0;
     int64_t              n_ctx = 2048;
-    std::string          dump;
+    std::string          dump, device = "cpu";
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto        next = [&]() -> std::string {
@@ -51,6 +52,10 @@ int main(int argc, char ** argv) {
             n_threads = std::atoi(next().c_str());
         } else if (a == "--ctx") {
             n_ctx = std::atoll(next().c_str());
+        } else if (a == "--check-decode") {
+            check_dec = std::atoi(next().c_str());
+        } else if (a == "--device") {
+            device = next();
         } else if (a == "--dump") {
             dump = next();
         } else {
@@ -63,7 +68,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
     std::string err;
-    auto        m = ttf::Model::load(path, &err);
+    auto        m = ttf::Model::load(path, &err, device);
     if (!m) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
@@ -74,10 +79,35 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const std::string graph = drv.at("graphs").at("step");
-    std::fprintf(stderr, "model %s: family %s, D %s, %zu parts\n", path.c_str(), m->family.c_str(),
-                 m->d_bf16 ? "bf16" : "f32", m->parts.size());
+    std::fprintf(stderr, "model %s: family %s, D %s, %zu parts, %s, trits %s\n", path.c_str(), m->family.c_str(),
+                 m->d_bf16 ? "bf16" : "f32", m->parts.size(), m->device.c_str(), m->q2p ? "q2p" : "tq1p");
     try {
         ttf::Session         s(*m, n_threads, n_ctx);
+        if (check_dec > 0) {  // prefill all vs prefill all but N then N decode steps: the state path
+            const int64_t        L = (int64_t) ids.size(), P0 = L - check_dec;
+            std::vector<int32_t> pa(L);
+            for (int64_t i = 0; i < L; ++i) {
+                pa[i] = (int32_t) i;
+            }
+            ttf::StepOut full = s.step(graph, ids, pa, false);
+            s.reset();
+            s.step(graph, std::vector<int32_t>(ids.begin(), ids.begin() + P0), std::vector<int32_t>(pa.begin(), pa.begin() + P0), true);
+            for (int64_t t = P0; t < L; ++t) {
+                ttf::StepOut o  = s.step(graph, { ids[t] }, { (int32_t) t }, true);
+                const float * a = full.logits.data() + t * full.n_vocab;
+                const float * b = o.logits.data();
+                double        dn = 0, rn = 0;
+                int           ia = 0, ib = 0;
+                for (int64_t j = 0; j < full.n_vocab; ++j) {
+                    dn += (double) (a[j] - b[j]) * (a[j] - b[j]);
+                    rn += (double) a[j] * a[j];
+                    ia = a[j] > a[ia] ? (int) j : ia;
+                    ib = b[j] > b[ib] ? (int) j : ib;
+                }
+                std::printf("pos %lld: decode vs prefill rel %.3e, argmax %d / %d\n", (long long) t, std::sqrt(dn / rn), ia, ib);
+            }
+            return 0;
+        }
         std::vector<int32_t> pos(ids.size());
         for (size_t i = 0; i < ids.size(); ++i) {
             pos[i] = (int32_t) i;
