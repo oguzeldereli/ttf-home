@@ -363,6 +363,127 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
     }
 }
 
+// int8 tensor-core path for T >= TTF_MMA_MIN_T (sm_80+): mma.sync m16n8k32 s8.s8.s32. Each 32-trit plane of a weight
+// block is one k-tile: plane j of block bi holds trits k = QB bi + 32 j + p at byte p (both layouts), so the A fragment
+// of row g, k = 4 tq + e is plane j of int tq (k < 16) or int tq + 4 (k >= 16) of the row's block. B (activation codes)
+// is staged per block bi in shared memory, rows padded to QB / 4 + 4 ints (no bank conflicts). The int32 sums are exact,
+// so the result equals the dp4a kernel's; the epilogue is the same (adapter dot per output in ttf_dot8's order).
+// block: 4 warps x 16 rows; NT n-tiles of 8 tokens per block.
+#define TTF_MMA_MIN_T 8
+
+static __device__ __forceinline__ void ttf_mma_s8(int (&c)[4], const int a0, const int a1, const int a2, const int a3,
+                                                  const int b0, const int b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+template <bool Q2, int NT>
+static __global__ void ttf_mma_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
+                                      const float * beta, const float * mA, const int rank, const float * r,
+                                      const float * b, const float * acc, const bool bf16, float * out,
+                                      const int64_t N, const int64_t T, const int64_t Kp) {
+    constexpr int QB = Q2 ? 128 : 160, NP = Q2 ? 4 : 5, LDB = QB / 4 + 4, TB = 8 * NT;
+    __shared__ uint32_t lut[Q2 ? 1 : 256];
+    __shared__ int      sb[TB * LDB];
+    if (!Q2) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) {
+            lut[i] = ttf_tq1p_lut_entry(i);
+        }
+    }
+    const int     lane = threadIdx.x % WARP_SIZE, g = lane / 4, tq = lane % 4;
+    const int64_t n0 = ((int64_t) blockIdx.x * TTF_MM_WARPS + threadIdx.x / WARP_SIZE) * 16;
+    const int64_t t0 = (int64_t) blockIdx.y * TB;
+    const int64_t ra = n0 + g, rb = n0 + g + 8;
+    const int *   wa = ra < N ? (const int *) (w + ra * nbw1) : nullptr;
+    const int *   wb = rb < N ? (const int *) (w + rb * nbw1) : nullptr;
+    int           c[NT][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        c[i][0] = c[i][1] = c[i][2] = c[i][3] = 0;
+    }
+    const int64_t nb = Kp / QB;
+    for (int64_t bi = 0; bi < nb; ++bi) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < TB * (QB / 4); i += blockDim.x) {
+            const int     tt = i / (QB / 4), q = i % (QB / 4);
+            const int64_t t  = t0 + tt;
+            sb[tt * LDB + q] = t < T ? *(const int *) (qa + t * ldq + QB * bi + 4 * q) : 0;
+        }
+        __syncthreads();
+        // the 4 ints of this thread's A fragments: rows g / g + 8, ints tq / tq + 4 of block bi
+        int v[4];
+        v[0] = wa ? wa[bi * 8 + tq] : 0;
+        v[1] = wb ? wb[bi * 8 + tq] : 0;
+        v[2] = wa ? wa[bi * 8 + tq + 4] : 0;
+        v[3] = wb ? wb[bi * 8 + tq + 4] : 0;
+        int hi[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            if (Q2) {
+                hi[i] = 0;
+            } else {
+                const uint32_t e0 = lut[(v[i]) & 0xFF], e1 = lut[(v[i] >> 8) & 0xFF], e2 = lut[(v[i] >> 16) & 0xFF],
+                               e3 = lut[(uint32_t) v[i] >> 24];
+                const uint32_t p01 = __byte_perm(e0, e1, 0x5140);
+                const uint32_t p23 = __byte_perm(e2, e3, 0x5140);
+                v[i]               = (int) __byte_perm(p01, p23, 0x5410);
+                hi[i]              = (int) __byte_perm(p01, p23, 0x7632);
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NP; ++j) {
+            int a[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                a[i] = j < 4 ? (v[i] >> (2 * j)) & 0x03030303 : hi[i] & 0x03030303;
+            }
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const int * br = sb + (8 * nt + g) * LDB + 8 * j + tq;
+                ttf_mma_s8(c[nt], a[0], a[1], a[2], a[3], br[0], br[4]);
+            }
+        }
+    }
+    // c[nt]: (row g, token 2 tq), (g, 2 tq + 1), (g + 8, 2 tq), (g + 8, 2 tq + 1) of n-tile nt
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int64_t n = e < 2 ? ra : rb;
+            const int64_t t = t0 + 8 * nt + 2 * tq + (e & 1);
+            if (n >= N || t >= T) {
+                continue;
+            }
+            const char * row = qa + t * ldq;
+            const float  s   = *(const float *) (row + Kp);
+            const int    qs  = *(const int *) (row + Kp + 4);
+            float        y   = ttf_rbf(__fmul_rn(__fmul_rn(s, (float) (c[nt][e] - qs)), beta[0]));
+            y                = ttf_rd(y, bf16);
+            if (mA) {
+                const float * u = (const float *) (row + Kp + TTF_QROW_TAIL);
+                y               = ttf_rd(__fadd_rn(y, ttf_rd(ttf_dot8(u, mA + n * rank, rank), bf16)), bf16);
+            }
+            if (r) {
+                y = ttf_rd(__fmul_rn(y, ttf_rd(r[n], bf16)), bf16);
+            }
+            if (b) {
+                y = ttf_rd(__fadd_rn(y, ttf_rd(b[n], bf16)), bf16);
+            }
+            const int64_t i = t * N + n;
+            if (acc) {
+                y = ttf_rd(__fadd_rn(acc[i], y), bf16);
+            }
+            out[i] = y;
+        }
+    }
+}
+
 void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * w   = dst->src[0];
     const ggml_tensor * qa  = dst->src[1];
@@ -379,6 +500,31 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t T    = ggml_nrows(qa);
     const int     rank = mA ? (int) mA->ne[0] : 0;
     if (T == 0) {
+        return;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const int64_t mgx = (N + TTF_MM_WARPS * 16 - 1) / (TTF_MM_WARPS * 16);
+    const int     nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    // MMA only when its grid (one block per 64 rows x 8 tokens at least) can fill the GPU; else the SIMT kernel, which
+    // splits rows finer
+    if (T >= TTF_MMA_MIN_T && ampere_mma_available(cc) && mgx * ((T + 7) / 8) >= nsm && !getenv("TTF_NO_MMA")) {
+        const int64_t gx = mgx;
+        auto          go = [&](auto kern, const int tb) {
+            const dim3 grid((unsigned) gx, (unsigned) ((T + tb - 1) / tb));
+            kern<<<grid, TTF_MM_WARPS * WARP_SIZE, 0, ctx.stream()>>>(
+                (const uint8_t *) w->data, w->nb[1], (const char *) qa->data, qa->nb[1], (const float *) be->data,
+                mA ? (const float *) mA->data : nullptr, rank, r ? (const float *) r->data : nullptr,
+                b ? (const float *) b->data : nullptr, acc ? (const float *) acc->data : nullptr, bf16,
+                (float *) dst->data, N, T, Kp);
+        };
+        // widest token tile that still gives >= 1 block per SM (wider tiles reuse each A fragment more)
+        const int nt = gx * ((T + 31) / 32) >= nsm ? 4 : gx * ((T + 15) / 16) >= nsm ? 2 : 1;
+        if (q2) {
+            nt == 4 ? go(ttf_mma_kernel<true, 4>, 32) : nt == 2 ? go(ttf_mma_kernel<true, 2>, 16) : go(ttf_mma_kernel<true, 1>, 8);
+        } else {
+            nt == 4 ? go(ttf_mma_kernel<false, 4>, 32) : nt == 2 ? go(ttf_mma_kernel<false, 2>, 16) : go(ttf_mma_kernel<false, 1>, 8);
+        }
+        CUDA_CHECK(cudaGetLastError());
         return;
     }
     // grid.y: token chunks split over blocks only as far as needed to fill the GPU (~2048 blocks); each block loops

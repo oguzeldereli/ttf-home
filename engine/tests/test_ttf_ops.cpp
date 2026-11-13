@@ -115,7 +115,8 @@ int main(int argc, char ** argv) {
         for (const Case & cs : std::vector<Case>{ { 1024, 4096, 1, 0, true, true },  { 1024, 4096, 4, 0, true, true },
                                                  { 1024, 4096, 8, 0, true, true },  { 1024, 4096, 24, 0, true, true },
                                                  { 1024, 4096, 24, 104, true, true }, { 4096, 1024, 24, 0, true, true },
-                                                 { 1024, 104, 24, 0, true, true },  { 1024, 3584, 1, 0, true, true } }) {
+                                                 { 1024, 104, 24, 0, true, true },  { 1024, 3584, 1, 0, true, true },
+                                                 { 1024, 4096, 512, 0, true, true }, { 4096, 1024, 512, 0, true, true } }) {
             std::vector<int8_t> tr(cs.N * cs.K, 1);
             std::vector<float>  x(cs.K * cs.T, 0.5f), mu(cs.K, 0.0f), c(cs.K, 1.0f), mB(cs.K * cs.rank, 0.01f),
                 mA(cs.rank * cs.N, 0.01f), r(cs.N, 1.0f), b(cs.N, 0.0f), acc(cs.N * cs.T, 0.0f);
@@ -127,6 +128,8 @@ int main(int argc, char ** argv) {
     std::vector<Case> cases = {
         { 1024, 300, 1, 0, false, true },   { 1024, 300, 1, 24, true, true },  { 2816, 257, 3, 104, true, true },
         { 1000, 130, 17, 64, true, true },  { 2048, 64, 5, 104, true, false }, { 4096, 96, 1, 104, true, true },
+        { 1024, 300, 40, 24, true, true },  { 2816, 257, 33, 0, true, true },  { 1000, 130, 64, 64, false, false },
+        { 2048, 70, 8, 104, true, true },
     };
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, 4);
