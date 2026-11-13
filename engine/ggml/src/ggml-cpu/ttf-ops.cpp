@@ -57,55 +57,67 @@ void ggml_compute_forward_ttf_quant(const ggml_compute_params * params, ggml_ten
     }
 }
 
-static constexpr int64_t CHMAX = 256;
+namespace {
 
-void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor * dst) {
-    const ggml_tensor * w   = dst->src[0];
-    const ggml_tensor * qa  = dst->src[1];
-    const ggml_tensor * be  = dst->src[2];
-    const ggml_tensor * mA  = dst->src[3];
-    const ggml_tensor * r   = dst->src[4];
-    const ggml_tensor * b   = dst->src[5];
-    const ggml_tensor * acc = dst->src[6];
-    const bool          bf16 = ggml_get_op_params_i32(dst, 0) != 0;
-    const bool q2 = w->type == GGML_TYPE_I8;  // Q2P layout
-    GGML_ASSERT((q2 || w->type == GGML_TYPE_TQ1_P) && qa->type == GGML_TYPE_I8 && dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(qa) && ggml_is_contiguous(dst));
-    GGML_ASSERT(!acc || ggml_is_contiguous(acc));
-    const int64_t Kp  = q2 ? 4 * w->ne[0] : w->ne[0];
-    const int64_t N   = w->ne[1];
-    const int64_t T   = ggml_nrows(qa);
-    const int64_t ldq = qa->nb[1];
-    const int64_t rank = mA ? mA->ne[0] : 0;
-    GGML_ASSERT(Kp % (q2 ? 128 : ttf_kern::QK_TQ1P) == 0 && qa->ne[0] == Kp + QROW_TAIL + 4 * rank && dst->ne[0] == N);
-    const float   bt  = ((const float *) be->data)[0];
-    const float * rv  = r ? (const float *) r->data : nullptr;
-    const float * bv  = b ? (const float *) b->data : nullptr;
-    const float * mAv = mA ? (const float *) mA->data : nullptr;
-    const float * av  = acc ? (const float *) acc->data : nullptr;
-    float *       out = (float *) dst->data;
+constexpr int64_t CHMAX = 256;
 
-    std::vector<float>   s(T);
-    std::vector<int32_t> qsum(T);
-    for (int64_t t = 0; t < T; ++t) {
-        const char * row = (const char *) qa->data + t * ldq;
-        std::memcpy(&s[t], row + Kp, 4);
-        std::memcpy(&qsum[t], row + Kp + 4, 4);
+// one TTF_MM node: its operands, the per-token scales, and its rows cut into chunks
+struct MmNode {
+    const ggml_tensor * w;
+    const int8_t *      q;
+    const float *       rv, *bv, *mAv, *av;
+    float *             out;
+    bool                bf16, q2;
+    int64_t             Kp, N, T, ldq, rank, CH, nc;
+    float               bt;
+    std::vector<float>   s;
+    std::vector<int32_t> qsum;
+
+    MmNode(const ggml_tensor * dst, int nth) {
+        w                       = dst->src[0];
+        const ggml_tensor * qa  = dst->src[1];
+        const ggml_tensor * be  = dst->src[2];
+        const ggml_tensor * mA  = dst->src[3];
+        const ggml_tensor * r   = dst->src[4];
+        const ggml_tensor * b   = dst->src[5];
+        const ggml_tensor * acc = dst->src[6];
+        bf16                    = ggml_get_op_params_i32(dst, 0) != 0;
+        q2                      = w->type == GGML_TYPE_I8;  // Q2P layout
+        GGML_ASSERT((q2 || w->type == GGML_TYPE_TQ1_P) && qa->type == GGML_TYPE_I8 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(qa) && ggml_is_contiguous(dst));
+        GGML_ASSERT(!acc || ggml_is_contiguous(acc));
+        Kp   = q2 ? 4 * w->ne[0] : w->ne[0];
+        N    = w->ne[1];
+        T    = ggml_nrows(qa);
+        ldq  = qa->nb[1];
+        rank = mA ? mA->ne[0] : 0;
+        GGML_ASSERT(Kp % (q2 ? 128 : ttf_kern::QK_TQ1P) == 0 && qa->ne[0] == Kp + QROW_TAIL + 4 * rank && dst->ne[0] == N);
+        bt  = ((const float *) be->data)[0];
+        rv  = r ? (const float *) r->data : nullptr;
+        bv  = b ? (const float *) b->data : nullptr;
+        mAv = mA ? (const float *) mA->data : nullptr;
+        av  = acc ? (const float *) acc->data : nullptr;
+        out = (float *) dst->data;
+        q   = (const int8_t *) qa->data;
+        s.resize(T);
+        qsum.resize(T);
+        for (int64_t t = 0; t < T; ++t) {
+            const char * row = (const char *) qa->data + t * ldq;
+            std::memcpy(&s[t], row + Kp, 4);
+            std::memcpy(&qsum[t], row + Kp + 4, 4);
+        }
+        // rows in chunks handed out dynamically (a shared counter, as ggml's mul_mat): on a hybrid CPU the slower
+        // cores take fewer chunks instead of holding up the barrier. ~16 chunks per thread, at least 8 rows: chunks
+        // of a few KB restart the hardware prefetcher too often (BitNet 2B decode, 8 threads: +4%)
+        CH = std::min<int64_t>(CHMAX, std::max<int64_t>(8, N / (16 * nth) / 8 * 8));
+        nc = (N + CH - 1) / CH;
     }
-    const int8_t *       q = (const int8_t *) qa->data;
-    std::vector<uint8_t> codes(T > 4 && !q2 ? Kp : 0);  // TQ1_P prefill: a row decoded once, reused over the tokens
-    // rows in chunks handed out dynamically (a shared counter, as ggml's mul_mat): on a hybrid CPU the slower cores
-    // take fewer chunks instead of holding up the barrier. ~16 chunks per thread, at least 8 rows: chunks of a few
-    // KB restart the hardware prefetcher too often (BitNet 2B decode, 8 threads: +4%)
-    const int64_t CH = std::min<int64_t>(CHMAX, std::max<int64_t>(8, N / (16 * params->nth) / 8 * 8));
-    const int64_t nc = (N + CH - 1) / CH;
-#ifdef GGML_USE_OPENMP
-    if (params->ith == 0) {
-        ggml_threadpool_chunk_set(params->threadpool, params->nth);
-    }
-    ggml_barrier(params->threadpool);
-#endif  // else ggml_barrier left the counter at nth when this node started
-    for (int64_t ci = params->ith; ci < nc; ci = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+
+    // chunk ci; codes: TQ1_P prefill scratch (a row decoded once, reused over the tokens)
+    void chunk(int64_t ci, std::vector<uint8_t> & codes) const {
+        if (T > 4 && !q2 && (int64_t) codes.size() < Kp) {
+            codes.resize(Kp);
+        }
         int32_t       a4[CHMAX];  // decode, Q2P: the chunk's full groups of 4 rows in one pass each
         const int64_t n0 = ci * CH, n1 = std::min(N, (ci + 1) * CH);
         const int64_t n4 = (T == 1 && q2) ? n0 + (n1 - n0) / 4 * 4 : n0;
@@ -153,5 +165,21 @@ void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor
                 }
             }
         }
+    }
+};
+
+}  // namespace
+
+void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor * dst) {
+    const MmNode nd(dst, params->nth);
+#ifdef GGML_USE_OPENMP
+    if (params->ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, params->nth);
+    }
+    ggml_barrier(params->threadpool);
+#endif  // else ggml_barrier left the counter at nth when this node started
+    std::vector<uint8_t> codes;
+    for (int64_t ci = params->ith; ci < nd.nc; ci = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+        nd.chunk(ci, codes);
     }
 }

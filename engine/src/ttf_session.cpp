@@ -1058,8 +1058,8 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         e->wbytes = e->sbytes = 0;
         auto in_model = [&](const ggml_tensor * t) {
             const ggml_tensor * o = t->view_src ? t->view_src : t;
-            if (!o->buffer) {
-                return 0;
+            if (!o->buffer) {  // CPU: the file's tensors (a weight already in D's type, e.g. a bf16 head) live in
+                return o->data ? 1 : 0;  // the gguf context's own memory
             }
             if (o->buffer == sbuf) {
                 return 2;
@@ -1084,7 +1084,9 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
                     continue;
                 }
                 // a get_rows source: the rows gathered; a set_rows / cpy destination: the bytes written
-                int64_t nb = (int64_t) ggml_nbytes(t);
+                // a strided view (the transposed V cache: S of max_ctx per row) reads its elements, not its span
+                int64_t nb = ggml_is_contiguous(t) ? (int64_t) ggml_nbytes(t)
+                                                   : ggml_nelements(t) * (int64_t) ggml_type_size(t->type) / ggml_blck_size(t->type);
                 if (nd->op == GGML_OP_GET_ROWS && k == 0) {
                     nb = ggml_nelements(nd->src[1]) * t->nb[1];
                 } else if (nd->op == GGML_OP_SET_ROWS && k == 2) {  // src 0 the rows, 2 the destination
