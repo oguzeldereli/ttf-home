@@ -117,6 +117,12 @@ struct Session {
 
     void reset();
 
+    // prefix reuse: the recurrent state (conv + delta-rule) copied out / back, and the kv cache cut to positions < n
+    // (later positions are masked; their stale values get probability exactly 0)
+    std::vector<uint8_t> save_recurrent() const;
+    void                 load_recurrent(const std::vector<uint8_t> & b);
+    void                 truncate(int32_t n);
+
     const Model &  m;
     int            n_threads;
     int64_t        max_ctx;

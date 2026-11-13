@@ -35,7 +35,13 @@
 #include <string>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+#include <cctype>
+#include <ctime>
 
 using json = nlohmann::json;
 
@@ -53,7 +59,9 @@ struct Args {
     bool                               bench = false, tokenize = false, specials = false, escapes = false, verbose = false, ids_given = false;
     bool                               chat = false, temp_set = false, top_k_set = false;
     int                                think = -1;  // --think 1 / --no-think 0 / the template's default -1
-    std::string                        system, effort = "xhigh";
+    std::string                        system, effort = "xhigh", host = "127.0.0.1";
+    bool                               serve = false;
+    int                                port  = 8080;
     ttf::SpeakParams                   sp;
     uint32_t                           seed = 0;
 };
@@ -435,6 +443,7 @@ struct ChatFmt {
     enum Kind { NONE, CHATML, ROLE_EOT } kind = NONE;
     bool                               think_on = false;     // the template's default for enable_thinking
     bool                               effort_sys = false;   // reasoning-effort text in the system turn when thinking
+    bool                               keep_think = false;   // earlier assistant turns keep their think block
     std::map<std::string, std::string> effort_text;          // effort -> instruction (none for "medium")
     std::vector<int32_t>               stop;
 };
@@ -459,6 +468,7 @@ ChatFmt chat_fmt(const Text & t, const std::string & cfgs) {
         // generation prompt: '<think>\n' when thinking, '<think>\n\n</think>\n\n' when not; which one is the default
         f.think_on   = tpl.find("enable_thinking is defined and enable_thinking is false") != std::string::npos;
         f.effort_sys = tpl.find("reasoning_instructions") != std::string::npos;
+        f.keep_think = tpl.find("preserve_thinking is undefined or preserve_thinking is true") != std::string::npos;
         for (const char * e : { "xhigh", "low" }) {  // 'Reasoning effort is set to E. ...' literals
             const std::string key = std::string("'Reasoning effort is set to ") + e;
             const size_t      i   = tpl.find(key);
@@ -629,6 +639,397 @@ int run_chat(const ttf::Model & m, const Args & a) {
     return 0;
 }
 
+
+// ---- serve: an OpenAI-style HTTP endpoint (POST /v1/chat/completions, GET /v1/models), one request at a time.
+// Messages render as the template does for the families above (no tools); reasoning goes out as reasoning_content.
+// The state is reused across requests in two ways, both exact in tokens: (1) when the new prompt extends the last
+// reply as the client sends it back (templates that keep the reasoning in history), the state as the reply left it;
+// (2) else, when it extends the last request's history (without the generation prompt), the recurrent state saved
+// there and the kv cache cut back to it. Otherwise a reset. TTF_CHAT_IDS=1 prints each prompt's ids.
+struct Msg {
+    std::string role, content, reasoning;
+};
+
+std::string render_chat(const ChatFmt & f, const std::vector<Msg> & ms, bool gen, bool think, const std::string & effort) {
+    std::string o;
+    size_t      i0 = 0;
+    if (f.kind == ChatFmt::CHATML) {
+        std::string instr;
+        if (f.effort_sys && think && f.effort_text.count(effort)) {
+            instr = f.effort_text.at(effort);
+        }
+        if (!ms.empty() && ms[0].role == "system") {
+            const std::string c = trim(ms[0].content);
+            if (!c.empty()) {
+                o += "<|im_start|>system\n" + (instr.empty() ? "" : instr + "\n\n") + c + "<|im_end|>\n";
+            } else if (!instr.empty()) {
+                o += "<|im_start|>system\n" + instr + "<|im_end|>\n";
+            }
+            i0 = 1;
+        } else if (!instr.empty()) {
+            o += "<|im_start|>system\n" + instr + "<|im_end|>\n";
+        }
+        size_t last_user = 0;
+        for (size_t i = 0; i < ms.size(); ++i) {
+            if (ms[i].role == "user") {
+                last_user = i;
+            }
+        }
+        for (size_t i = i0; i < ms.size(); ++i) {
+            const Msg & m = ms[i];
+            std::string c = trim(m.content), rc = trim(m.reasoning);
+            if (m.role == "user") {
+                o += "<|im_start|>user\n" + c + "<|im_end|>\n";
+            } else if (m.role == "assistant") {
+                const size_t e = c.find("</think>");
+                if (rc.empty() && e != std::string::npos) {  // reasoning inline in the content
+                    const size_t b = c.rfind("<think>", e);
+                    rc             = trim(c.substr(b == std::string::npos ? 0 : b + 7, e - (b == std::string::npos ? 0 : b + 7)));
+                    c              = trim(c.substr(e + 8));
+                }
+                if (f.keep_think || i > last_user) {
+                    o += "<|im_start|>assistant\n<think>\n" + rc + "\n</think>\n\n" + c + "<|im_end|>\n";
+                } else {
+                    o += "<|im_start|>assistant\n" + c + "<|im_end|>\n";
+                }
+            } else {
+                throw std::runtime_error("role " + m.role + ": not supported");
+            }
+        }
+        if (gen) {
+            o += "<|im_start|>assistant\n" + std::string(think ? "<think>\n" : "<think>\n\n</think>\n\n");
+        }
+    } else {
+        for (const Msg & m : ms) {
+            if (m.role != "system" && m.role != "user" && m.role != "assistant") {
+                throw std::runtime_error("role " + m.role + ": not supported");
+            }
+            std::string r = m.role;
+            r[0]          = (char) std::toupper(r[0]);
+            o += r + ": " + trim(m.content) + "<|eot_id|>";
+        }
+        if (gen) {
+            o += "Assistant: ";
+        }
+    }
+    return o;
+}
+
+bool send_all(int fd, const std::string & d) {
+    size_t o = 0;
+    while (o < d.size()) {
+        const ssize_t n = ::send(fd, d.data() + o, d.size() - o, MSG_NOSIGNAL);
+        if (n <= 0) {
+            return false;
+        }
+        o += (size_t) n;
+    }
+    return true;
+}
+
+void http_reply(int fd, int code, const std::string & type, const std::string & body) {
+    const char * st = code == 200 ? "OK" : code == 204 ? "No Content" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : "Error";
+    send_all(fd, "HTTP/1.1 " + std::to_string(code) + " " + st + "\r\nContent-Type: " + type +
+                     "\r\nContent-Length: " + std::to_string(body.size()) +
+                     "\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: *\r\nConnection: close\r\n\r\n" + body);
+}
+
+int run_serve(const ttf::Model & m, const Args & a) {
+    const std::string graph = m.ir.at("driver").at("graphs").at("step");
+    const Text        txt   = load_text(m.kv_str("ttf.tokenizer.json"), m.kv_str("ttf.tokenizer.config"), m.ir.at("driver"));
+    const ChatFmt     f     = chat_fmt(txt, m.kv_str("ttf.tokenizer.config"));
+    if (f.kind == ChatFmt::NONE) {
+        std::fprintf(stderr, "serve: the file has no chat template this program knows\n");
+        return 1;
+    }
+    const int64_t ctx = a.ctx ? a.ctx : 16384;
+    ttf::Session  s(m, a.threads, ctx);
+    std::string   name = a.model.substr(a.model.find_last_of('/') + 1);
+    std::vector<int32_t> kv_view;  // the client view of what the state holds (empty: nothing reusable)
+    std::vector<int32_t> snap_ids;  // the history (no generation prompt) whose recurrent state is in snap
+    std::vector<uint8_t> snap;
+    int32_t              pos = 0;
+    const int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int       one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons((uint16_t) a.port);
+    if (inet_pton(AF_INET, a.host.c_str(), &addr.sin_addr) != 1 || ::bind(lfd, (sockaddr *) &addr, sizeof(addr)) != 0 ||
+        ::listen(lfd, 8) != 0) {
+        std::fprintf(stderr, "serve: cannot listen on %s:%d\n", a.host.c_str(), a.port);
+        return 1;
+    }
+    std::fprintf(stderr, "serving %s on http://%s:%d/v1 (POST /v1/chat/completions, GET /v1/models)\n", name.c_str(),
+                 a.host.c_str(), a.port);
+    for (;;) {
+        const int fd = ::accept(lfd, nullptr, nullptr);
+        if (fd < 0) {
+            continue;
+        }
+        timeval tv{ 30, 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        std::string req;
+        char        buf[65536];
+        size_t      hend = std::string::npos, need = 0;
+        bool        ok   = true;
+        while (ok) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) {
+                ok = false;
+                break;
+            }
+            req.append(buf, (size_t) n);
+            if (hend == std::string::npos && (hend = req.find("\r\n\r\n")) != std::string::npos) {
+                std::string h = req.substr(0, hend);
+                std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return (char) std::tolower(c); });
+                const size_t cl = h.find("content-length:");
+                need            = hend + 4 + (cl == std::string::npos ? 0 : std::strtoull(h.c_str() + cl + 15, nullptr, 10));
+            }
+            if (hend != std::string::npos && req.size() >= need) {
+                break;
+            }
+            if (req.size() > (64u << 20)) {
+                ok = false;
+            }
+        }
+        if (!ok || hend == std::string::npos) {
+            ::close(fd);
+            continue;
+        }
+        const std::string line   = req.substr(0, req.find("\r\n"));
+        const std::string method = line.substr(0, line.find(' '));
+        std::string       path   = line.substr(line.find(' ') + 1);
+        path                     = path.substr(0, path.find(' '));
+        const std::string body   = req.substr(hend + 4);
+        try {
+            if (method == "OPTIONS") {
+                http_reply(fd, 204, "text/plain", "");
+            } else if (method == "GET" && path == "/v1/models") {
+                http_reply(fd, 200, "application/json",
+                           json{ { "object", "list" }, { "data", json::array({ json{ { "id", name }, { "object", "model" }, { "owned_by", "local" } } }) } }.dump());
+            } else if (method == "POST" && path == "/v1/chat/completions") {
+                const json       q = json::parse(body);
+                if (q.contains("tools") && !q.at("tools").empty()) {
+                    throw std::runtime_error("tools: not supported");
+                }
+                std::vector<Msg> ms;
+                for (const auto & jm : q.at("messages")) {
+                    Msg mm;
+                    mm.role = jm.at("role");
+                    if (jm.contains("content") && jm.at("content").is_string()) {
+                        mm.content = jm.at("content");
+                    } else if (jm.contains("content") && jm.at("content").is_array()) {
+                        for (const auto & part : jm.at("content")) {
+                            if (part.value("type", std::string()) == "text") {
+                                mm.content += part.value("text", std::string());
+                            } else {
+                                throw std::runtime_error("content part " + part.value("type", std::string("?")) + ": not supported");
+                            }
+                        }
+                    }
+                    if (jm.contains("reasoning_content") && jm.at("reasoning_content").is_string()) {
+                        mm.reasoning = jm.at("reasoning_content");
+                    }
+                    ms.push_back(mm);
+                }
+                const bool  stream = q.value("stream", false);
+                const float temp   = q.contains("temperature") && q.at("temperature").is_number() ? q.at("temperature").get<float>() : (a.temp_set ? a.temp : 0.7f);
+                const int   top_k  = q.contains("top_k") && q.at("top_k").is_number() ? q.at("top_k").get<int>() : (a.top_k_set ? a.top_k : 20);
+                int         n_max  = a.n_gen == 128 ? 4096 : a.n_gen;
+                for (const char * k : { "max_tokens", "max_completion_tokens" }) {
+                    if (q.contains(k) && q.at(k).is_number()) {
+                        n_max = q.at(k).get<int>();
+                    }
+                }
+                bool think = a.think < 0 ? f.think_on : a.think == 1;
+                if (q.contains("chat_template_kwargs") && q.at("chat_template_kwargs").contains("enable_thinking")) {
+                    think = q.at("chat_template_kwargs").at("enable_thinking").get<bool>();
+                }
+                std::string effort = q.value("reasoning_effort", a.effort);
+                if (effort == "high") {
+                    effort = "xhigh";
+                }
+                std::mt19937 rng(q.contains("seed") && q.at("seed").is_number() ? q.at("seed").get<uint32_t>() : (uint32_t) std::random_device{}());
+                // the prompt; reuse the state when it extends the previous conversation's client view
+                std::vector<int32_t> ids = txt.tok->encode(render_chat(f, ms, true, think, effort));
+                ids.insert(ids.begin(), txt.pre.begin(), txt.pre.end());
+                if ((int64_t) ids.size() + 8 > ctx) {
+                    throw std::runtime_error("prompt of " + std::to_string(ids.size()) + " tokens over the context " + std::to_string(ctx));
+                }
+                // reuse: the state as the last reply left it (when the client sent it back as rendered), else the
+                // snapshot taken at the end of the last request's history (a template that drops the reasoning from
+                // history, a regenerated reply), else a reset
+                auto starts = [&](const std::vector<int32_t> & p) {
+                    return !p.empty() && ids.size() > p.size() && std::equal(p.begin(), p.end(), ids.begin());
+                };
+                size_t reuse = 0;
+                if (starts(kv_view)) {
+                    reuse = kv_view.size();
+                } else if (starts(snap_ids)) {
+                    s.load_recurrent(snap);
+                    s.truncate((int32_t) snap_ids.size());
+                    pos   = (int32_t) snap_ids.size();
+                    reuse = snap_ids.size();
+                } else {
+                    s.reset();
+                    pos = 0;
+                }
+                const size_t reused = reuse;
+                if (std::getenv("TTF_CHAT_IDS")) {
+                    std::fprintf(stderr, "[prompt");
+                    for (int32_t t : ids) {
+                        std::fprintf(stderr, " %d", t);
+                    }
+                    std::fprintf(stderr, "]\n");
+                }
+                const auto   t0     = std::chrono::steady_clock::now();
+                double       t_snap = 0;
+                std::vector<int32_t> base = txt.tok->encode(render_chat(f, ms, false, think, effort));
+                base.insert(base.begin(), txt.pre.begin(), txt.pre.end());
+                if (base.size() > reuse && base.size() < ids.size() && std::equal(base.begin(), base.end(), ids.begin())) {
+                    const std::vector<int32_t> h(ids.begin() + (int64_t) reuse, ids.begin() + (int64_t) base.size());
+                    s.step(graph, h, positions(pos, (int64_t) h.size()), true);
+                    pos += (int32_t) h.size();
+                    reuse    = base.size();
+                    const auto ts = std::chrono::steady_clock::now();
+                    snap          = s.save_recurrent();
+                    t_snap        = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+                    snap_ids = base;
+                }
+                const std::vector<int32_t> feed(ids.begin() + (int64_t) reuse, ids.end());
+                const std::string id      = "chatcmpl-" + std::to_string(std::random_device{}());
+                const int64_t     created = (int64_t) std::time(nullptr);
+                if (stream) {
+                    send_all(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+                                 "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n");
+                }
+                auto chunk = [&](const json & delta, const json & finish) {
+                    json c = { { "id", id }, { "object", "chat.completion.chunk" }, { "created", created }, { "model", name },
+                               { "choices", json::array({ json{ { "index", 0 }, { "delta", delta }, { "finish_reason", finish } } }) } };
+                    return send_all(fd, "data: " + c.dump() + "\n\n");
+                };
+                if (stream) {
+                    chunk(json{ { "role", "assistant" }, { "content", "" } }, nullptr);
+                }
+                ttf::StepOut r = s.step(graph, feed, positions(pos, (int64_t) feed.size()), true);
+                pos += (int32_t) feed.size();
+                const auto t1 = std::chrono::steady_clock::now();
+                kv_view.clear();  // set again below only when the state matches the client's next rendering
+                int32_t              next = pick(r.logits.data() + (r.T_out - 1) * r.n_vocab, r.n_vocab, temp, top_k, rng);
+                std::vector<int32_t> gen;
+                std::string          shown, reasoning, content;
+                size_t               rsent    = 0;  // reasoning bytes streamed
+                bool                 in_think = f.kind == ChatFmt::CHATML && think, alive = true;
+                std::string          finish   = "length";
+                auto add_content = [&](std::string piece) {
+                    if (content.empty()) {  // the answer's leading newlines are dropped (the template trims them)
+                        const size_t nz = piece.find_first_not_of('\n');
+                        piece           = nz == std::string::npos ? "" : piece.substr(nz);
+                    }
+                    content += piece;
+                    if (stream && !piece.empty()) {
+                        alive = chunk(json{ { "content", piece } }, nullptr);
+                    }
+                };
+                auto send_reasoning = [&](size_t upto) {
+                    if (stream && upto > rsent) {
+                        alive = chunk(json{ { "reasoning_content", reasoning.substr(rsent, upto - rsent) } }, nullptr);
+                    }
+                    rsent = std::max(rsent, upto);
+                };
+                for (int i = 0; i < n_max && alive; ++i) {
+                    if (std::find(f.stop.begin(), f.stop.end(), next) != f.stop.end()) {
+                        finish = "stop";
+                        break;
+                    }
+                    gen.push_back(next);
+                    const std::string all = txt.tok->decode(gen, false);
+                    if (all.size() > shown.size() && all.compare(0, shown.size(), shown) == 0) {  // whole UTF-8 only
+                        const std::string piece = all.substr(shown.size());
+                        shown                   = all;
+                        if (in_think) {  // the reasoning until </think>, then the answer
+                            reasoning += piece;
+                            const size_t e = reasoning.find("</think>");
+                            if (e != std::string::npos) {
+                                const std::string rest = reasoning.substr(e + 8);
+                                reasoning.resize(e);
+                                send_reasoning(e);
+                                in_think = false;
+                                add_content(rest);
+                            } else {  // hold back a tail that may start "</think>"
+                                size_t hold = 0;
+                                for (size_t k = std::min<size_t>(7, reasoning.size()); k > 0 && !hold; --k) {
+                                    if (reasoning.compare(reasoning.size() - k, k, "</think>", k) == 0) {
+                                        hold = k;
+                                    }
+                                }
+                                send_reasoning(reasoning.size() - hold);
+                            }
+                        } else {
+                            add_content(piece);
+                        }
+                    }
+                    if (pos + 2 > ctx) {
+                        break;
+                    }
+                    ttf::StepOut o = s.step(graph, { next }, { pos++ }, true);
+                    next           = pick(o.logits.data(), o.n_vocab, temp, top_k, rng);
+                }
+                if (in_think) {
+                    send_reasoning(reasoning.size());
+                }
+                // KV reuse, exact only: the client sends back the conversation plus this reply; when that rendering
+                // extends the tokens the state holds (prompt + generated), feed its tail now (the stop token and the
+                // separator) and keep it as the reusable prefix. Otherwise (e.g. a template that drops the reasoning
+                // from history) the next request re-prefills from a reset state.
+                if (alive && finish == "stop") {
+                    std::vector<Msg> ms2 = ms;
+                    ms2.push_back(Msg{ "assistant", content, reasoning });
+                    std::vector<int32_t> view = txt.tok->encode(render_chat(f, ms2, false, think, effort));
+                    view.insert(view.begin(), txt.pre.begin(), txt.pre.end());
+                    std::vector<int32_t> real(ids);
+                    real.insert(real.end(), gen.begin(), gen.end());
+                    if (view.size() > real.size() && view.size() + 8 < (size_t) ctx &&
+                        std::equal(real.begin(), real.end(), view.begin())) {
+                        const std::vector<int32_t> tail(view.begin() + (int64_t) real.size(), view.end());
+                        s.step(graph, tail, positions(pos, (int64_t) tail.size()), true);
+                        pos += (int32_t) tail.size();
+                        kv_view = view;
+                    }
+                }
+                json usage = { { "prompt_tokens", ids.size() }, { "completion_tokens", gen.size() }, { "total_tokens", ids.size() + gen.size() } };
+                if (stream) {
+                    if (alive) {
+                        chunk(json::object(), finish);
+                        send_all(fd, "data: [DONE]\n\n");
+                    }
+                } else {
+                    json msg = { { "role", "assistant" }, { "content", content } };
+                    if (f.kind == ChatFmt::CHATML && think) {
+                        msg["reasoning_content"] = trim(reasoning);
+                    }
+                    http_reply(fd, 200, "application/json",
+                               json{ { "id", id }, { "object", "chat.completion" }, { "created", created }, { "model", name },
+                                     { "choices", json::array({ json{ { "index", 0 }, { "message", msg }, { "finish_reason", finish } } }) },
+                                     { "usage", usage } }.dump());
+                }
+                if (a.verbose) {
+                    const double tp = std::chrono::duration<double>(t1 - t0).count();
+                    const double tg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+                    std::fprintf(stderr, "[%zu prompt tokens (%zu reused) %.2f s (snapshot %.0f MB %.2f s), %zu generated %.1f tok/s, %s]\n",
+                                 ids.size(), reused, tp, snap.size() / 1e6, t_snap, gen.size(), gen.size() / std::max(tg, 1e-9), finish.c_str());
+                }
+            } else {
+                http_reply(fd, 404, "application/json", json{ { "error", { { "message", "not found: " + method + " " + path } } } }.dump());
+            }
+        } catch (const std::exception & e) {
+            http_reply(fd, 400, "application/json", json{ { "error", { { "message", e.what() } } } }.dump());
+        }
+        ::close(fd);
+    }
+}
+
 // ---- lm_diffusion driver (speech)
 int run_speech(const ttf::Model & m, Args a) {
     std::vector<float> noise;
@@ -770,6 +1171,7 @@ int run_tokenize(const std::string & path, bool specials, bool escapes) {
 const char * USAGE =
     "usage: ttf-home MODEL \"text\" [options]     run the model (text model: continuation; speech model: -o out.wav)\n"
     "       ttf-home MODEL --chat [--system S] [--think | --no-think] [--effort xhigh|medium|low]   text model, stdin turns\n"
+    "       ttf-home MODEL --serve [--host 127.0.0.1] [--port 8080]   OpenAI-style /v1/chat/completions (stream too)\n"
     "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3] [--depth 16]\n"
     "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
@@ -816,6 +1218,12 @@ int main(int argc, char ** argv) {
             a.top_k_set = true;
         } else if (o == "--chat") {
             a.chat = true;
+        } else if (o == "--serve") {
+            a.serve = true;
+        } else if (o == "--host") {
+            a.host = next();
+        } else if (o == "--port") {
+            a.port = std::atoi(next().c_str());
         } else if (o == "--system") {
             a.system = next();
         } else if (o == "--think") {
@@ -896,7 +1304,7 @@ int main(int argc, char ** argv) {
         if (a.tokenize) {
             return run_tokenize(a.model, a.specials, a.escapes);
         }
-        if (a.graph.empty() && !a.bench && !a.chat && a.text.empty() && a.ids.empty() && a.list.empty()) {
+        if (a.graph.empty() && !a.bench && !a.chat && !a.serve && a.text.empty() && a.ids.empty() && a.list.empty()) {
             std::fputs(USAGE, stderr);
             return 1;
         }
@@ -917,6 +1325,9 @@ int main(int argc, char ** argv) {
         const std::string drv = m->ir.at("driver").at("name");
         if (drv == "lm" && a.chat) {
             return run_chat(*m, a);
+        }
+        if (drv == "lm" && a.serve) {
+            return run_serve(*m, a);
         }
         if (drv == "lm") {
             return run_lm(*m, a);

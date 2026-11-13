@@ -996,6 +996,48 @@ void Session::reset() {
     }
 }
 
+std::vector<uint8_t> Session::save_recurrent() const {
+    size_t n = 0;
+    for (const auto * mp : { &conv, &rec }) {
+        for (const auto & [id, t] : *mp) {
+            n += ggml_nbytes(t);
+        }
+    }
+    std::vector<uint8_t> b(n);
+    size_t               o = 0;
+    for (const auto * mp : { &conv, &rec }) {
+        for (const auto & [id, t] : *mp) {
+            ggml_backend_tensor_get(t, b.data() + o, 0, ggml_nbytes(t));
+            o += ggml_nbytes(t);
+        }
+    }
+    return b;
+}
+
+void Session::load_recurrent(const std::vector<uint8_t> & b) {
+    size_t o = 0;
+    for (const auto * mp : { &conv, &rec }) {
+        for (const auto & [id, t] : *mp) {
+            if (o + ggml_nbytes(t) > b.size()) {
+                throw std::runtime_error("load_recurrent: size mismatch");
+            }
+            ggml_backend_tensor_set(t, b.data() + o, 0, ggml_nbytes(t));
+            o += ggml_nbytes(t);
+        }
+    }
+    if (o != b.size()) {
+        throw std::runtime_error("load_recurrent: size mismatch");
+    }
+}
+
+void Session::truncate(int32_t n) {
+    for (auto & [id, k] : kv) {
+        for (int64_t j = std::max<int32_t>(n, 0); j < max_ctx; ++j) {
+            k.filled[j] = false;
+        }
+    }
+}
+
 StepOut Session::step(const std::string & graph, const std::vector<int32_t> & ids, const std::vector<int32_t> & pos,
                       bool last_only) {
     Values in;
