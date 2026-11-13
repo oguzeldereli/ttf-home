@@ -110,7 +110,7 @@ static __device__ __forceinline__ int ttf_block_sum_i(int v, int * sh) {
 // the adapter's down projections u_j = rD(xc . mB_j), one warp each, in dot_f32_64's order
 static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, const float * mu, const float * c,
                                         const float * mB, const int64_t K, const int64_t Kp, const int rank,
-                                        const bool bf16, char * dst, const int64_t nbd1) {
+                                        const bool bf16, char * dst, const int64_t nbd1, const int xsz) {
     __shared__ float sf[32];
     __shared__ int   si[32];
     const int64_t    row = blockIdx.x;
@@ -118,7 +118,16 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
     char *           o   = dst + row * nbd1;
     if (blockIdx.y > 0) {
         const int lane = threadIdx.x % WARP_SIZE;
-        const int j    = (blockIdx.y - 1) * 8 + threadIdx.x / WARP_SIZE;
+        const int j    = (blockIdx.y - 1) * (int) (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+        // xc staged once per block in shared memory (the warps' dots all read it); dynamic smem: K floats or 0
+        extern __shared__ float xs[];
+        const bool staged = xsz > 0;
+        if (staged) {
+            for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
+                xs[k] = ttf_xc(xr, mu, c, k, bf16);
+            }
+            __syncthreads();
+        }
         if (j >= rank) {
             return;
         }
@@ -127,12 +136,13 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
         const int64_t K64 = K / 64 * 64;
         int64_t       k0  = 0;
         // full blocks, 4 at a time: the loads of 4 blocks issue before the (ordered) fma chains
+#pragma unroll 2
         for (; k0 + 256 <= K64; k0 += 256) {
             float xa[8], wa[8];
 #pragma unroll
             for (int u = 0; u < 8; ++u) {
                 const int64_t k = k0 + 32 * u + lane;
-                xa[u]           = ttf_xc(xr, mu, c, k, bf16);
+                xa[u]           = staged ? xs[k] : ttf_xc(xr, mu, c, k, bf16);
                 wa[u]           = bj[k];
             }
 #pragma unroll
@@ -160,14 +170,45 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
         }
         return;
     }
-    float am = 0.0f;
-    for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
-        am = fmaxf(am, fabsf(ttf_xc(xr, mu, c, k, bf16)));
+    // xc kept in registers between the two passes when the row fits (K <= TTF_QV blockDim); max and the integer sum
+    // do not depend on the order
+    constexpr int TTF_QV = 8;
+    const bool    held   = K <= (int64_t) TTF_QV * blockDim.x;
+    float         xv[TTF_QV];
+    float         am = 0.0f;
+    if (held) {
+#pragma unroll
+        for (int u = 0; u < TTF_QV; ++u) {
+            const int64_t k = threadIdx.x + (int64_t) u * blockDim.x;
+            xv[u]           = k < K ? ttf_xc(xr, mu, c, k, bf16) : 0.0f;
+            am              = fmaxf(am, fabsf(xv[u]));
+        }
+    } else {
+        for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
+            am = fmaxf(am, fabsf(ttf_xc(xr, mu, c, k, bf16)));
+        }
     }
     am             = ttf_block_max(am, sf);
     const float fl = ttf_rd(1e-5f, bf16);
     const float s  = __fmul_rn(fmaxf(am, fl), 1.0f / 127.0f);
     int         qs = 0;
+    if (held) {
+#pragma unroll
+        for (int u = 0; u < TTF_QV; ++u) {
+            const int64_t k = threadIdx.x + (int64_t) u * blockDim.x;
+            if (k < Kp) {
+                int q = 0;
+                if (k < K) {
+                    q = (int) fminf(127.0f, fmaxf(-128.0f, rintf(__fdiv_rn(xv[u], s))));
+                }
+                o[k] = (char) q;
+                qs += q;
+            }
+        }
+        for (int64_t k = threadIdx.x + (int64_t) TTF_QV * blockDim.x; k < Kp; k += blockDim.x) {
+            o[k] = 0;  // padding past K beyond the held part
+        }
+    } else
     for (int64_t k = threadIdx.x; k < Kp; k += blockDim.x) {
         int q = 0;
         if (k < K) {
@@ -198,11 +239,16 @@ void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     if (rows == 0) {
         return;
     }
-    const dim3 grid((unsigned) rows, 1 + (rank + 7) / 8);
-    ttf_quant_kernel<<<grid, 256, 0, ctx.stream()>>>(
+    // few rows (decode): 1024 threads per row, the row held in registers; many rows: 256 (more blocks per SM)
+    const int  nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const int  nth = rows < nsm ? 1024 : 256;
+    const dim3 grid((unsigned) rows, 1 + (rank + nth / WARP_SIZE - 1) / (nth / WARP_SIZE));
+    // adapter blocks stage xc in shared memory when it fits (48 KB)
+    const int xsz = rank > 0 && x->ne[0] * (int64_t) sizeof(float) <= 48 * 1024 ? (int) (x->ne[0] * sizeof(float)) : 0;
+    ttf_quant_kernel<<<grid, nth, xsz, ctx.stream()>>>(
         (const char *) x->data, x->nb[1], mu ? (const float *) mu->data : nullptr,
         c ? (const float *) c->data : nullptr, mB ? (const float *) mB->data : nullptr, x->ne[0], Kp, rank, bf16,
-        (char *) dst->data, dst->nb[1]);
+        (char *) dst->data, dst->nb[1], xsz);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -250,6 +296,51 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
         }
         const int64_t QB = Q2 ? 128 : 160;
         const int64_t nb = Kp / QB;
+        if (R == 1 && ldq % 16 == 0 && nbw1 % 16 == 0 && ((uintptr_t) qa | (uintptr_t) w) % 16 == 0) {
+            // one row per warp: lanes take the row's 16-byte chunks (a block is 32 bytes = 2 chunks; byte p of the
+            // block holds plane j's trit k = QB bi + 32 j + p), so a warp has 512 bytes of the row in flight per step
+            // instead of 128; the activations for plane j are the 16 bytes at QB bi + 32 j + p0. Integer sums: the
+            // same result in any order.
+            const int4 * wr = (const int4 *) (w + n0 * nbw1);
+#pragma unroll 2
+            for (int64_t c = lane; c < 2 * nb; c += WARP_SIZE) {
+                const int4    v4 = wr[c];
+                const int64_t bi = c / 2;
+                const int     p0 = 16 * (int) (c & 1);
+                const int     vv[4] = { v4.x, v4.y, v4.z, v4.w };
+                int           wa4[4], wb4[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    if (Q2) {
+                        wa4[i] = vv[i];
+                        wb4[i] = 0;
+                    } else {
+                        const int      v = vv[i];
+                        const uint32_t e0 = lut[(v) & 0xFF], e1 = lut[(v >> 8) & 0xFF], e2 = lut[(v >> 16) & 0xFF],
+                                       e3 = lut[(uint32_t) v >> 24];
+                        const uint32_t p01 = __byte_perm(e0, e1, 0x5140);
+                        const uint32_t p23 = __byte_perm(e2, e3, 0x5140);
+                        wa4[i]             = (int) __byte_perm(p01, p23, 0x5410);
+                        wb4[i]             = (int) __byte_perm(p01, p23, 0x7632);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < (Q2 ? 4 : 5); ++j) {
+#pragma unroll
+                    for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
+                        if (tt < nt) {
+                            const int4 q = *(const int4 *) (qa + (t0 + tt) * ldq + QB * bi + 32 * j + p0);
+                            const int  qq[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                const int cj = j < 4 ? (wa4[i] >> (2 * j)) & 0x03030303 : wb4[i] & 0x03030303;
+                                a[0][tt]     = __dp4a(cj, qq[i], a[0][tt]);
+                            }
+                        }
+                    }
+                }
+            }
+        } else
         for (int64_t bi = lane / 8; bi < nb; bi += 4) {
             int wa[R], wb[R];
 #pragma unroll
