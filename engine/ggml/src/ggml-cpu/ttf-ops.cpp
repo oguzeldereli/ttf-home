@@ -51,7 +51,7 @@ void ggml_compute_forward_ttf_quant(const ggml_compute_params * params, ggml_ten
         std::memcpy(o + Kp + 4, &qs, 4);
         // step 6, first half: u = rD(xc @ mag_B), xc = v (in D)
         for (int64_t j = 0; j < rank; ++j) {
-            const float u = rd(ttf_kern::dot_f32(v.data(), mBv + j * K, K), bf16);
+            const float u = rd(ttf_kern::dot_f32_64(v.data(), mBv + j * K, K), bf16);
             std::memcpy(o + Kp + QROW_TAIL + 4 * j, &u, 4);
         }
     }

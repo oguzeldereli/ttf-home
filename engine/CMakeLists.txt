@@ -16,13 +16,22 @@ set(GGML_OPENMP OFF CACHE BOOL "")
 # CUDA graphs (ggml defaults them on only inside llama.cpp): one launch per decode step
 set(GGML_CUDA_GRAPHS ON CACHE BOOL "")
 add_subdirectory(ggml)
+# the TTF ops round like torch: no fused multiply-add across separately rounded steps
+set_source_files_properties(ggml/src/ggml-cpu/ttf-ops.cpp TARGET_DIRECTORY ggml-cpu PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
-add_library(ttf_engine STATIC src/ttf_model.cpp src/ttf_session.cpp)
+add_library(ttf_engine STATIC src/ttf_model.cpp src/ttf_session.cpp src/ttf_speak.cpp)
 target_include_directories(ttf_engine PUBLIC include)
 target_link_libraries(ttf_engine PUBLIC ggml)
+target_compile_options(ttf_engine PRIVATE -ffp-contract=off)
 if (GGML_CUDA)
     target_compile_definitions(ttf_engine PUBLIC TTF_CUDA)
 endif()
 
 add_executable(ttf-run tools/ttf_run.cpp)
 target_link_libraries(ttf-run PRIVATE ttf_engine)
+
+add_executable(ttf-speak tools/ttf_speak.cpp)
+target_link_libraries(ttf-speak PRIVATE ttf_engine)
+
+add_executable(test-ttf-ops tests/test_ttf_ops.cpp)
+target_link_libraries(test-ttf-ops PRIVATE ttf_engine)

@@ -1,6 +1,8 @@
 // ttf-run: run a .ttf model's lm driver on token ids (greedy), dump logits for parity.
 //   ttf-run MODEL --ids 1,2,3 [--gen N] [--threads N] [--ctx N] [--dump FILE] [--device cpu|cuda]
 //   --dump FILE: the prefill logits, f32 [T, n_vocab] raw
+//   ttf-run MODEL --graph NAME --in NAME=FILE ... [--out DIR]: one call of one graph on raw f32 / i32 inputs
+//   (shape from the IR, the dynamic dim from the file size); outputs to DIR/NAME.bin
 
 #include "ttf.h"
 
@@ -9,6 +11,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -34,7 +38,8 @@ int main(int argc, char ** argv) {
     std::vector<int32_t> ids;
     int                  n_gen = 0, n_threads = 4, check_dec = 0;
     int64_t              n_ctx = 2048;
-    std::string          dump, device = "cpu";
+    std::string          dump, device = "cpu", graph_name, out_dir = ".";
+    std::map<std::string, std::string> gin;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto        next = [&]() -> std::string {
@@ -58,13 +63,21 @@ int main(int argc, char ** argv) {
             device = next();
         } else if (a == "--dump") {
             dump = next();
+        } else if (a == "--graph") {
+            graph_name = next();
+        } else if (a == "--in") {
+            const std::string v = next();
+            const size_t      e = v.find('=');
+            gin[v.substr(0, e)] = v.substr(e + 1);
+        } else if (a == "--out") {
+            out_dir = next();
         } else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 1;
         }
     }
-    if (ids.empty()) {
-        std::fprintf(stderr, "--ids required\n");
+    if (ids.empty() && graph_name.empty()) {
+        std::fprintf(stderr, "--ids or --graph required\n");
         return 1;
     }
     std::string err;
@@ -72,6 +85,74 @@ int main(int argc, char ** argv) {
     if (!m) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
+    }
+    if (!graph_name.empty()) {
+        try {
+            ttf::Values in;
+            for (const auto & spec : m->ir.at("graphs").at(graph_name).at("inputs")) {
+                const std::string nm = spec.at("name");
+                if (!gin.count(nm)) {
+                    std::fprintf(stderr, "--in %s=FILE missing\n", nm.c_str());
+                    return 1;
+                }
+                std::ifstream     f(gin[nm], std::ios::binary | std::ios::ate);
+                const int64_t     nb  = f.tellg();
+                const bool        i32 = spec.value("dtype", std::string("f32")) == "i32";
+                int64_t           known = 1, dyn = -1;
+                std::vector<int64_t> sh;
+                for (const auto & d : spec.at("shape")) {
+                    if (d.is_number()) {
+                        sh.push_back(d.get<int64_t>());
+                        known *= sh.back();
+                    } else {
+                        dyn = (int64_t) sh.size();
+                        sh.push_back(0);
+                    }
+                }
+                const int64_t n = nb / 4;
+                if (dyn >= 0) {
+                    sh[dyn] = n / known;
+                }
+                f.seekg(0);
+                ttf::Tensor t;
+                t.shape = sh;
+                if (i32) {
+                    t.type = GGML_TYPE_I32;
+                    t.i.resize(n);
+                    f.read((char *) t.i.data(), nb);
+                } else {
+                    t.f.resize(n);
+                    f.read((char *) t.f.data(), nb);
+                }
+                if (t.numel() != n) {
+                    std::fprintf(stderr, "%s: %lld values do not fit the shape\n", nm.c_str(), (long long) n);
+                    return 1;
+                }
+                in[nm] = std::move(t);
+            }
+            ttf::Session s(*m, n_threads, n_ctx);
+            ttf::Values  o = s.run(graph_name, in, false);
+            std::fprintf(stderr, "%s: %.1f ms\n", graph_name.c_str(), s.last_ms);
+            for (auto & [nm, t] : o) {
+                const std::string fn = out_dir + "/" + nm + ".bin";
+                FILE *            f  = std::fopen(fn.c_str(), "wb");
+                if (t.type == GGML_TYPE_I32) {
+                    std::fwrite(t.i.data(), 4, t.i.size(), f);
+                } else {
+                    std::fwrite(t.f.data(), 4, t.f.size(), f);
+                }
+                std::fclose(f);
+                std::string shs;
+                for (int64_t d : t.shape) {
+                    shs += std::to_string(d) + " ";
+                }
+                std::fprintf(stderr, "out %s [ %s] -> %s\n", nm.c_str(), shs.c_str(), fn.c_str());
+            }
+        } catch (const std::exception & e) {
+            std::fprintf(stderr, "error: %s\n", e.what());
+            return 1;
+        }
+        return 0;
     }
     const auto & drv = m->ir.at("driver");
     if (drv.at("name") != "lm") {

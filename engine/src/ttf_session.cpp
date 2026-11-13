@@ -27,6 +27,35 @@ struct Builder {
     std::map<std::string, ggml_tensor *> val;
     std::map<std::string, int>           nd;      // each value's torch rank (ggml drops trailing 1s: T = 1)
     std::vector<ggml_tensor *>           writes;  // state updates (conv / rec), part of the graph
+
+    // a constant made on the host (rope factors, frequencies, aranges, zero context): one device copy per distinct
+    // content for the session's life, uploaded once (not per call: each upload is a synchronous copy on CUDA)
+    ggml_tensor * host_const(const Tensor & h) {
+        std::string key(h.type == GGML_TYPE_F32 ? (const char *) h.f.data() : (const char *) h.i.data(),
+                        (h.type == GGML_TYPE_F32 ? h.f.size() : h.i.size()) * 4);
+        key += '|' + std::to_string((int) h.type);
+        for (int64_t d : h.shape) {
+            key += ',' + std::to_string(d);
+        }
+        auto it = s.consts.find(key);
+        if (it != s.consts.end()) {
+            return it->second.t;
+        }
+        int64_t   ne[4] = { 1, 1, 1, 1 };
+        const int r     = (int) h.shape.size();
+        for (int i = 0; i < r; ++i) {
+            ne[r - 1 - i] = h.shape[i];
+        }
+        Session::Const c;
+        ggml_init_params ip = { ggml_tensor_overhead(), nullptr, true };
+        c.ctx               = ggml_init(ip);
+        c.t                 = ggml_new_tensor(c.ctx, h.type, std::max(r, 1), ne);
+        c.buf               = ggml_backend_alloc_ctx_tensors(c.ctx, s.backend);
+        ggml_backend_tensor_set(c.t, h.type == GGML_TYPE_F32 ? (const void *) h.f.data() : (const void *) h.i.data(), 0,
+                                ggml_nbytes(c.t));
+        s.consts[key] = c;
+        return c.t;
+    }
     ggml_tensor *                        pos   = nullptr;
     ggml_tensor *                        mask  = nullptr;  // F32 [S, T], shared by every causal attn
     int64_t                              S     = 0;        // key length this call
@@ -172,15 +201,30 @@ struct Builder {
         const int     mode = a.value("style", std::string("interleaved")) == "interleaved" ? GGML_ROPE_TYPE_NORMAL
                                                                                            : GGML_ROPE_TYPE_NEOX;
         const int     hd   = a.contains("dims") ? a.at("dims").get<int>() : (int) x->ne[0];
+        ggml_tensor * ff     = nullptr;  // longrope: theta_j / factor_j, cos / sin x mscale
+        float         mscale = 1.0f;
         if (a.contains("scaling")) {
-            throw std::runtime_error("rope scaling: not yet");
+            const json & sc = a.at("scaling");
+            if (sc.at("type") != "longrope") {
+                throw std::runtime_error("rope scaling " + sc.at("type").get<std::string>() + ": not yet");
+            }
+            std::vector<float> f = sc.at("factors").get<std::vector<float>>();
+            ff                   = host_const(Tensor::f32({ (int64_t) f.size() }, f));
+            mscale               = sc.value("mscale", 1.0f);
         }
         x = cont(x);
-        if (ggml_n_dims(x) < 3) {  // [hd, H, T] even at T = 1
-            x = ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], T);
+        // ggml rope: [hd, H, S, B] with pos [S]; the IR's x is [..., S, H, hd]
+        const int64_t S_ = ps->ne[0];
+        x = ggml_reshape_4d(ctx, x, x->ne[0], x->ne[1], S_, ggml_nelements(x) / (x->ne[0] * x->ne[1] * S_));
+        if (x->ne[3] == 1) {
+            return ggml_rope_ext(ctx, x, ps, ff, hd, mode, 0, a.at("theta").get<float>(), 1.0f, 0.0f, mscale, 0.0f, 0.0f);
         }
-        return ggml_rope_ext(ctx, x, ps, nullptr, hd, mode, 0, a.at("theta").get<float>(), 1.0f, 0.0f, 1.0f, 0.0f,
-                             0.0f);
+        // leading batch: rope wants [hd, H, S] per call with pos [S]; fold B into H (same pos for every batch row)
+        ggml_tensor * xb = ggml_cont(ctx, ggml_permute(ctx, x, 0, 1, 3, 2));                          // [hd, H, B, S]
+        xb = ggml_reshape_3d(ctx, xb, xb->ne[0], xb->ne[1] * xb->ne[2], S_);
+        xb = ggml_rope_ext(ctx, xb, ps, ff, hd, mode, 0, a.at("theta").get<float>(), 1.0f, 0.0f, mscale, 0.0f, 0.0f);
+        xb = ggml_reshape_4d(ctx, xb, x->ne[0], x->ne[1], x->ne[3], S_);
+        return ggml_cont(ctx, ggml_permute(ctx, xb, 0, 1, 3, 2));                                     // [hd, H, S, B]
     }
 
     ggml_tensor * op_attn(const json & n) {
@@ -188,8 +232,19 @@ struct Builder {
         ggml_tensor * k = in(n, 1);  // [hd, Hkv, T]
         ggml_tensor * v = in(n, 2);
         const json &  a = n.at("attr");
-        if (!a.value("causal", true)) {
-            throw std::runtime_error("attn: non-causal not yet");
+        if (!a.value("causal", true)) {  // q [..., S, H, hd], k / v [..., S, Hkv, hd]: ggml [hd, H, S, B]
+            const int64_t hd = q->ne[0];
+            const float   sc = a.contains("scale") ? a.at("scale").get<float>() : 1.0f / std::sqrt((float) hd);
+            auto as4 = [&](ggml_tensor * t) {
+                t = cont(t);
+                return ggml_reshape_4d(ctx, t, t->ne[0], t->ne[1], t->ne[2], ggml_nelements(t) / (t->ne[0] * t->ne[1] * t->ne[2]));
+            };
+            ggml_tensor * Q  = ggml_permute(ctx, as4(q), 0, 2, 1, 3);                  // [hd, S, H, B]
+            ggml_tensor * K  = ggml_permute(ctx, as4(k), 0, 2, 1, 3);
+            ggml_tensor * kq = ggml_soft_max_ext(ctx, ggml_mul_mat(ctx, K, Q), nullptr, sc, 0.0f);  // [Sk, Sq, H, B]
+            ggml_tensor * Vt = ggml_cont(ctx, ggml_permute(ctx, as4(v), 1, 2, 0, 3));  // [S, hd, Hkv, B]
+            ggml_tensor * o  = ggml_mul_mat(ctx, Vt, kq);                              // [hd, Sq, H, B]
+            return ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3));                   // [hd, H, Sq, B]
         }
         const std::string sid = a.at("state");
         auto              it  = s.kv.find(sid);
@@ -350,6 +405,131 @@ struct Builder {
         return ggml_view_3d(ctx, out, dv, Hv, T, dv * sizeof(float), dv * Hv * sizeof(float), 0);
     }
 
+    // causal conv over (left context, x): x torch [C, T] = ggml [T, C]; the context is the stream state or zeros
+    ggml_tensor * with_ctx(const json & a, ggml_tensor * xt, int ctxn) {
+        if (ctxn == 0) {
+            return xt;
+        }
+        const int64_t C = xt->ne[1];
+        ggml_tensor * prev;
+        ggml_tensor * st = nullptr;
+        if (a.contains("state") && !a.at("state").is_null()) {
+            st   = s.conv.at(a.at("state").get<std::string>());
+            prev = st;
+        } else {
+            prev = host_const(Tensor::f32({ C, (int64_t) ctxn }, std::vector<float>(C * ctxn, 0.0f)));
+        }
+        ggml_tensor * full = ggml_concat(ctx, prev, xt, 0);
+        if (st) {
+            ggml_tensor * tail = ggml_view_2d(ctx, full, ctxn, C, full->nb[1], (full->ne[0] - ctxn) * full->nb[0]);
+            writes.push_back(ggml_cpy(ctx, tail, st));
+        }
+        return full;
+    }
+
+    ggml_tensor * conv_bias_act(const json & n, ggml_tensor * y) {  // y [T, Cout]
+        const json &      a = n.at("attr");
+        const std::string p = n.at("p");
+        if (a.value("bias", false)) {
+            ggml_tensor * bb = weight(p + ".bias");
+            y                = ggml_add(ctx, y, ggml_reshape_2d(ctx, bb, 1, ggml_nelements(bb)));
+        }
+        if (a.value("act", std::string("none")) == "silu") {
+            y = ggml_silu(ctx, y);
+        }
+        return y;
+    }
+
+    ggml_tensor * op_conv1d_general(const json & n) {
+        const json &      a  = n.at("attr");
+        const std::string p  = n.at("p");
+        ggml_tensor *     xt = cont(in(n, 0));
+        xt                   = ggml_reshape_2d(ctx, xt, xt->ne[0], ggml_nelements(xt) / xt->ne[0]);  // [T, C]
+        const int64_t C = xt->ne[1];
+        const int     st = a.value("stride", 1), dl = a.value("dilation", 1), gr = a.value("groups", 1);
+        ggml_tensor * w  = weight(p + ".weight");  // ggml [k, Cin / g, Cout]
+        ggml_tensor * full = with_ctx(a, xt, a.at("ctx").get<int>());
+        ggml_tensor * y;
+        if (gr == 1) {
+            ggml_tensor * col = ggml_im2col(ctx, w, full, st, 0, 0, 0, dl, 0, false, GGML_TYPE_F32);   // [Cin k, Tout, 1]
+            y = ggml_mul_mat(ctx, ggml_reshape_2d(ctx, col, col->ne[0], col->ne[1] * col->ne[2]),
+                             ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));                    // [Tout, Cout]
+        } else if (gr == C && w->ne[1] == 1) {  // depthwise
+            ggml_tensor * fb  = ggml_reshape_4d(ctx, full, full->ne[0], 1, C, 1);
+            ggml_tensor * col = ggml_im2col(ctx, w, fb, st, 0, 0, 0, dl, 0, false, GGML_TYPE_F32);       // [k, Tout, C]
+            y = ggml_mul_mat(ctx, col, w);                                                                // [Tout, 1, C]
+            y = ggml_reshape_2d(ctx, y, y->ne[0], C);
+        } else {
+            throw std::runtime_error("conv1d_causal " + p + ": groups not 1 / C");
+        }
+        return conv_bias_act(n, y);
+    }
+
+    ggml_tensor * op_conv_t1d(const json & n) {
+        const json &      a  = n.at("attr");
+        const std::string p  = n.at("p");
+        if (a.value("groups", 1) != 1) {
+            throw std::runtime_error("conv_transpose1d_causal: groups");
+        }
+        ggml_tensor * xt = cont(in(n, 0));
+        xt               = ggml_reshape_2d(ctx, xt, xt->ne[0], ggml_nelements(xt) / xt->ne[0]);
+        const int     c = a.at("ctx"), st = a.at("stride"), trim = a.at("trim");
+        ggml_tensor * full = with_ctx(a, xt, c);
+        ggml_tensor * w    = weight(p + ".weight");  // ggml [k, Cout, Cin]
+        const int64_t k = w->ne[0], Co = w->ne[1], Lf = full->ne[0];
+        ggml_tensor * y;
+        if (k % st == 0) {
+            // cols [k Cout, L] = W^T x, then y[o, (l + q) s + r] += cols[q s + r + k o, l] for q < k / s (overlap-add)
+            ggml_tensor * cols = ggml_mul_mat(ctx, weight(p + ".weight.ct"), ggml_cont(ctx, ggml_transpose(ctx, full)));
+            const int     mq   = (int) (k / st);
+            y                  = nullptr;
+            for (int q = 0; q < mq; ++q) {
+                ggml_tensor * pc = ggml_view_3d(ctx, cols, st, Co, Lf, k * sizeof(float), cols->nb[1], q * st * sizeof(float));
+                pc = ggml_cont(ctx, ggml_permute(ctx, pc, 0, 2, 1, 3));  // [s, L, Cout]
+                pc = ggml_reshape_2d(ctx, pc, st * Lf, Co);
+                pc = ggml_pad_ext(ctx, pc, q * st, (mq - 1 - q) * st, 0, 0, 0, 0, 0, 0);
+                y  = y ? ggml_add(ctx, y, pc) : pc;
+            }
+        } else {
+            y = ggml_conv_transpose_1d(ctx, w, full, st, 0, 1);  // [L, Cout]
+        }
+        const int64_t L    = y->ne[0] - (int64_t) c * st - trim;
+        y = ggml_view_2d(ctx, y, L, y->ne[1], y->nb[1], (int64_t) c * st * y->nb[0]);
+        return conv_bias_act(n, cont(y));
+    }
+
+    ggml_tensor * op_timestep(const json & n) {  // t [B] -> [B, dim] = cat(sin(scale t f), cos(scale t f))
+        const json &  a    = n.at("attr");
+        const int64_t half = a.at("dim").get<int64_t>() / 2;
+        const float   mp   = a.value("max_period", 10000.0f);
+        std::vector<float> f(half);
+        for (int64_t j = 0; j < half; ++j) {  // torch: exp(arange(half) * -(log(mp) / (half - 1))), fp32
+            f[j] = std::exp((float) j * -(std::log(mp) / (float) (half - 1)));
+        }
+        ggml_tensor * t  = in(n, 0);
+        ggml_tensor * tb = ggml_scale(ctx, ggml_reshape_2d(ctx, cont(t), 1, ggml_nelements(t)), a.value("scale", 1.0f));
+        ggml_tensor * fc = host_const(Tensor::f32({ half }, f));
+        ggml_tensor * e  = ggml_mul(ctx, ggml_repeat_4d(ctx, tb, half, tb->ne[1], 1, 1), fc);  // [half, B]
+        return ggml_concat(ctx, ggml_sin(ctx, e), ggml_cos(ctx, e), 0);
+    }
+
+    ggml_tensor * op_snake(const json & n) {  // x [C, T] torch: x + inv sin^2(alpha x)
+        const std::string p  = n.at("p");
+        ggml_tensor *     x  = cont(in(n, 0));
+        ggml_tensor *     al = weight(p + ".alpha");
+        ggml_tensor *     iv = weight(p + ".alpha.inv");
+        const int64_t     C  = ggml_nelements(al);
+        al = ggml_reshape_2d(ctx, al, 1, C);
+        iv = ggml_reshape_2d(ctx, iv, 1, C);
+        ggml_tensor * sn = ggml_sin(ctx, ggml_mul(ctx, x, al));
+        return ggml_add(ctx, x, ggml_mul(ctx, ggml_sqr(ctx, sn), iv));
+    }
+
+    // ggml-cuda's SSM_CONV: channels a multiple of 128, kernel 3 / 4 / 5 / 7 / 9 / 15
+    static bool ssm_conv_cuda_ok(int64_t C, int k) {
+        return C % 128 == 0 && (k == 3 || k == 4 || k == 5 || k == 7 || k == 9 || k == 15);
+    }
+
     void node(const json & n) {
         const std::string op = n.at("op");
         ggml_tensor *     y  = nullptr;
@@ -358,8 +538,9 @@ struct Builder {
             y = op_linear(n);
         } else if (op == "ttf.embed") {
             const json & a = n.value("attr", json::object());
-            if (a.value("kind", std::string("float")) != "float") {
-                throw std::runtime_error("ttf.embed: int-k not yet");
+            const std::string kind = a.value("kind", std::string("float"));
+            if (kind != "float" && kind != "intk") {
+                throw std::runtime_error("ttf.embed: kind " + kind);
             }
             y = ggml_get_rows(ctx, weight(n.at("p").get<std::string>() + ".weight"), in(n, 0));
             r += 1;
@@ -374,8 +555,7 @@ struct Builder {
         } else if (op == "rope") {
             y = op_rope(n);
         } else if (op == "attn") {
-            y = op_attn(n);
-            r = 3;
+            y = op_attn(n);  // q's rank: [T, H, hd] causal, [..., S, H, hd] batched
         } else if (op == "glu") {
             const std::string act = n.value("attr", json::object()).value("act", std::string("silu"));
             ggml_tensor *     g   = in(n, 0);
@@ -390,8 +570,54 @@ struct Builder {
         } else if (op == "matmul") {
             y = op_matmul(n);
         } else if (op == "conv1d_causal") {
-            y = op_conv1d(n);
+            const json & a = n.at("attr");
+            ggml_tensor * x0 = in(n, 0);
+            const bool fast = a.value("stride", 1) == 1 && a.value("dilation", 1) == 1 && a.value("groups", 1) == x0->ne[1] &&
+                              a.value("kernel", 0) == a.at("ctx").get<int>() + 1 && m.get(n.at("p").get<std::string>() + ".weight.conv") &&
+                              m.get(n.at("p").get<std::string>() + ".weight")->ne[2] == x0->ne[1] &&  // depthwise, Cout = C
+                              (m.device == "cpu" || ssm_conv_cuda_ok(x0->ne[1], a.value("kernel", 0)));
+            y = fast ? op_conv1d(n) : op_conv1d_general(n);  // both: ggml [T, C] = torch [C, T]
             r = 2;
+        } else if (op == "conv_transpose1d_causal") {
+            y = op_conv_t1d(n);
+            r = 2;
+        } else if (op == "snake") {
+            y = op_snake(n);
+        } else if (op == "timestep_embed") {
+            y = op_timestep(n);
+            r = 2;
+        } else if (op == "const") {
+            const json & a = n.at("attr");
+            y              = weight(a.at("w"));
+            if (a.contains("shape")) {
+                std::vector<int64_t> sh = a.at("shape").get<std::vector<int64_t>>();
+                y                       = reshape_ne(y, std::vector<int64_t>(sh.rbegin(), sh.rend()));
+                r                       = (int) sh.size();
+            } else {
+                r = ggml_n_dims(y);
+            }
+        } else if (op == "repeat") {
+            y = ggml_repeat(ctx, in(n, 0), in(n, 1));
+            r = rank_of(n, 1);
+        } else if (op == "concat") {
+            const int d = ax(n.at("attr").at("dim").get<int>(), r);
+            y           = cont(in(n, 0));
+            for (size_t i = 1; i < n.at("in").size(); ++i) {
+                y = ggml_concat(ctx, y, cont(in(n, i)), d);
+            }
+        } else if (op == "arange") {
+            const json &         a  = n.at("attr");
+            const int32_t        st = a.value("start", 0), en = a.at("n");
+            std::vector<int32_t> v;
+            for (int32_t i = st; i < en; ++i) {
+                v.push_back(i);
+            }
+            y = host_const(Tensor::i32({ (int64_t) v.size() }, v));
+            r = 1;
+        } else if (op == "round") {
+            y = ggml_round(ctx, in(n, 0));
+        } else if (op == "scale") {
+            y = ggml_scale(ctx, in(n, 0), n.at("attr").at("s").get<float>());
         } else if (op == "delta_rule") {
             y = op_delta_rule(n);
             r = 3;
@@ -470,13 +696,15 @@ Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_
     if (sbuf) {
         ggml_backend_buffer_clear(sbuf, 0);
     }
-    galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    gbuf.resize(ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false));
 }
 
 Session::~Session() {
-    if (galloc) {
-        ggml_gallocr_free(galloc);
+    for (auto & [k, g] : gmem) {
+        ggml_gallocr_free(g.galloc);
+    }
+    for (auto & [k, c] : consts) {
+        ggml_backend_buffer_free(c.buf);
+        ggml_free(c.ctx);
     }
     if (sbuf) {
         ggml_backend_buffer_free(sbuf);
@@ -497,27 +725,59 @@ void Session::reset() {
 
 StepOut Session::step(const std::string & graph, const std::vector<int32_t> & ids, const std::vector<int32_t> & pos,
                       bool last_only) {
+    Values in;
+    in["ids"] = Tensor::i32({ (int64_t) ids.size() }, ids);
+    in["pos"] = Tensor::i32({ (int64_t) pos.size() }, pos);
+    Values  o = run(graph, in, last_only);
+    StepOut r;
+    Tensor & lo = o.begin()->second;
+    r.n_vocab   = lo.shape.back();
+    r.T_out     = lo.numel() / r.n_vocab;
+    r.logits    = std::move(lo.f);
+    return r;
+}
+
+Values Session::run(const std::string & graph, const Values & in, bool last_only) {
     const auto t0 = std::chrono::steady_clock::now();
     const json & g = m.ir.at("graphs").at(graph);
-    const int64_t T = (int64_t) ids.size();
-    if (T == 0 || (int64_t) pos.size() != T) {
-        throw std::runtime_error("step: ids / pos");
+    // T: the positions' length, else the first input's leading dim
+    const Tensor * pin = in.count("pos") ? &in.at("pos") : nullptr;
+    int64_t        T   = 1;
+    if (pin) {
+        T = pin->numel();
+    } else if (!g.at("inputs").empty()) {
+        const Tensor & f0 = in.at(g.at("inputs")[0].at("name").get<std::string>());
+        T                 = f0.shape.empty() ? 1 : f0.shape[0];
+    }
+    // the causal kv states this graph uses; filled first: a token sees itself and the earlier tokens of its call
+    std::vector<Kv *> used;
+    for (const auto & n : g.at("nodes")) {
+        if (n.at("op") == "attn" && n.value("attr", json::object()).value("causal", true)) {
+            used.push_back(&kv.at(n.at("attr").at("state").get<std::string>()));
+        }
+    }
+    const std::vector<int32_t> pos = pin ? pin->i : std::vector<int32_t>();
+    if (!used.empty() && !pin) {
+        throw std::runtime_error("graph " + graph + ": causal attn needs a pos input");
     }
     for (int32_t p : pos) {
         if (p < 0 || p >= max_ctx) {
-            throw std::runtime_error("step: position out of context");
+            throw std::runtime_error("run: position out of context");
         }
     }
-    // state update first: a token sees itself and the earlier tokens of its own call
-    std::vector<bool> filled = kv.empty() ? std::vector<bool>() : kv.begin()->second.filled;
-    for (auto & [id, k] : kv) {
+    for (Kv * k : used) {
         for (int32_t p : pos) {
-            k.filled[p] = true;
+            k->filled[p] = true;
         }
     }
     int64_t S = 0;
-    if (!kv.empty()) {
-        const auto & f = kv.begin()->second.filled;
+    if (!used.empty()) {
+        const auto & f = used[0]->filled;
+        for (Kv * k : used) {
+            if (k->filled != f) {
+                throw std::runtime_error("graph " + graph + ": kv states filled differently");
+            }
+        }
         for (int64_t j = max_ctx - 1; j >= 0; --j) {
             if (f[j]) {
                 S = j + 1;
@@ -529,26 +789,41 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
         S = std::min<int64_t>(max_ctx, (S + 255) / 256 * 256);
     }
 
-    ggml_init_params ip = { gbuf.size(), gbuf.data(), true };
+    GraphMem & gm = gmem[graph + (T == 1 ? "/1" : "/n")];
+    if (!gm.galloc) {
+        gm.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        gm.gbuf.resize(ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false));
+    }
+    ggml_init_params ip = { gm.gbuf.size(), gm.gbuf.data(), true };
     ggml_context *   ctx = ggml_init(ip);
     Builder          b{ m, *this, ctx, {}, {}, {}, nullptr, nullptr, S, T, last_only, m.d_bf16 };
-    ggml_tensor *    tid = nullptr;
+    std::vector<std::pair<ggml_tensor *, const Tensor *>> sets;
     for (const auto & inp : g.at("inputs")) {
         const std::string name = inp.at("name");
-        ggml_tensor *     t    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, T);
+        auto              it   = in.find(name);
+        if (it == in.end()) {
+            throw std::runtime_error("graph " + graph + ": missing input " + name);
+        }
+        const Tensor & h = it->second;
+        int64_t        ne[4] = { 1, 1, 1, 1 };
+        const int      r     = (int) h.shape.size();
+        if (r > 4) {
+            throw std::runtime_error("input rank > 4");
+        }
+        for (int i = 0; i < r; ++i) {
+            ne[r - 1 - i] = h.shape[i];
+        }
+        ggml_tensor * t = ggml_new_tensor(ctx, h.type, std::max(r, 1), ne);
         ggml_set_name(t, name.c_str());
         ggml_set_input(t);
         b.val[name] = t;
-        b.nd[name]  = 1;
-        if (name == "ids") {
-            tid = t;
-        } else if (name == "pos") {
+        b.nd[name]  = std::max(r, 1);
+        if (name == "pos") {
             b.pos = t;
-        } else {
-            throw std::runtime_error("graph input " + name + ": not yet");
         }
+        sets.emplace_back(t, &h);
     }
-    if (!kv.empty()) {
+    if (!used.empty()) {
         b.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, T);
         ggml_set_name(b.mask, "kq_mask");
         ggml_set_input(b.mask);
@@ -574,6 +849,9 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
     std::vector<ggml_tensor *> outs;
     for (const auto & o : g.at("outputs")) {
         ggml_tensor * t = b.val.at(o.at("of").get<std::string>());
+        if (!ggml_is_contiguous(t)) {
+            t = ggml_cont(ctx, t);
+        }
         ggml_set_output(t);
         outs.push_back(t);
         ggml_build_forward_expand(gf, t);
@@ -588,21 +866,30 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
         }
     }
     const auto t1 = std::chrono::steady_clock::now();
-    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+    if (!ggml_gallocr_alloc_graph(gm.galloc, gf)) {
         ggml_free(ctx);
         throw std::runtime_error("graph allocation failed");
     }
-    ggml_backend_tensor_set(tid, ids.data(), 0, T * sizeof(int32_t));
-    ggml_backend_tensor_set(b.pos, pos.data(), 0, T * sizeof(int32_t));
+    prof_galloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    for (auto & [t, h] : sets) {
+        if (h->numel() != ggml_nelements(t) || (h->type == GGML_TYPE_F32 ? h->f.size() : h->i.size()) != (size_t) h->numel()) {
+            throw std::runtime_error(std::string("input ") + t->name + ": size");
+        }
+        // async on the compute stream: no per-input synchronisation (the host data outlives the call)
+        ggml_backend_tensor_set_async(backend, t,
+                                      h->type == GGML_TYPE_F32 ? (const void *) h->f.data() : (const void *) h->i.data(), 0,
+                                      ggml_nbytes(t));
+    }
+    std::vector<float> mk;
     if (b.mask) {
-        const auto &       f = kv.begin()->second.filled;
-        std::vector<float> mk(S * T);
+        const auto & f = used[0]->filled;
+        mk.resize(S * T);
         for (int64_t t = 0; t < T; ++t) {
             for (int64_t j = 0; j < S; ++j) {
                 mk[t * S + j] = (f[j] && j <= pos[t]) ? 0.0f : -std::numeric_limits<float>::infinity();
             }
         }
-        ggml_backend_tensor_set(b.mask, mk.data(), 0, mk.size() * sizeof(float));
+        ggml_backend_tensor_set_async(backend, b.mask, mk.data(), 0, mk.size() * sizeof(float));
     }
     const auto t2 = std::chrono::steady_clock::now();
     if (std::getenv("TTF_PROF_OPS")) {  // node by node, time per op (+ part shape for TTF_MM)
@@ -639,12 +926,27 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
         }
         std::ofstream(std::string(dump_dir) + "/index.json") << idx.dump();
     }
-    StepOut r;
-    ggml_tensor * lo = outs.at(0);
-    r.n_vocab        = lo->ne[0];
-    r.T_out          = ggml_nelements(lo) / lo->ne[0];
-    r.logits.resize(ggml_nelements(lo));
-    ggml_backend_tensor_get(lo, r.logits.data(), 0, ggml_nbytes(lo));
+    Values r;
+    size_t oi = 0;
+    for (const auto & o : g.at("outputs")) {
+        ggml_tensor * t  = outs.at(oi++);
+        const int     nd = b.nd.at(o.at("of").get<std::string>());
+        Tensor        h;
+        h.type = GGML_TYPE_F32;
+        for (int i = nd - 1; i >= 0; --i) {
+            h.shape.push_back(t->ne[i]);
+        }
+        if (t->type != GGML_TYPE_F32) {
+            throw std::runtime_error("output " + o.at("name").get<std::string>() + ": not f32");
+        }
+        h.f.resize(ggml_nelements(t));
+        if (ggml_is_contiguous(t)) {
+            ggml_backend_tensor_get(t, h.f.data(), 0, ggml_nbytes(t));
+        } else {
+            throw std::runtime_error("output " + o.at("name").get<std::string>() + ": not contiguous");
+        }
+        r[o.at("name").get<std::string>()] = std::move(h);
+    }
     ggml_free(ctx);
     const auto t3 = std::chrono::steady_clock::now();
     last_ms       = std::chrono::duration<double, std::milli>(t3 - t0).count();
@@ -652,7 +954,6 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
     prof_alloc += std::chrono::duration<double, std::milli>(t2 - t1).count();
     prof_compute += std::chrono::duration<double, std::milli>(t3 - t2).count();
     prof_nodes = ggml_graph_n_nodes(gf);
-    (void) filled;
     return r;
 }
 

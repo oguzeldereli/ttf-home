@@ -61,6 +61,35 @@ struct Model {
     ggml_tensor * get(const std::string & name) const;  // nullptr when absent
 };
 
+// a host tensor: torch-order shape, f32 or i32 data
+struct Tensor {
+    ggml_type            type = GGML_TYPE_F32;
+    std::vector<int64_t> shape;
+    std::vector<float>   f;
+    std::vector<int32_t> i;
+    int64_t              numel() const {
+        int64_t n = 1;
+        for (int64_t d : shape) {
+            n *= d;
+        }
+        return n;
+    }
+    static Tensor f32(std::vector<int64_t> s, std::vector<float> v) {
+        Tensor t;
+        t.shape = std::move(s);
+        t.f     = std::move(v);
+        return t;
+    }
+    static Tensor i32(std::vector<int64_t> s, std::vector<int32_t> v) {
+        Tensor t;
+        t.type  = GGML_TYPE_I32;
+        t.shape = std::move(s);
+        t.i     = std::move(v);
+        return t;
+    }
+};
+using Values = std::map<std::string, Tensor>;
+
 struct StepOut {
     std::vector<float> logits;  // [T_out, n_vocab]
     int64_t            n_vocab = 0;
@@ -75,6 +104,9 @@ struct Session {
     // last_only: the head only on the last token
     StepOut step(const std::string & graph, const std::vector<int32_t> & ids, const std::vector<int32_t> & pos,
                  bool last_only = false);
+
+    // run any graph of the IR on named inputs (torch-order shapes); returns its named outputs
+    Values run(const std::string & graph, const Values & in, bool last_only = false);
 
     void reset();
 
@@ -92,12 +124,47 @@ struct Session {
     std::map<std::string, Kv> kv;
     std::map<std::string, ggml_tensor *> conv;  // conv stream state [len, C]
     std::map<std::string, ggml_tensor *> rec;   // delta-rule state [dv, dk, H, 1]
-    ggml_gallocr_t            galloc = nullptr;
-    std::vector<uint8_t>      gbuf;  // graph context memory
+    // per graph (and prefill / single-token call): its own context memory and allocator, so that alternating graphs
+    // neither re-plan the allocator nor share node addresses (ggml-cuda keys its CUDA graphs by the first node)
+    struct GraphMem {
+        std::vector<uint8_t> gbuf;
+        ggml_gallocr_t       galloc = nullptr;
+    };
+    std::map<std::string, GraphMem> gmem;
+    struct Const {
+        ggml_context *        ctx = nullptr;
+        ggml_tensor *         t   = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+    };
+    std::map<std::string, Const> consts;  // host-made constants by content
     double                    last_ms = 0;
     double                    prof_build = 0, prof_alloc = 0, prof_compute = 0;  // ms, summed over calls
+    double                    prof_galloc = 0;                                   // ms, the allocator part of alloc
     int                       prof_nodes = 0;                                    // last graph
     std::map<std::string, std::pair<double, int>> prof_ops;                      // TTF_PROF_OPS: ms, count
 };
+
+// lm_diffusion driver (VoxCPM2): text ids -> waveform. Defaults (-1 / empty) come from the IR's driver attr.
+struct SpeakParams {
+    int      timesteps   = -1;
+    float    cfg         = -1;
+    int      min_len     = -1;
+    int      max_len     = -1;
+    float    temperature = -1;
+    uint32_t seed        = 0;
+    const std::vector<float> * noise = nullptr;  // fed noise, [patches, P, D] in order (parity runs); else mt19937
+    bool     verbose     = false;
+};
+
+struct SpeakOut {
+    std::vector<float> wav;          // mono, out_sample_rate
+    int                sample_rate = 0;
+    std::vector<float> feat;         // generated latents [patches, P, D]
+    int                n_patches = 0;
+    double             ms_prefill = 0, ms_lm = 0, ms_dit = 0, ms_enc = 0, ms_vae = 0;
+};
+
+// text_ids: the tokenizer's output (the driver appends audio_start)
+SpeakOut speak(Session & s, const std::vector<int32_t> & text_ids, const SpeakParams & p = {});
 
 }  // namespace ttf

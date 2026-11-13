@@ -366,4 +366,36 @@ inline float dot_f32(const float * a, const float * b, int64_t n) {
     return r;
 }
 
+// fp32 dot of n floats in 64 lanes (the legacy adapter's K-length down projection; one CUDA warp per dot):
+// lane j accumulates k = j mod 64 by fma in increasing k; then l[i] += l[i + 32], then the halves 16, 8, 4, 2, 1
+inline float dot_f32_64(const float * a, const float * b, int64_t n) {
+    alignas(32) float l[64] = {};
+    int64_t           k     = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 acc[8];
+    for (int i = 0; i < 8; ++i) {
+        acc[i] = _mm256_setzero_ps();
+    }
+    for (; k + 64 <= n; k += 64) {
+        for (int i = 0; i < 8; ++i) {
+            acc[i] = _mm256_fmadd_ps(_mm256_loadu_ps(a + k + 8 * i), _mm256_loadu_ps(b + k + 8 * i), acc[i]);
+        }
+    }
+    for (int i = 0; i < 8; ++i) {
+        _mm256_store_ps(l + 8 * i, acc[i]);
+    }
+#endif
+    for (; k < n; k += 64) {
+        for (int j = 0; j < 64 && k + j < n; ++j) {
+            l[j] = std::fma(a[k + j], b[k + j], l[j]);
+        }
+    }
+    for (int off = 32; off > 0; off >>= 1) {
+        for (int i = 0; i < off; ++i) {
+            l[i] = l[i] + l[i + off];
+        }
+    }
+    return l[0];
+}
+
 }  // namespace ttf_kern

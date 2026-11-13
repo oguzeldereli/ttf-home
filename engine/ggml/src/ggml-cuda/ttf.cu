@@ -1,8 +1,9 @@
 // GGML_OP_TTF_QUANT / GGML_OP_TTF_MM on CUDA: the TTF linear as the trainer computes it (TTF_FORMAT_IR_SPEC.md,
 // Arithmetic steps 1-8), bit-identical to the CPU op (ggml-cpu/ttf-ops.cpp):
 //  - every rounding is an explicit _rn intrinsic (the CUDA build uses -use_fast_math; nothing may contract or approximate);
-//  - the legacy adapter's float dots follow the CPU's order: 8 lanes, lane l accumulating k = l mod 8 by fma in increasing
-//    k, the lanes summed in order, then the tail (ttf_kern::dot_f32 with AVX2 + FMA);
+//  - the legacy adapter's float dots follow the CPU's order: the K-length down projection in 64 lanes (lane j accumulates
+//    k = j mod 64 by fma, then a fixed halving tree; ttf_kern::dot_f32_64, one warp per dot here), the rank-length up
+//    projection in 8 lanes summed in order, then the tail (ttf_kern::dot_f32 with AVX2 + FMA);
 //  - the trit product is exact in int32 (dp4a), so its order does not matter.
 // Weights: TQ1_P (decoded by a 256-entry shared table, as mmvq-tq1p.cuh) or Q2P (2-bit planes).
 
@@ -105,16 +106,61 @@ static __device__ __forceinline__ int ttf_block_sum_i(int v, int * sh) {
 }
 
 // one block per row; 256 threads
+// grid (rows, 1 + ceil(rank / 8)), 256 threads: blockIdx.y 0 makes the codes, s and qsum; blockIdx.y > 0 makes 8 of
+// the adapter's down projections u_j = rD(xc . mB_j), one warp each, in dot_f32_64's order
 static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, const float * mu, const float * c,
                                         const float * mB, const int64_t K, const int64_t Kp, const int rank,
                                         const bool bf16, char * dst, const int64_t nbd1) {
     __shared__ float sf[32];
     __shared__ int   si[32];
-    __shared__ float lanes[64 * 8];  // adapter dot lanes, rank <= 64
     const int64_t    row = blockIdx.x;
     const float *    xr  = (const float *) (x + row * nbx1);
     char *           o   = dst + row * nbd1;
-    float            am  = 0.0f;
+    if (blockIdx.y > 0) {
+        const int lane = threadIdx.x % WARP_SIZE;
+        const int j    = (blockIdx.y - 1) * 8 + threadIdx.x / WARP_SIZE;
+        if (j >= rank) {
+            return;
+        }
+        const float * bj = mB + (int64_t) j * K;
+        float         a0 = 0.0f, a1 = 0.0f;
+        const int64_t K64 = K / 64 * 64;
+        int64_t       k0  = 0;
+        // full blocks, 4 at a time: the loads of 4 blocks issue before the (ordered) fma chains
+        for (; k0 + 256 <= K64; k0 += 256) {
+            float xa[8], wa[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int64_t k = k0 + 32 * u + lane;
+                xa[u]           = ttf_xc(xr, mu, c, k, bf16);
+                wa[u]           = bj[k];
+            }
+#pragma unroll
+            for (int u = 0; u < 8; u += 2) {
+                a0 = __fmaf_rn(xa[u], wa[u], a0);
+                a1 = __fmaf_rn(xa[u + 1], wa[u + 1], a1);
+            }
+        }
+        for (; k0 < K; k0 += 64) {
+            const int64_t k = k0 + lane;
+            if (k < K) {
+                a0 = __fmaf_rn(ttf_xc(xr, mu, c, k, bf16), bj[k], a0);
+            }
+            if (k + 32 < K) {
+                a1 = __fmaf_rn(ttf_xc(xr, mu, c, k + 32, bf16), bj[k + 32], a1);
+            }
+        }
+        float s = __fadd_rn(a0, a1);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            s = __fadd_rn(s, __shfl_down_sync(0xffffffff, s, off));
+        }
+        if (lane == 0) {
+            *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(s, bf16);
+        }
+        return;
+    }
+    float am = 0.0f;
     for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
         am = fmaxf(am, fabsf(ttf_xc(xr, mu, c, k, bf16)));
     }
@@ -136,31 +182,6 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
         *(float *) (o + Kp)  = s;
         *(int *) (o + Kp + 4) = qs;
     }
-    // adapter down projection u_j = rD(xc . mB_j) in dot_f32's order: thread (j, lane) runs lane l of row j
-    if (rank > 0) {
-        const int64_t n8 = K / 8 * 8;
-        for (int e = threadIdx.x; e < rank * 8; e += blockDim.x) {
-            const int     j  = e / 8, l = e % 8;
-            const float * bj = mB + (int64_t) j * K;
-            float         a  = 0.0f;
-            for (int64_t k = l; k < n8; k += 8) {
-                a = __fmaf_rn(ttf_xc(xr, mu, c, k, bf16), bj[k], a);
-            }
-            lanes[e] = a;
-        }
-        __syncthreads();
-        for (int j = threadIdx.x; j < rank; j += blockDim.x) {
-            const float * bj = mB + (int64_t) j * K;
-            float         r  = 0.0f;
-            for (int l = 0; l < 8; ++l) {
-                r = __fadd_rn(r, lanes[j * 8 + l]);
-            }
-            for (int64_t k = n8; k < K; ++k) {
-                r = __fadd_rn(r, __fmul_rn(ttf_xc(xr, mu, c, k, bf16), bj[k]));
-            }
-            *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(r, bf16);
-        }
-    }
 }
 
 void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -173,12 +194,12 @@ void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     const int           rank = mB ? (int) mB->ne[1] : 0;
     GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
     GGML_ASSERT(ggml_nrows(x) == x->ne[1] && ggml_is_contiguous(dst));  // 2-d input (the builder reshapes)
-    GGML_ASSERT(rank <= 64);
     const int64_t rows = x->ne[1];
     if (rows == 0) {
         return;
     }
-    ttf_quant_kernel<<<rows, 256, 0, ctx.stream()>>>(
+    const dim3 grid((unsigned) rows, 1 + (rank + 7) / 8);
+    ttf_quant_kernel<<<grid, 256, 0, ctx.stream()>>>(
         (const char *) x->data, x->nb[1], mu ? (const float *) mu->data : nullptr,
         c ? (const float *) c->data : nullptr, mB ? (const float *) mB->data : nullptr, x->ne[0], Kp, rank, bf16,
         (char *) dst->data, dst->nb[1]);

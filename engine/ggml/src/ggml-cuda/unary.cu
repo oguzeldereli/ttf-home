@@ -107,7 +107,7 @@ static __device__ __forceinline__ float op_ceil(float x) {
 }
 
 static __device__ __forceinline__ float op_round(float x) {
-    return roundf(x);
+    return rintf(x);  // ttf: half to even, as torch.round
 }
 
 static __device__ __forceinline__ float op_trunc(float x) {

@@ -90,7 +90,7 @@ static inline float op_ceil(float x) {
 }
 
 static inline float op_round(float x) {
-    return roundf(x);
+    return nearbyintf(x);  // ttf: half to even, as torch.round
 }
 
 static inline float op_trunc(float x) {

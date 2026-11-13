@@ -144,6 +144,8 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
         std::vector<Pending>                                       pend;
         std::vector<std::pair<std::string, const ggml_tensor *>> heads;
         std::vector<std::pair<std::string, std::string>>          fder;  // (source weight, derived suffix)
+        std::vector<std::tuple<std::string, json, bool>>          intk;  // int-k embeddings / heads: (p, attr, head)
+        std::vector<std::string>                                  snakes;
         for (const auto & [gname, g] : m->ir.at("graphs").items()) {
             for (const auto & n : g.at("nodes")) {
                 const std::string op = n.at("op");
@@ -165,6 +167,8 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                         P.N      = wp->ne[1];
                         pend.push_back({ p, K, wp });
                     }
+                } else if (op == "conv_transpose1d_causal") {  // weight as [Cin, k Cout] for one mul_mat + overlap-add
+                    fder.emplace_back(n.at("p").get<std::string>() + ".weight", ".weight.ct");
                 } else if (op == "matmul" || op == "conv1d_causal" ||
                            (op == "rms_norm" && n.contains("p") && n.at("attr").value("offset", false))) {
                     const std::string p    = n.at("p");
@@ -173,12 +177,17 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                         throw std::runtime_error("missing " + p + ".weight");
                     }
                     fder.emplace_back(p + ".weight", kind);
+                } else if ((op == "ttf.embed" || op == "ttf.head") && n.value("attr", json::object()).value("kind", std::string("float")) == "intk") {
+                    const std::string p = n.at("p");
+                    intk.emplace_back(p, n.at("attr"), op == "ttf.head");
                 } else if (op == "ttf.head") {
                     const std::string p = n.at("p");
                     if (!m->get(p + ".weight")) {
                         throw std::runtime_error("missing " + p + ".weight");
                     }
                     heads.emplace_back(p, m->get(p + ".weight"));
+                } else if (op == "snake") {
+                    snakes.push_back(n.at("p").get<std::string>());
                 }
             }
         }
@@ -187,7 +196,7 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
         for (ggml_tensor * t = ggml_get_first_tensor(m->meta); t; t = ggml_get_next_tensor(m->meta, t)) {
             ++n_meta;
         }
-        const size_t        nt = pend.size() * 8 + heads.size() + fder.size() + n_meta + 8;
+        const size_t        nt = pend.size() * 8 + heads.size() + fder.size() + n_meta + intk.size() + snakes.size() + 8;
         ggml_init_params    ip = { ggml_tensor_overhead() * nt, nullptr, /*no_alloc =*/true };
         m->wctx                = ggml_init(ip);
         std::vector<std::pair<ggml_tensor *, const ggml_tensor *>> dvec;   // (D copy, source) of side vectors
@@ -267,11 +276,13 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                     continue;
                 }
                 ggml_tensor * d;
-                if (kind == ".weight.conv") {  // torch [C, 1, k] = ggml [k, 1, C]
+                if (kind == ".weight.conv") {  // depthwise: torch [C, 1, k] = ggml [k, 1, C] -> [k, C]
                     if (w->ne[1] != 1) {
-                        throw std::runtime_error(src + ": only depthwise conv yet");
+                        continue;  // dense conv reads the weight as stored (F32 copy below)
                     }
                     d = ggml_new_tensor_2d(m->wctx, GGML_TYPE_F32, w->ne[0], w->ne[2]);
+                } else if (kind == ".weight.ct") {  // torch [Cin, Cout, k] = ggml [k, Cout, Cin] -> ggml [Cin, k Cout]
+                    d = ggml_new_tensor_2d(m->wctx, GGML_TYPE_F32, w->ne[2], w->ne[0] * w->ne[1]);
                 } else {
                     d = ggml_new_tensor(m->wctx, GGML_TYPE_F32, GGML_MAX_DIMS, w->ne);
                 }
@@ -283,11 +294,35 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
         // Large ones (embeddings, heads) stay as stored: get_rows / mul_mat read them directly.
         std::vector<std::pair<ggml_tensor *, const ggml_tensor *>> f32c;
         for (ggml_tensor * t = ggml_get_first_tensor(m->meta); t; t = ggml_get_next_tensor(m->meta, t)) {
-            if ((t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F16) && ggml_nelements(t) <= (1 << 22)) {
+            if ((t->type == GGML_TYPE_BF16 || t->type == GGML_TYPE_F16) && ggml_nelements(t) <= (1 << 24)) {
                 ggml_tensor * d = ggml_new_tensor(m->wctx, GGML_TYPE_F32, GGML_MAX_DIMS, t->ne);
                 ggml_set_name(d, ggml_get_name(t));
                 f32c.emplace_back(d, t);
             }
+        }
+        // int-k (nib2 codes, per-group lo / s): the weight D(lo + s q) in D's type, exact (fp32 mul, then add, then D)
+        std::vector<std::tuple<ggml_tensor *, std::string, int64_t>> ikd;
+        for (auto & [p, a, head] : intk) {
+            if (m->kv_str("ttf.layout.intk", "nib2") != "nib2" || a.at("bits").get<int>() > 4) {
+                throw std::runtime_error(p + ": int-k layout / bits not yet");
+            }
+            const int64_t K = a.at("K"), V = a.at("V"), g = a.at("g");
+            ggml_tensor * d = ggml_new_tensor_2d(m->wctx, dt, K, V);
+            ggml_set_name(d, (p + ".weight").c_str());
+            ikd.emplace_back(d, p, g);
+            if (head) {
+                m->head_w[p] = d;
+            }
+        }
+        std::vector<std::pair<ggml_tensor *, std::string>> snd;
+        for (auto & p : snakes) {
+            const ggml_tensor * al = m->get(p + ".alpha");
+            if (!al) {
+                throw std::runtime_error("missing " + p + ".alpha");
+            }
+            ggml_tensor * d = ggml_new_tensor(m->wctx, GGML_TYPE_F32, GGML_MAX_DIMS, al->ne);
+            ggml_set_name(d, (p + ".alpha.inv").c_str());
+            snd.emplace_back(d, p);
         }
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(m->wctx, ggml_backend_cpu_buffer_type());
         if (!buf) {
@@ -332,6 +367,51 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                 }
             }
         }
+        auto f32of = [&](const std::string & name) {  // a float tensor of the file as f32
+            const ggml_tensor * t = m->get(name);
+            if (!t) {
+                throw std::runtime_error("missing " + name);
+            }
+            std::vector<float> f(ggml_nelements(t));
+            if (t->type == GGML_TYPE_F32) {
+                std::memcpy(f.data(), t->data, f.size() * 4);
+            } else if (t->type == GGML_TYPE_BF16) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, f.data(), f.size());
+            } else if (t->type == GGML_TYPE_F16) {
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) t->data, f.data(), f.size());
+            } else {
+                throw std::runtime_error(name + ": not a float tensor");
+            }
+            return f;
+        };
+        for (auto & [d, p, g] : ikd) {
+            const ggml_tensor * c  = m->get(p + ".codes");
+            if (!c) {
+                throw std::runtime_error("missing " + p + ".codes");
+            }
+            const std::vector<float> lo = f32of(p + ".lo"), sc = f32of(p + ".s");
+            const int64_t            K = d->ne[0], V = d->ne[1], G = K / g;
+            std::vector<float>       row(K);
+            for (int64_t v = 0; v < V; ++v) {
+                const uint8_t * cr = (const uint8_t *) c->data + v * c->nb[1];
+                for (int64_t k = 0; k < K; ++k) {
+                    const int   q  = (k & 1) ? (cr[k / 2] >> 4) : (cr[k / 2] & 15);
+                    const float pq = sc[v * G + k / g] * (float) q;
+                    row[k]         = lo[v * G + k / g] + pq;
+                }
+                if (d->type == GGML_TYPE_BF16) {
+                    ggml_fp32_to_bf16_row_ref(row.data(), (ggml_bf16_t *) d->data + v * K, K);
+                } else {
+                    std::memcpy((float *) d->data + v * K, row.data(), K * 4);
+                }
+            }
+        }
+        for (auto & [d, p] : snd) {  // torch: (alpha + 1e-9).reciprocal()
+            std::vector<float> al = f32of(p + ".alpha");
+            for (size_t i = 0; i < al.size(); ++i) {
+                ((float *) d->data)[i] = 1.0f / (al[i] + 1e-9f);
+            }
+        }
         for (auto & [d, t] : f32c) {
             if (t->type == GGML_TYPE_BF16) {
                 ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, (float *) d->data, ggml_nelements(t));
@@ -355,6 +435,16 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                 for (auto & v : f) {
                     v = 1.0f + v;
                 }
+            }
+            if (kind == ".weight.ct") {
+                const int64_t      kc = w->ne[0] * w->ne[1], ci = w->ne[2];
+                std::vector<float> t(n);
+                for (int64_t i = 0; i < ci; ++i) {
+                    for (int64_t j = 0; j < kc; ++j) {
+                        t[i + ci * j] = f[j + kc * i];
+                    }
+                }
+                f.swap(t);
             }
             std::memcpy(d->data, f.data(), n * sizeof(float));
         }
