@@ -270,7 +270,7 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
                                      const float * beta, const float * mA, const int rank, const float * r,
                                      const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
                                      const int64_t T, const int64_t Kp) {
-    __shared__ uint32_t lut[256];
+    __shared__ uint32_t lut[256];  // (a precomputed global table, read through L1, was slower: 168 vs 173 tok/s)
     if (!Q2) {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) {
             lut[i] = ttf_tq1p_lut_entry(i);
@@ -382,8 +382,10 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
         for (int rr = 0; rr < R; ++rr) {
 #pragma unroll
             for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
-                for (int o = 16; o > 0; o >>= 1) {
-                    a[rr][tt] += __shfl_xor_sync(0xffffffff, a[rr][tt], o);
+                if (tt < nt && rr < nr) {  // warp-uniform: only the live tokens and rows
+                    for (int o = 16; o > 0; o >>= 1) {
+                        a[rr][tt] += __shfl_xor_sync(0xffffffff, a[rr][tt], o);
+                    }
                 }
             }
         }
