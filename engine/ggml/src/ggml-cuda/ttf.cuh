@@ -8,6 +8,8 @@ void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * ds, int np);
 bool ggml_cuda_ttf_quant_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * qs, int np);
 void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// decode TTF_MM then ADD(product, res): one kernel writing the sum to add (the product not written)
+bool ggml_cuda_ttf_mm_add(ggml_backend_cuda_context & ctx, ggml_tensor * mm, const ggml_tensor * res, ggml_tensor * add);
 // RMS_NORM, MUL (weight row), then 1..4 TTF_QUANTs of the product (with or without adapters) as one kernel
 // g / u / act: the norm's input is act(g) * u (act 1 silu, 2 relu^2), the product never written
 bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul,

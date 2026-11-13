@@ -5201,6 +5201,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    static const bool ttf_no_mm_add = getenv("TTF_NO_MMADD") != nullptr;
+    if (node->op == GGML_OP_TTF_MM && !ttf_no_mm_add && node->src[6] == nullptr &&
+            ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        // TTF: a decode TTF_MM and the ADD of its product (the residual) as one kernel
+        const int j = ggml_cuda_next_compute(cgraph, i);
+        ggml_tensor * ad = j > 0 ? cgraph->nodes[j] : nullptr;
+        bool ok = ad && ad->op == GGML_OP_ADD &&
+                  (ggml_cuda_strip_views(ad->src[0]) == node) != (ggml_cuda_strip_views(ad->src[1]) == node);
+        for (int k = i + 1; ok && k < j; ++k) {  // the views between: one use each, of the product
+            ok = ggml_cuda_strip_views(cgraph->nodes[k]) == node && ggml_node_get_use_count(cgraph, k) <= 1 &&
+                 !(cgraph->nodes[k]->flags & GGML_TENSOR_FLAG_OUTPUT);
+        }
+        if (ok) {
+            const ggml_tensor * res = ggml_cuda_strip_views(ad->src[0]) == node ? ad->src[1] : ad->src[0];
+            if (ggml_cuda_ttf_mm_add(*cuda_ctx, node, res, ad)) {
+                return j - i;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_RMS_NORM) {
         ggml_cuda_gdn_out_norm p;
         const int last = ggml_cuda_gdn_out_norm_match(cgraph, i, p);

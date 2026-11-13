@@ -569,7 +569,7 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
                                                    const int64_t ldq, const float * beta, const float * mA,
                                                    const int rank, const float * r, const float * b, const float * acc,
                                                    const bool bf16, float * out, const int64_t N, const int64_t T,
-                                                   const int64_t Kp, const int64_t bx) {
+                                                   const int64_t Kp, const int64_t bx, const float * res) {
     __shared__ uint32_t lut[256];  // (a precomputed global table, read through L1, was slower: 168 vs 173 tok/s)
     if (!Q2) {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) {
@@ -825,6 +825,9 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
             if (acc) {
                 y = ttf_rd(__fadd_rn(acc[i], y), bf16);
             }
+            if (res) {  // a following ADD of the product (residual), as ggml's add: not rounded
+                y = __fadd_rn(res[i], y);
+            }
             out[i] = y;
         }
     }
@@ -834,8 +837,8 @@ template <bool Q2, int R, bool H = false>
 static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 7 : 4) ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
                                      const float * beta, const float * mA, const int rank, const float * r,
                                      const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
-                                     const int64_t T, const int64_t Kp) {
-    ttf_mm_body<Q2, R, H>(w, nbw1, qa, ldq, beta, mA, rank, r, b, acc, bf16, out, N, T, Kp, blockIdx.x);
+                                     const int64_t T, const int64_t Kp, const float * res = nullptr) {
+    ttf_mm_body<Q2, R, H>(w, nbw1, qa, ldq, beta, mA, rank, r, b, acc, bf16, out, N, T, Kp, blockIdx.x, res);
 }
 
 // up to TTF_MMMAX parts (each its own weights, activations, epilogue) in one launch: part z owns blocks
@@ -868,7 +871,7 @@ static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 7 : 
     const int        z  = bx >= P.p[2].bx0 ? 2 : bx >= P.p[1].bx0 ? 1 : 0;  // unused parts: bx0 = INT_MAX
     const ttf_mmpart q  = z == 0 ? P.p[0] : z == 1 ? P.p[1] : P.p[2];
     ttf_mm_body<Q2, R, H>(q.w, q.nbw1, q.qa, q.ldq, q.beta, q.mA, q.rank, q.r, q.b, q.acc, bf16, q.out, q.N, T, q.Kp,
-                       bx - q.bx0);
+                          bx - q.bx0, nullptr);
 }
 
 // int8 tensor-core path for T >= TTF_MMA_MIN_T (sm_80+): mma.sync m16n8k32 s8.s8.s32. Each 32-trit plane of a weight
@@ -997,7 +1000,8 @@ static bool ttf_mm_no_half() {
     return d;
 }
 
-void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// res / out: the product plus res (a following ADD) written to out instead of dst (decode-sized only)
+static void ttf_mm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const float * res, float * out_o) {
     const ggml_tensor * w   = dst->src[0];
     const ggml_tensor * qa  = dst->src[1];
     const ggml_tensor * be  = dst->src[2];
@@ -1020,7 +1024,7 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int     nsm = ggml_cuda_info().devices[ctx.device].nsm;
     // MMA only when its grid (one block per 64 rows x 8 tokens at least) can fill the GPU; else the SIMT kernel, which
     // splits rows finer
-    if (T >= TTF_MMA_MIN_T && ampere_mma_available(cc) && mgx * ((T + 7) / 8) >= nsm && !getenv("TTF_NO_MMA")) {
+    if (!res && T >= TTF_MMA_MIN_T && ampere_mma_available(cc) && mgx * ((T + 7) / 8) >= nsm && !getenv("TTF_NO_MMA")) {
         const int64_t gx = mgx;
         auto          go = [&](auto kern, const int tb) {
             const dim3 grid((unsigned) gx, (unsigned) ((T + tb - 1) / tb));
@@ -1058,7 +1062,7 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (const uint8_t *) w->data, w->nb[1], (const char *) qa->data, qa->nb[1], (const float *) be->data,
             mA ? (const float *) mA->data : nullptr, rank, r ? (const float *) r->data : nullptr,
             b ? (const float *) b->data : nullptr, acc ? (const float *) acc->data : nullptr, bf16,
-            (float *) dst->data, N, T, Kp);
+            out_o ? out_o : (float *) dst->data, N, T, Kp, res);
     };
     if (q2) {
         H ? go(ttf_mm_kernel<true, 4, true>)
@@ -1068,6 +1072,20 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
           : (R == 4 ? go(ttf_mm_kernel<false, 4>) : go(ttf_mm_kernel<false, 1>));
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ttf_mm_launch(ctx, dst, nullptr, nullptr);
+}
+
+bool ggml_cuda_ttf_mm_add(ggml_backend_cuda_context & ctx, ggml_tensor * mm, const ggml_tensor * res, ggml_tensor * add) {
+    if (ggml_nrows(mm->src[1]) > TTF_MM_TOK || res->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(res) || !ggml_is_contiguous(add) || ggml_nelements(res) != ggml_nelements(mm) ||
+            !ggml_are_same_shape(res, add) || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    ttf_mm_launch(ctx, mm, (const float *) res->data, (float *) add->data);
+    return true;
 }
 
 // TTF_MM nodes ds[0..np) of one decode step (T <= TTF_MM_TOK, the SIMT kernel, same weight layout and rounding) in
