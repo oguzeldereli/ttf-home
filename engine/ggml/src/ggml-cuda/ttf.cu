@@ -24,7 +24,36 @@ static __device__ __forceinline__ float ttf_rd(const float v, const bool bf16) {
     return bf16 ? ttf_rbf(v) : v;
 }
 
-// xc_k as the CPU computes it (steps 0-2)
+// the input x_k: x itself, or act(g_k) * u_k with ggml-cuda's unary formulas (op_silu, op_relu_sqr), as the unfused
+// UNARY [SQR] MUL nodes compute it (a fused MLP gate in front of a quantisation)
+#define TTF_ACT_NONE  0
+#define TTF_ACT_SILU  1
+#define TTF_ACT_RELU2 2
+static __device__ __forceinline__ float ttf_act(const float x, const int act) {
+    if (act == TTF_ACT_SILU) {
+        return x / (1.0f + expf(-x));
+    }
+    const float r = fmaxf(x, 0.0f);
+    return r * r;
+}
+
+static __device__ __forceinline__ float ttf_xin(const float * g, const float * u, const int act, const int64_t k) {
+    return act == TTF_ACT_NONE ? g[k] : ttf_act(g[k], act) * u[k];
+}
+
+// xc_k as the CPU computes it (steps 0-2) from the input value v = x_k
+static __device__ __forceinline__ float ttf_xc_v(const float v, const float * mu, const float * c, const int64_t k,
+                                                 const bool bf16) {
+    float t = ttf_rd(v, bf16);
+    if (mu) {
+        t = ttf_rd(__fsub_rn(t, mu[k]), bf16);
+    }
+    if (c) {
+        t = ttf_rd(__fmul_rn(t, c[k]), bf16);
+    }
+    return t;
+}
+
 static __device__ __forceinline__ float ttf_xc(const float * x, const float * mu, const float * c, const int64_t k,
                                                const bool bf16) {
     float t = ttf_rd(x[k], bf16);
@@ -165,7 +194,8 @@ struct ttf_qparts {
 };
 
 static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, const int64_t K, const bool bf16,
-                                        const int xsz, const ttf_qparts P) {
+                                        const int xsz, const ttf_qparts P, const char * ux, const int64_t nbu1,
+                                        const int act) {
     __shared__ float sf[32];
     __shared__ int   si[32];
     const int        z    = blockIdx.z;  // static indices: the parameters stay in the parameter bank
@@ -179,6 +209,7 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
     const int        rank = q.rank;
     const int64_t    row = blockIdx.x;
     const float *    xr  = (const float *) (x + row * nbx1);
+    const float *    ur  = act != TTF_ACT_NONE ? (const float *) (ux + row * nbu1) : nullptr;
     char *           o   = dst + row * nbd1;
     if (blockIdx.y > 0) {
         const int lane = threadIdx.x % WARP_SIZE;
@@ -188,7 +219,7 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
         const bool staged = xsz > 0;
         if (staged) {
             for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
-                xs[k] = ttf_xc(xr, mu, c, k, bf16);
+                xs[k] = ttf_xc_v(ttf_xin(xr, ur, act, k), mu, c, k, bf16);
             }
             __syncthreads();
         }
@@ -196,7 +227,7 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
             return;
         }
         const float * bj = mB + (int64_t) j * K;
-        const float   s  = ttf_adapter_dot([&](int64_t k) { return staged ? xs[k] : ttf_xc(xr, mu, c, k, bf16); }, bj, K, lane);
+        const float   s  = ttf_adapter_dot([&](int64_t k) { return staged ? xs[k] : ttf_xc_v(ttf_xin(xr, ur, act, k), mu, c, k, bf16); }, bj, K, lane);
         if (lane == 0) {
             *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(s, bf16);
         }
@@ -212,12 +243,12 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
 #pragma unroll
         for (int u = 0; u < TTF_QV; ++u) {
             const int64_t k = threadIdx.x + (int64_t) u * blockDim.x;
-            xv[u]           = k < K ? ttf_xc(xr, mu, c, k, bf16) : 0.0f;
+            xv[u]           = k < K ? ttf_xc_v(ttf_xin(xr, ur, act, k), mu, c, k, bf16) : 0.0f;
             am              = fmaxf(am, fabsf(xv[u]));
         }
     } else {
         for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
-            am = fmaxf(am, fabsf(ttf_xc(xr, mu, c, k, bf16)));
+            am = fmaxf(am, fabsf(ttf_xc_v(ttf_xin(xr, ur, act, k), mu, c, k, bf16)));
         }
     }
     am             = ttf_block_max(am, sf);
@@ -244,7 +275,7 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
     for (int64_t k = threadIdx.x; k < Kp; k += blockDim.x) {
         int q = 0;
         if (k < K) {
-            const float t = rintf(__fdiv_rn(ttf_xc(xr, mu, c, k, bf16), s));
+            const float t = rintf(__fdiv_rn(ttf_xc_v(ttf_xin(xr, ur, act, k), mu, c, k, bf16), s));
             q             = (int) fminf(127.0f, fmaxf(-128.0f, t));
         }
         o[k] = (char) q;
@@ -258,8 +289,10 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
 }
 
 // the TTF_QUANT nodes qs[0..np) all on the same x (same shape and rounding), one launch
-static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * const * qs, const int np) {
-    const ggml_tensor * x    = qs[0]->src[0];
+// act: the quants' input is act(g) * u (g, u: same shape as the input), the product never written
+static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * const * qs, const int np,
+                             const ggml_tensor * g = nullptr, const ggml_tensor * u = nullptr, const int act = 0) {
+    const ggml_tensor * x    = act ? g : qs[0]->src[0];
     const bool          bf16 = ggml_get_op_params_i32(qs[0], 1) != 0;
     GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
     GGML_ASSERT(ggml_nrows(x) == x->ne[1]);  // 2-d input (the builder reshapes)
@@ -289,12 +322,30 @@ static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * cons
     const dim3 grid((unsigned) rows, 1 + (rmax + nth / WARP_SIZE - 1) / (nth / WARP_SIZE), (unsigned) np);
     // adapter blocks stage xc in shared memory when it fits (48 KB)
     const int xsz = rmax > 0 && x->ne[0] * (int64_t) sizeof(float) <= 48 * 1024 ? (int) (x->ne[0] * sizeof(float)) : 0;
-    ttf_quant_kernel<<<grid, nth, xsz, ctx.stream()>>>((const char *) x->data, x->nb[1], x->ne[0], bf16, xsz, P);
+    ttf_quant_kernel<<<grid, nth, xsz, ctx.stream()>>>((const char *) x->data, x->nb[1], x->ne[0], bf16, xsz, P,
+                                                       act ? (const char *) u->data : nullptr, act ? u->nb[1] : 0, act);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ttf_quant_launch(ctx, &dst, 1);
+}
+
+bool ggml_cuda_ttf_act_quant(ggml_backend_cuda_context & ctx, const ggml_tensor * g, const ggml_tensor * u, int act,
+                             ggml_tensor * const * qs, int np) {
+    const ggml_tensor * x = qs[0]->src[0];
+    if (np < 1 || np > TTF_QMAX || g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || g->ne[0] != x->ne[0] ||
+            ggml_nrows(g) != x->ne[1] || ggml_nrows(u) != x->ne[1] || u->ne[0] != x->ne[0] || g->nb[0] != 4 ||
+            u->nb[0] != 4 || ggml_nrows(g) != g->ne[1] || ggml_nrows(u) != u->ne[1]) {
+        return false;
+    }
+    for (int p = 1; p < np; ++p) {
+        if (ggml_get_op_params_i32(qs[p], 1) != ggml_get_op_params_i32(qs[0], 1)) {
+            return false;
+        }
+    }
+    ttf_quant_launch(ctx, qs, np, g, u, act);
+    return true;
 }
 
 bool ggml_cuda_ttf_quant_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * qs, int np) {
@@ -319,7 +370,8 @@ bool ggml_cuda_ttf_quant_multi(ggml_backend_cuda_context & ctx, ggml_tensor * co
 // shared memory and makes BS / 32 of the part's adapter down projections (ttf_adapter_dot, as ttf_quant_kernel)
 template <int BS, int VPT>
 static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, const float * mul, const float eps,
-                                             const int K, const bool bf16, const ttf_qparts P) {
+                                             const int K, const bool bf16, const ttf_qparts P, const float * ux,
+                                             const int64_t su, const int act) {
     __shared__ float sf[32];
     __shared__ int   si[32];
     const int        z    = blockIdx.z;
@@ -339,6 +391,13 @@ static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, 
         const int i = tid + k * BS;
         if (i < n4) {
             xs[k] = x4[i];
+            if (act != TTF_ACT_NONE) {  // the norm's input is act(g) * u
+                const float4 u4 = ((const float4 *) (ux + blockIdx.x * su))[i];
+                xs[k].x         = ttf_act(xs[k].x, act) * u4.x;
+                xs[k].y         = ttf_act(xs[k].y, act) * u4.y;
+                xs[k].z         = ttf_act(xs[k].z, act) * u4.z;
+                xs[k].w         = ttf_act(xs[k].w, act) * u4.w;
+            }
             tmp += xs[k].x * xs[k].x + xs[k].y * xs[k].y + xs[k].z * xs[k].z + xs[k].w * xs[k].w;
         }
     }
@@ -426,8 +485,13 @@ static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, 
 // rms: RMS_NORM on x [K, rows] F32 (rows contiguous); mul: its MUL by a weight row; q: TTF_QUANT of the product (or
 // of a reshape of it), no adapter. False when the shapes do not fit the kernel (the caller then runs the nodes).
 bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul,
-                              ggml_tensor * const * qs, const int np) {
-    const ggml_tensor * x = rms->src[0];
+                              ggml_tensor * const * qs, const int np, const ggml_tensor * g, const ggml_tensor * u,
+                              const int act) {
+    const ggml_tensor * x = act ? g : rms->src[0];
+    if (act && (u->type != GGML_TYPE_F32 || !ggml_are_same_shape(u, g) || u->nb[0] != 4 || u->nb[1] % 16 != 0 ||
+                ((uintptr_t) u->data % 16) != 0 || ggml_nrows(u) != u->ne[1] || !ggml_are_same_shape(g, rms->src[0]))) {
+        return false;
+    }
     const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
     const int64_t       K = x->ne[0], rows = ggml_nrows(x);
     if (np < 1 || np > TTF_QMAX || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || K % 4 != 0 || K > 16384 ||
@@ -466,7 +530,8 @@ bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor
     auto go = [&](auto kern, const int bs) {
         const dim3 grid((unsigned) rows, 1 + (rmax + bs / WARP_SIZE - 1) / (bs / WARP_SIZE), (unsigned) np);
         kern<<<grid, bs, xsz, ctx.stream()>>>((const float *) x->data, x->nb[1] / 4, (const float *) w->data, eps,
-                                              (int) K, bf16, P);
+                                              (int) K, bf16, P, act ? (const float *) u->data : nullptr,
+                                              act ? u->nb[1] / 4 : 0, act);
     };
     // rms_norm_f32_dispatch's vec choices
     if (n4 <= 32) {
