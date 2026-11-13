@@ -10,6 +10,7 @@
 #include "ttf.cuh"
 
 #include <cuda_bf16.h>
+#include <climits>
 
 #define TTF_QROW_TAIL 32
 #define TTF_MM_WARPS  4   // rows per block, one warp each
@@ -108,11 +109,34 @@ static __device__ __forceinline__ int ttf_block_sum_i(int v, int * sh) {
 // one block per row; 256 threads
 // grid (rows, 1 + ceil(rank / 8)), 256 threads: blockIdx.y 0 makes the codes, s and qsum; blockIdx.y > 0 makes 8 of
 // the adapter's down projections u_j = rD(xc . mB_j), one warp each, in dot_f32_64's order
-static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, const float * mu, const float * c,
-                                        const float * mB, const int64_t K, const int64_t Kp, const int rank,
-                                        const bool bf16, char * dst, const int64_t nbd1, const int xsz) {
+// up to TTF_QMAX quantisations of one input in one launch (parts on one input: own mu / c / adapter), blockIdx.z
+struct ttf_qpart {
+    const float * mu;
+    const float * c;
+    const float * mB;
+    char *        dst;
+    int64_t       nbd1;
+    int64_t       Kp;
+    int           rank;
+};
+#define TTF_QMAX 4
+struct ttf_qparts {
+    ttf_qpart p[TTF_QMAX];
+};
+
+static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, const int64_t K, const bool bf16,
+                                        const int xsz, const ttf_qparts P) {
     __shared__ float sf[32];
     __shared__ int   si[32];
+    const int        z    = blockIdx.z;  // static indices: the parameters stay in the parameter bank
+    const ttf_qpart  q    = z == 0 ? P.p[0] : z == 1 ? P.p[1] : z == 2 ? P.p[2] : P.p[3];
+    const float *    mu   = q.mu;
+    const float *    c    = q.c;
+    const float *    mB   = q.mB;
+    char *           dst  = q.dst;
+    const int64_t    nbd1 = q.nbd1;
+    const int64_t    Kp   = q.Kp;
+    const int        rank = q.rank;
     const int64_t    row = blockIdx.x;
     const float *    xr  = (const float *) (x + row * nbx1);
     char *           o   = dst + row * nbd1;
@@ -225,31 +249,59 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
     }
 }
 
-void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * x  = dst->src[0];
-    const ggml_tensor * mu = dst->src[1];
-    const ggml_tensor * c  = dst->src[2];
-    const ggml_tensor * mB = dst->src[3];
-    const int64_t       Kp   = ggml_get_op_params_i32(dst, 0);
-    const bool          bf16 = ggml_get_op_params_i32(dst, 1) != 0;
-    const int           rank = mB ? (int) mB->ne[1] : 0;
+// the TTF_QUANT nodes qs[0..np) all on the same x (same shape and rounding), one launch
+static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * const * qs, const int np) {
+    const ggml_tensor * x    = qs[0]->src[0];
+    const bool          bf16 = ggml_get_op_params_i32(qs[0], 1) != 0;
     GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float));
-    GGML_ASSERT(ggml_nrows(x) == x->ne[1] && ggml_is_contiguous(dst));  // 2-d input (the builder reshapes)
+    GGML_ASSERT(ggml_nrows(x) == x->ne[1]);  // 2-d input (the builder reshapes)
+    GGML_ASSERT(np >= 1 && np <= TTF_QMAX);
     const int64_t rows = x->ne[1];
     if (rows == 0) {
         return;
     }
+    ttf_qparts P = {};
+    int        rmax = 0;
+    for (int p = 0; p < np; ++p) {
+        const ggml_tensor * d  = qs[p];
+        const ggml_tensor * mB = d->src[3];
+        GGML_ASSERT(ggml_is_contiguous(d));
+        P.p[p].mu   = d->src[1] ? (const float *) d->src[1]->data : nullptr;
+        P.p[p].c    = d->src[2] ? (const float *) d->src[2]->data : nullptr;
+        P.p[p].mB   = mB ? (const float *) mB->data : nullptr;
+        P.p[p].dst  = (char *) d->data;
+        P.p[p].nbd1 = d->nb[1];
+        P.p[p].Kp   = ggml_get_op_params_i32(d, 0);
+        P.p[p].rank = mB ? (int) mB->ne[1] : 0;
+        rmax        = std::max(rmax, P.p[p].rank);
+    }
     // few rows (decode): 1024 threads per row, the row held in registers; many rows: 256 (more blocks per SM)
     const int  nsm = ggml_cuda_info().devices[ctx.device].nsm;
     const int  nth = rows < nsm ? 1024 : 256;
-    const dim3 grid((unsigned) rows, 1 + (rank + nth / WARP_SIZE - 1) / (nth / WARP_SIZE));
+    const dim3 grid((unsigned) rows, 1 + (rmax + nth / WARP_SIZE - 1) / (nth / WARP_SIZE), (unsigned) np);
     // adapter blocks stage xc in shared memory when it fits (48 KB)
-    const int xsz = rank > 0 && x->ne[0] * (int64_t) sizeof(float) <= 48 * 1024 ? (int) (x->ne[0] * sizeof(float)) : 0;
-    ttf_quant_kernel<<<grid, nth, xsz, ctx.stream()>>>(
-        (const char *) x->data, x->nb[1], mu ? (const float *) mu->data : nullptr,
-        c ? (const float *) c->data : nullptr, mB ? (const float *) mB->data : nullptr, x->ne[0], Kp, rank, bf16,
-        (char *) dst->data, dst->nb[1], xsz);
+    const int xsz = rmax > 0 && x->ne[0] * (int64_t) sizeof(float) <= 48 * 1024 ? (int) (x->ne[0] * sizeof(float)) : 0;
+    ttf_quant_kernel<<<grid, nth, xsz, ctx.stream()>>>((const char *) x->data, x->nb[1], x->ne[0], bf16, xsz, P);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ttf_quant_launch(ctx, &dst, 1);
+}
+
+bool ggml_cuda_ttf_quant_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * qs, int np) {
+    if (np < 2 || np > TTF_QMAX) {
+        return false;
+    }
+    for (int p = 1; p < np; ++p) {
+        if (qs[p]->src[0]->data != qs[0]->src[0]->data || !ggml_are_same_shape(qs[p]->src[0], qs[0]->src[0]) ||
+                qs[p]->src[0]->nb[1] != qs[0]->src[0]->nb[1] ||
+                ggml_get_op_params_i32(qs[p], 1) != ggml_get_op_params_i32(qs[0], 1)) {
+            return false;
+        }
+    }
+    ttf_quant_launch(ctx, qs, np);
+    return true;
 }
 
 // RMS_NORM -> MUL (weight row) -> TTF_QUANT (no adapter) as one kernel, one block per row. The norm is ggml's
@@ -394,10 +446,11 @@ static __device__ __forceinline__ uint32_t ttf_tq1p_lut_entry(const uint32_t b) 
 // grid (ceil(N / (WARPS R)), <= ceil(T / TOK)); block WARPS warps, R rows each (R = 4 when T > TOK: each activation load
 // then feeds 4 rows), TOK tokens per pass; the block strides over its token chunks
 template <bool Q2, int R>
-static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
-                                     const float * beta, const float * mA, const int rank, const float * r,
-                                     const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
-                                     const int64_t T, const int64_t Kp) {
+static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int64_t nbw1, const char * qa,
+                                                   const int64_t ldq, const float * beta, const float * mA,
+                                                   const int rank, const float * r, const float * b, const float * acc,
+                                                   const bool bf16, float * out, const int64_t N, const int64_t T,
+                                                   const int64_t Kp, const int64_t bx) {
     __shared__ uint32_t lut[256];  // (a precomputed global table, read through L1, was slower: 168 vs 173 tok/s)
     if (!Q2) {
         for (int i = threadIdx.x; i < 256; i += blockDim.x) {
@@ -406,7 +459,7 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
         __syncthreads();
     }
     const int     lane = threadIdx.x % WARP_SIZE;
-    const int64_t n0   = ((int64_t) blockIdx.x * TTF_MM_WARPS + threadIdx.x / WARP_SIZE) * R;
+    const int64_t n0   = (bx * TTF_MM_WARPS + threadIdx.x / WARP_SIZE) * R;
     if (n0 >= N) {
         return;
     }
@@ -587,6 +640,47 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
             out[i] = y;
         }
     }
+}
+
+template <bool Q2, int R>
+static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
+                                     const float * beta, const float * mA, const int rank, const float * r,
+                                     const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
+                                     const int64_t T, const int64_t Kp) {
+    ttf_mm_body<Q2, R>(w, nbw1, qa, ldq, beta, mA, rank, r, b, acc, bf16, out, N, T, Kp, blockIdx.x);
+}
+
+// up to TTF_MMMAX parts (each its own weights, activations, epilogue) in one launch: part z owns blocks
+// [bx0, next bx0) of grid.x
+struct ttf_mmpart {
+    const uint8_t * w;
+    int64_t         nbw1;
+    const char *    qa;
+    int64_t         ldq;
+    const float *   beta;
+    const float *   mA;
+    const float *   r;
+    const float *   b;
+    const float *   acc;
+    float *         out;
+    int64_t         N;
+    int64_t         Kp;
+    int             rank;
+    int             bx0;
+};
+#define TTF_MMMAX 3
+struct ttf_mmparts {
+    ttf_mmpart p[TTF_MMMAX];
+};
+
+// register cap as the single-part kernel gets (128 with R = 4): the part selection otherwise costs occupancy
+template <bool Q2, int R>
+static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 4 ? 4 : 7) ttf_mm_multi_kernel(const ttf_mmparts P, const bool bf16, const int64_t T) {
+    const int        bx = blockIdx.x;
+    const int        z  = bx >= P.p[2].bx0 ? 2 : bx >= P.p[1].bx0 ? 1 : 0;  // unused parts: bx0 = INT_MAX
+    const ttf_mmpart q  = z == 0 ? P.p[0] : z == 1 ? P.p[1] : P.p[2];
+    ttf_mm_body<Q2, R>(q.w, q.nbw1, q.qa, q.ldq, q.beta, q.mA, q.rank, q.r, q.b, q.acc, bf16, q.out, q.N, T, q.Kp,
+                       bx - q.bx0);
 }
 
 // int8 tensor-core path for T >= TTF_MMA_MIN_T (sm_80+): mma.sync m16n8k32 s8.s8.s32. Each 32-trit plane of a weight
@@ -776,4 +870,79 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         R == 4 ? go(ttf_mm_kernel<false, 4>) : go(ttf_mm_kernel<false, 1>);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+// TTF_MM nodes ds[0..np) of one decode step (T <= TTF_MM_TOK, the SIMT kernel, same weight layout and rounding) in
+// one launch; false if they do not qualify
+bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * ds, int np) {
+    if (np < 2 || np > TTF_MMMAX) {
+        return false;
+    }
+    const ggml_type wt   = ds[0]->src[0]->type;
+    const int64_t   T    = ggml_nrows(ds[0]->src[1]);
+    const int32_t   bf16 = ggml_get_op_params_i32(ds[0], 0);
+    if (T == 0 || T > TTF_MM_TOK) {
+        return false;
+    }
+    ttf_mmparts P = {};
+    int64_t     Ntot = 0;
+    for (int p = 0; p < TTF_MMMAX; ++p) {
+        P.p[p].bx0 = INT_MAX;
+    }
+    for (int p = 0; p < np; ++p) {
+        const ggml_tensor * d   = ds[p];
+        const ggml_tensor * w   = d->src[0];
+        const ggml_tensor * qa  = d->src[1];
+        const ggml_tensor * acc = d->src[6];
+        if (w->type != wt || ggml_nrows(qa) != T || ggml_get_op_params_i32(d, 0) != bf16 || !ggml_is_contiguous(qa) ||
+                !ggml_is_contiguous(d) || (acc && !ggml_is_contiguous(acc))) {
+            return false;
+        }
+        Ntot += w->ne[1];
+    }
+    static const int64_t r4_min_n = getenv("TTF_MM_R4_N") ? atoll(getenv("TTF_MM_R4_N")) : 2048;
+    static const int64_t r4_tot_n = getenv("TTF_MM_R4_TOT") ? atoll(getenv("TTF_MM_R4_TOT")) : (int64_t) 1 << 40;
+    // rows per warp as each part alone would use (all parts must agree), or 4 when the group is tall enough
+    int R = 0;
+    for (int p = 0; p < np; ++p) {
+        const int Rp = ds[p]->src[0]->ne[1] >= r4_min_n || Ntot >= r4_tot_n ? 4 : 1;
+        if (R != 0 && Rp != R) {
+            return false;
+        }
+        R = Rp;
+    }
+    const bool q2 = wt == GGML_TYPE_I8;
+    int        bx = 0;
+    for (int p = 0; p < np; ++p) {
+        const ggml_tensor * d  = ds[p];
+        const ggml_tensor * w  = d->src[0];
+        const ggml_tensor * qa = d->src[1];
+        const ggml_tensor * mA = d->src[3];
+        ttf_mmpart &        q  = P.p[p];
+        q.w    = (const uint8_t *) w->data;
+        q.nbw1 = w->nb[1];
+        q.qa   = (const char *) qa->data;
+        q.ldq  = qa->nb[1];
+        q.beta = (const float *) d->src[2]->data;
+        q.mA   = mA ? (const float *) mA->data : nullptr;
+        q.rank = mA ? (int) mA->ne[0] : 0;
+        q.r    = d->src[4] ? (const float *) d->src[4]->data : nullptr;
+        q.b    = d->src[5] ? (const float *) d->src[5]->data : nullptr;
+        q.acc  = d->src[6] ? (const float *) d->src[6]->data : nullptr;
+        q.out  = (float *) d->data;
+        q.N    = w->ne[1];
+        q.Kp   = q2 ? 4 * w->ne[0] : w->ne[0];
+        q.bx0  = bx;
+        bx += (int) ((q.N + TTF_MM_WARPS * R - 1) / (TTF_MM_WARPS * R));
+    }
+    const dim3 grid((unsigned) bx, 1);
+    const dim3 block(TTF_MM_WARPS * WARP_SIZE);
+    auto       go = [&](auto kern) { kern<<<grid, block, 0, ctx.stream()>>>(P, bf16 != 0, T); };
+    if (q2) {
+        R == 4 ? go(ttf_mm_multi_kernel<true, 4>) : go(ttf_mm_multi_kernel<true, 1>);
+    } else {
+        R == 4 ? go(ttf_mm_multi_kernel<false, 4>) : go(ttf_mm_multi_kernel<false, 1>);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }

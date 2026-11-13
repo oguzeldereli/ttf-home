@@ -6,6 +6,7 @@
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-impl.h"  // ggml_graph_view (TTF_PROF_OPS)
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -14,12 +15,152 @@
 #include <limits>
 #include <set>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace ttf {
 
 namespace {
 
 constexpr size_t GRAPH_SIZE = 32768;
+
+
+// TTF_MM nodes after the quant grouping: a later TTF_MM whose inputs are all computed by the first one's position
+// (its activations from the grouped quants, the rest leaves) moves next to it (up to 3), so the CUDA backend runs a
+// decode step's q / k / v and gate / up as one launch each. Same rule: only independent nodes change order.
+static void group_mms(ggml_cgraph * gf) {
+    constexpr int SCAN = 96, GMAX = 3;
+    ggml_tensor ** nodes = gf->nodes;
+    const int      n     = gf->n_nodes;
+    std::unordered_map<const ggml_tensor *, int> at;
+    auto index = [&]() {
+        at.clear();
+        for (int k = 0; k < n; ++k) {
+            at[nodes[k]] = k;
+        }
+    };
+    auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    index();
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * a = nodes[i];
+        if (a->op != GGML_OP_TTF_MM) {
+            continue;
+        }
+        int pos = i + 1;
+        int G   = 1;
+        for (int j = pos; j < n && j < pos + SCAN && G < GMAX; ++j) {
+            ggml_tensor * t = nodes[j];
+            if (t->op != GGML_OP_TTF_MM || t->src[0]->type != a->src[0]->type ||
+                    ggml_get_op_params_i32(t, 0) != ggml_get_op_params_i32(a, 0)) {
+                continue;
+            }
+            bool ok = true;
+            for (int si = 0; si < GGML_MAX_SRC && ok; ++si) {
+                const ggml_tensor * s = t->src[si];
+                if (!s) {
+                    continue;
+                }
+                for (const ggml_tensor * u : { s, base(s) }) {
+                    auto it = at.find(u);
+                    ok = ok && (it == at.end() || it->second < pos);
+                }
+                for (int k = pos; k < j && ok; ++k) {  // nothing between writes an input in place
+                    const ggml_tensor * v = nodes[k];
+                    ok = !(v->view_src && v->view_src == base(s) && v->op != GGML_OP_RESHAPE && v->op != GGML_OP_VIEW &&
+                           v->op != GGML_OP_PERMUTE && v->op != GGML_OP_TRANSPOSE && v->op != GGML_OP_NONE);
+                }
+            }
+            if (!ok) {
+                continue;
+            }
+            std::rotate(nodes + pos, nodes + j, nodes + j + 1);
+            index();
+            ++pos;
+            ++G;
+        }
+        i = pos - 1;
+    }
+}
+
+// TTF_QUANT nodes on the same input (parts with their own mu / c / adapter: q / k / v, gate / up) moved next to the
+// first of them, before allocation, so the CUDA backend runs them as one launch. A quant depends on its input (views
+// of it) and leaves only, so it can move up to any point after the first; a node between that writes the input in
+// place stops the scan. The values do not change (only the order of independent nodes).
+static void group_quants(ggml_cgraph * gf) {
+    constexpr int SCAN = 96, GMAX = 4;
+    ggml_tensor ** nodes = gf->nodes;
+    const int      n     = gf->n_nodes;
+    auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    auto offs = [](const ggml_tensor * t) { return t->view_src ? t->view_offs : (size_t) 0; };
+    auto same = [&](const ggml_tensor * a, const ggml_tensor * b) {
+        const ggml_tensor * x = a->src[0];
+        const ggml_tensor * y = b->src[0];
+        return base(x) == base(y) && offs(x) == offs(y) && ggml_are_same_shape(x, y) && x->nb[1] == y->nb[1] &&
+               ggml_is_contiguous(x) && ggml_is_contiguous(y) &&
+               ggml_get_op_params_i32(a, 1) == ggml_get_op_params_i32(b, 1);
+    };
+    auto pure_view = [](const ggml_tensor * t) {
+        return t->op == GGML_OP_NONE || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW ||
+               t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE;
+    };
+    std::vector<ggml_tensor *> moved;
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * a = nodes[i];
+        if (a->op != GGML_OP_TTF_QUANT) {
+            continue;
+        }
+        const ggml_tensor * xb  = base(a->src[0]);
+        int                 pos = i + 1;
+        int                 G   = 1;
+        for (int j = pos; j < n && j < pos + SCAN && G < GMAX; ++j) {
+            ggml_tensor * t = nodes[j];
+            if (t->view_src == xb && !pure_view(t)) {
+                break;  // writes the input in place
+            }
+            if (t->op != GGML_OP_TTF_QUANT || !same(a, t)) {
+                continue;
+            }
+            bool movable = true;  // mu / c / adapter: leaves (weights), never nodes between
+            for (int k = pos; k < j && movable; ++k) {
+                for (int si = 1; si < GGML_MAX_SRC; ++si) {
+                    movable = movable && (t->src[si] == nullptr || t->src[si] != nodes[k]);
+                }
+            }
+            if (!movable) {
+                continue;
+            }
+            // t's view chain of the input (graph nodes between pos and j) moves with it, in order
+            std::vector<int> mv;
+            for (const ggml_tensor * v = t->src[0]; v && v->view_src; v = v->src[0]) {
+                for (int k = pos; k < j; ++k) {
+                    if (nodes[k] == v) {
+                        mv.push_back(k);
+                    }
+                }
+            }
+            std::sort(mv.begin(), mv.end());
+            mv.push_back(j);
+            moved.clear();
+            for (int k : mv) {
+                moved.push_back(nodes[k]);
+            }
+            int w = j;  // compact [pos, j] without the moved nodes, from the back
+            for (int k = j, m = (int) mv.size() - 1; k >= pos; --k) {
+                if (m >= 0 && mv[m] == k) {
+                    --m;
+                    continue;
+                }
+                nodes[w--] = nodes[k];
+            }
+            for (size_t k = 0; k < moved.size(); ++k) {
+                nodes[pos + (int) k] = moved[k];
+            }
+            pos += (int) moved.size();
+            j = pos - 1;
+            ++G;
+        }
+        i = pos - 1;
+    }
+}
 
 struct Builder {
     const Model &                        m;
@@ -930,6 +1071,10 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             e.outs.push_back(t);
             e.out_nd.push_back(b.nd.at(o.at("of").get<std::string>()));
             ggml_build_forward_expand(gf, t);
+        }
+        if (m.device != "cpu" && !std::getenv("TTF_NO_QGROUP")) {
+            group_quants(gf);
+            group_mms(gf);
         }
         if (m.device != "cpu") {
             for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {

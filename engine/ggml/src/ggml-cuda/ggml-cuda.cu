@@ -4486,6 +4486,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 // GGML_CUDA_TTF_LINEAR_OFF=1: no fused TTF linear (A/B)
+static bool ggml_cuda_ttf_quant_multi_disabled() {
+    static const bool d = getenv("TTF_NO_QMULTI") != nullptr;
+    return d;
+}
+
 static bool ggml_cuda_ttf_norm_quant_disabled() {
     static const bool d = getenv("TTF_NO_NQ_FUSE") != nullptr;
     return d;
@@ -5048,6 +5053,52 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ok && ggml_cuda_ttf_norm_quant(*cuda_ctx, node, mul, q)) {
                 return jq - i;
             }
+        }
+    }
+
+    if (node->op == GGML_OP_TTF_QUANT && !ggml_cuda_ttf_quant_multi_disabled()) {
+        // TTF: adjacent TTF_QUANT nodes on the same input (the session puts the parts on one input next to each
+        // other: q / k / v, gate / up) in one launch; only views between
+        ggml_tensor * qs[4] = { node };
+        int np = 1, last = i;
+        for (int j = ggml_cuda_next_compute(cgraph, i); j > 0 && np < 4; j = ggml_cuda_next_compute(cgraph, j)) {
+            ggml_tensor * t = cgraph->nodes[j];
+            if (t->op != GGML_OP_TTF_QUANT || t->src[0]->data != node->src[0]->data) {
+                break;
+            }
+            qs[np++] = t;
+            last     = j;
+        }
+        if (np > 1 && ggml_cuda_ttf_quant_multi(*cuda_ctx, qs, np)) {
+            return last - i;
+        }
+    }
+
+    static const bool ttf_no_mm_multi = getenv("TTF_NO_MMMULTI") != nullptr;
+    if (node->op == GGML_OP_TTF_MM && !ttf_no_mm_multi) {
+        // TTF: adjacent TTF_MM nodes of a decode step (the session puts the parts on one input next to each other)
+        // in one launch; only views between
+        ggml_tensor * ds[3] = { node };
+        int np = 1, last = i;
+        for (int j = ggml_cuda_next_compute(cgraph, i); j > 0 && np < 3; j = ggml_cuda_next_compute(cgraph, j)) {
+            ggml_tensor * t = cgraph->nodes[j];
+            if (t->op != GGML_OP_TTF_MM) {
+                break;
+            }
+            bool dep = false;  // a later member must not read an earlier one's output
+            for (int p = 0; p < np; ++p) {
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    dep = dep || (t->src[si] && ggml_cuda_strip_views(t->src[si]) == ds[p]);
+                }
+            }
+            if (dep) {
+                break;
+            }
+            ds[np++] = t;
+            last     = j;
+        }
+        if (np > 1 && ggml_cuda_ttf_mm_multi(*cuda_ctx, ds, np)) {
+            return last - i;
         }
     }
 
