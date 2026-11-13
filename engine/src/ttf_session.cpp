@@ -710,6 +710,7 @@ Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_
 }
 
 Session::~Session() {
+    built.clear();
     for (auto & [k, g] : gmem) {
         ggml_gallocr_free(g.galloc);
     }
@@ -800,99 +801,179 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         S = std::min<int64_t>(max_ctx, (S + 255) / 256 * 256);
     }
 
-    GraphMem & gm = gmem[graph + (T == 1 ? "/1" : "/n")];
-    if (!gm.galloc) {
-        gm.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        gm.gbuf.resize(ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false));
-    }
-    ggml_init_params ip = { gm.gbuf.size(), gm.gbuf.data(), true };
-    ggml_context *   ctx = ggml_init(ip);
-    Builder          b{ m, *this, ctx, {}, {}, {}, nullptr, nullptr, S, T, last_only, m.d_bf16 };
-    std::vector<std::pair<ggml_tensor *, const Tensor *>> sets;
+    // a built graph is kept per (graph, T, S, last_only, input shapes) and reused: inputs and mask are uploaded, nothing
+    // is rebuilt or re-allocated (decode: one per S bucket). Not with TTF_DUMP / TTF_PROF_OPS, nor for T > 64 (prefill
+    // lengths vary; their compute buffers are large)
+    const char * dump_dir   = std::getenv("TTF_DUMP");
+    const bool   prof_by_op = std::getenv("TTF_PROF_OPS") != nullptr;
+    static const bool no_cache = std::getenv("TTF_NO_GRAPH_CACHE") != nullptr;
+    const bool   cacheable  = !dump_dir && !prof_by_op && !no_cache && T <= 64;
+    std::string  key = graph + "|" + std::to_string(T) + "|" + std::to_string(S) + "|" + (last_only ? "1" : "0");
     for (const auto & inp : g.at("inputs")) {
         const std::string name = inp.at("name");
         auto              it   = in.find(name);
         if (it == in.end()) {
             throw std::runtime_error("graph " + graph + ": missing input " + name);
         }
-        const Tensor & h = it->second;
-        int64_t        ne[4] = { 1, 1, 1, 1 };
-        const int      r     = (int) h.shape.size();
-        if (r > 4) {
-            throw std::runtime_error("input rank > 4");
-        }
-        for (int i = 0; i < r; ++i) {
-            ne[r - 1 - i] = h.shape[i];
-        }
-        ggml_tensor * t = ggml_new_tensor(ctx, h.type, std::max(r, 1), ne);
-        ggml_set_name(t, name.c_str());
-        ggml_set_input(t);
-        b.val[name] = t;
-        b.nd[name]  = std::max(r, 1);
-        if (name == "pos") {
-            b.pos = t;
-        }
-        sets.emplace_back(t, &h);
-    }
-    if (!used.empty()) {
-        b.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, T);
-        ggml_set_name(b.mask, "kq_mask");
-        ggml_set_input(b.mask);
-    }
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
-    for (const auto & n : g.at("nodes")) {
-        b.node(n);
-    }
-    // TTF_DUMP=DIR: every IR value of this call to DIR/<name>.bin (f32 / i32 raw) + DIR/index.json (ggml ne)
-    const char * dump_dir = std::getenv("TTF_DUMP");
-    std::map<std::string, ggml_tensor *> dumped;  // views made contiguous for the dump
-    if (dump_dir) {
-        for (auto & [name, t] : b.val) {
-            ggml_tensor * d = ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
-            ggml_set_output(d);
-            ggml_build_forward_expand(gf, d);
-            dumped[name] = d;
+        key += "|" + name + ":" + std::to_string((int) it->second.type);
+        for (int64_t d : it->second.shape) {
+            key += "," + std::to_string(d);
         }
     }
-    for (ggml_tensor * w : b.writes) {
-        ggml_build_forward_expand(gf, w);
+    GraphMem & gm = gmem[graph + (T == 1 ? "/1" : "/n")];  // scratch: metadata for a build, allocator if not kept
+    if (!gm.galloc) {
+        gm.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        gm.gbuf.resize(ggml_tensor_overhead() * GRAPH_SIZE + ggml_graph_overhead_custom(GRAPH_SIZE, false));
     }
-    std::vector<ggml_tensor *> outs;
-    for (const auto & o : g.at("outputs")) {
-        ggml_tensor * t = b.val.at(o.at("of").get<std::string>());
-        if (!ggml_is_contiguous(t)) {
-            t = ggml_cont(ctx, t);
+    std::map<std::string, ggml_tensor *> dumped;  // TTF_DUMP: views made contiguous for the dump
+    std::map<std::string, int>           dump_nd;
+    // build the graph into ctx (graph capacity gsize): inputs, mask, outputs into e
+    auto build = [&](ggml_context * ctx, size_t gsize, Built & e) {
+        Builder b{ m, *this, ctx, {}, {}, {}, nullptr, nullptr, S, T, last_only, m.d_bf16 };
+        for (const auto & inp : g.at("inputs")) {
+            const std::string name = inp.at("name");
+            const Tensor &    h    = in.at(name);
+            int64_t           ne[4] = { 1, 1, 1, 1 };
+            const int         r     = (int) h.shape.size();
+            if (r > 4) {
+                throw std::runtime_error("input rank > 4");
+            }
+            for (int i = 0; i < r; ++i) {
+                ne[r - 1 - i] = h.shape[i];
+            }
+            ggml_tensor * t = ggml_new_tensor(ctx, h.type, std::max(r, 1), ne);
+            ggml_set_name(t, name.c_str());
+            ggml_set_input(t);
+            b.val[name] = t;
+            b.nd[name]  = std::max(r, 1);
+            if (name == "pos") {
+                b.pos = t;
+            }
+            e.inputs.emplace_back(name, t);
         }
-        ggml_set_output(t);
-        outs.push_back(t);
-        ggml_build_forward_expand(gf, t);
-    }
-    if (m.device != "cpu") {
-        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-            ggml_tensor * nd = ggml_graph_node(gf, i);
-            if (!ggml_backend_supports_op(backend, nd)) {
-                ggml_free(ctx);
-                throw std::runtime_error(std::string("op not supported on ") + m.device + ": " + ggml_op_desc(nd) + " (" + nd->name + ")");
+        if (!used.empty()) {
+            b.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, T);
+            ggml_set_name(b.mask, "kq_mask");
+            ggml_set_input(b.mask);
+        }
+        e.mask = b.mask;
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, gsize, false);
+        for (const auto & n : g.at("nodes")) {
+            b.node(n);
+        }
+        // TTF_DUMP=DIR: every IR value of this call to DIR/<name>.bin (f32 / i32 raw) + DIR/index.json (ggml ne)
+        if (dump_dir) {
+            for (auto & [name, t] : b.val) {
+                ggml_tensor * d = ggml_is_contiguous(t) ? t : ggml_cont(ctx, t);
+                ggml_set_output(d);
+                ggml_build_forward_expand(gf, d);
+                dumped[name] = d;
+            }
+            dump_nd = b.nd;
+        }
+        for (ggml_tensor * w : b.writes) {
+            ggml_build_forward_expand(gf, w);
+        }
+        for (const auto & o : g.at("outputs")) {
+            ggml_tensor * t = b.val.at(o.at("of").get<std::string>());
+            if (!ggml_is_contiguous(t)) {
+                t = ggml_cont(ctx, t);
+            }
+            ggml_set_output(t);
+            e.outs.push_back(t);
+            e.out_nd.push_back(b.nd.at(o.at("of").get<std::string>()));
+            ggml_build_forward_expand(gf, t);
+        }
+        if (m.device != "cpu") {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                ggml_tensor * nd = ggml_graph_node(gf, i);
+                if (!ggml_backend_supports_op(backend, nd)) {
+                    throw std::runtime_error(std::string("op not supported on ") + m.device + ": " + ggml_op_desc(nd) +
+                                             " (" + nd->name + ")");
+                }
             }
         }
+        e.gf = gf;
+    };
+    auto scratch_ctx = [&]() {
+        ggml_init_params ip = { gm.gbuf.size(), gm.gbuf.data(), true };
+        return ggml_init(ip);
+    };
+    Built   tmp;  // the not-kept case: scratch metadata, the scratch allocator
+    Built * e   = nullptr;
+    bool    fresh = false;
+    auto    hit = cacheable ? built.find(key) : built.end();
+    if (hit != built.end()) {
+        e = hit->second.get();
+    } else if (cacheable) {
+        // measure in the scratch, then build again into exactly sized metadata kept with the entry
+        Built probe;
+        probe.ctx = scratch_ctx();
+        size_t used_mem = 0, gsize = 0;
+        try {
+            build(probe.ctx, GRAPH_SIZE, probe);
+            const size_t n = (size_t) ggml_graph_n_nodes(probe.gf) + (size_t) probe.gf->n_leafs;
+            gsize          = 64;
+            while (gsize < n + n / 4 + 16) {
+                gsize *= 2;
+            }
+            used_mem = ggml_used_mem(probe.ctx) - ggml_graph_overhead_custom(GRAPH_SIZE, false) +
+                       ggml_graph_overhead_custom(gsize, false) + 64 * 1024;
+        } catch (...) {
+            ggml_free(probe.ctx);
+            probe.ctx = nullptr;
+            throw;
+        }
+        ggml_free(probe.ctx);
+        probe.ctx = nullptr;
+        if (built.size() >= 48) {  // drop the least recently used
+            auto lru = built.begin();
+            for (auto i = built.begin(); i != built.end(); ++i) {
+                lru = i->second->use < lru->second->use ? i : lru;
+            }
+            built.erase(lru);
+        }
+        auto ne  = std::make_unique<Built>();
+        ne->gbuf.resize(used_mem);
+        ggml_init_params ip = { ne->gbuf.size(), ne->gbuf.data(), true };
+        ne->ctx = ggml_init(ip);
+        build(ne->ctx, gsize, *ne);
+        ne->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        e          = ne.get();
+        built[key] = std::move(ne);
+        fresh      = true;
+    } else {
+        tmp.ctx = scratch_ctx();
+        try {
+            build(tmp.ctx, GRAPH_SIZE, tmp);
+        } catch (...) {
+            ggml_free(tmp.ctx);
+            tmp.ctx = nullptr;
+            throw;
+        }
+        e     = &tmp;
+        fresh = true;
     }
-    const auto t1 = std::chrono::steady_clock::now();
-    if (!ggml_gallocr_alloc_graph(gm.galloc, gf)) {
-        ggml_free(ctx);
+    e->use               = ++use_clock;
+    ggml_cgraph * gf     = e->gf;
+    const auto    t1     = std::chrono::steady_clock::now();
+    ggml_gallocr_t ga    = e == &tmp ? gm.galloc : e->galloc;
+    if (fresh && !ggml_gallocr_alloc_graph(ga, gf)) {
         throw std::runtime_error("graph allocation failed");
     }
     prof_galloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
-    for (auto & [t, h] : sets) {
-        if (h->numel() != ggml_nelements(t) || (h->type == GGML_TYPE_F32 ? h->f.size() : h->i.size()) != (size_t) h->numel()) {
+    for (auto & [name, t] : e->inputs) {
+        const Tensor & h = in.at(name);
+        if (h.numel() != ggml_nelements(t) || (h.type == GGML_TYPE_F32 ? h.f.size() : h.i.size()) != (size_t) h.numel()) {
             throw std::runtime_error(std::string("input ") + t->name + ": size");
         }
         // async on the compute stream: no per-input synchronisation (the host data outlives the call)
         ggml_backend_tensor_set_async(backend, t,
-                                      h->type == GGML_TYPE_F32 ? (const void *) h->f.data() : (const void *) h->i.data(), 0,
+                                      h.type == GGML_TYPE_F32 ? (const void *) h.f.data() : (const void *) h.i.data(), 0,
                                       ggml_nbytes(t));
     }
     std::vector<float> mk;
-    if (b.mask) {
+    if (e->mask) {
         const auto & f = used[0]->filled;
         mk.resize(S * T);
         for (int64_t t = 0; t < T; ++t) {
@@ -900,11 +981,11 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
                 mk[t * S + j] = (f[j] && j <= pos[t]) ? 0.0f : -std::numeric_limits<float>::infinity();
             }
         }
-        ggml_backend_tensor_set_async(backend, b.mask, mk.data(), 0, mk.size() * sizeof(float));
+        ggml_backend_tensor_set_async(backend, e->mask, mk.data(), 0, mk.size() * sizeof(float));
     }
-    {  // bytes read per call (the roofline numerator)
+    if (fresh) {  // bytes read per call (the roofline numerator)
         std::map<const ggml_tensor *, std::pair<int, int64_t>> seen;  // per tensor: kind, the most any op reads of it
-        last_wbytes = last_sbytes = 0;
+        e->wbytes = e->sbytes = 0;
         auto in_model = [&](const ggml_tensor * t) {
             const ggml_tensor * o = t->view_src ? t->view_src : t;
             if (!o->buffer) {
@@ -941,16 +1022,18 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
                 } else if (nd->op == GGML_OP_CPY && k == 1) {
                     nb = ggml_nelements(nd->src[0]) * (int64_t) ggml_type_size(t->type) / ggml_blck_size(t->type);
                 }
-                auto & e = seen[t];  // a tied embedding: one row by get_rows, all of it by the head
-                e        = { w, std::max(e.second, nb) };
+                auto & se = seen[t];  // a tied embedding: one row by get_rows, all of it by the head
+                se        = { w, std::max(se.second, nb) };
             }
         }
-        for (const auto & [t, e] : seen) {
-            (e.first == 1 ? last_wbytes : last_sbytes) += e.second;
+        for (const auto & [t, se] : seen) {
+            (se.first == 1 ? e->wbytes : e->sbytes) += se.second;
         }
     }
+    last_wbytes   = e->wbytes;
+    last_sbytes   = e->sbytes;
     const auto t2 = std::chrono::steady_clock::now();
-    if (std::getenv("TTF_PROF_OPS")) {  // node by node, time per op (+ part shape for TTF_MM)
+    if (prof_by_op) {  // node by node, time per op (+ part shape for TTF_MM)
         for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
             ggml_cgraph  gv = ggml_graph_view(gf, i, i + 1);
             const auto   a  = std::chrono::steady_clock::now();
@@ -966,7 +1049,6 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             prof_ops[k].second += 1;
         }
     } else if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
-        ggml_free(ctx);
         throw std::runtime_error("graph compute failed");
     }
     if (dump_dir) {
@@ -979,7 +1061,7 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
             std::ofstream f(std::string(dump_dir) + "/" + name + ".bin", std::ios::binary);
             f.write(buf.data(), (std::streamsize) buf.size());
-            idx[name] = { { "ne", { t->ne[0], t->ne[1], t->ne[2], t->ne[3] } }, { "nd", b.nd[name] },
+            idx[name] = { { "ne", { t->ne[0], t->ne[1], t->ne[2], t->ne[3] } }, { "nd", dump_nd[name] },
                           { "type", t->type == GGML_TYPE_F32 ? "f32" : "i32" } };
         }
         std::ofstream(std::string(dump_dir) + "/index.json") << idx.dump();
@@ -987,8 +1069,8 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     Values r;
     size_t oi = 0;
     for (const auto & o : g.at("outputs")) {
-        ggml_tensor * t  = outs.at(oi++);
-        const int     nd = b.nd.at(o.at("of").get<std::string>());
+        ggml_tensor * t  = e->outs.at(oi);
+        const int     nd = e->out_nd.at(oi++);
         Tensor        h;
         h.type = GGML_TYPE_F32;
         for (int i = nd - 1; i >= 0; --i) {
@@ -1005,7 +1087,6 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         }
         r[o.at("name").get<std::string>()] = std::move(h);
     }
-    ggml_free(ctx);
     const auto t3 = std::chrono::steady_clock::now();
     last_ms       = std::chrono::duration<double, std::milli>(t3 - t0).count();
     prof_build += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1013,6 +1094,15 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     prof_compute += std::chrono::duration<double, std::milli>(t3 - t2).count();
     prof_nodes = ggml_graph_n_nodes(gf);
     return r;
+}
+
+Session::Built::~Built() {
+    if (galloc) {
+        ggml_gallocr_free(galloc);
+    }
+    if (ctx) {
+        ggml_free(ctx);
+    }
 }
 
 }  // namespace ttf

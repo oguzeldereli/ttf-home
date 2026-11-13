@@ -132,6 +132,25 @@ struct Session {
         ggml_gallocr_t       galloc = nullptr;
     };
     std::map<std::string, GraphMem> gmem;
+    // a graph built once and reused (see run): its own exactly sized metadata and allocator
+    struct Built {
+        std::vector<uint8_t>                               gbuf;
+        ggml_context *                                     ctx    = nullptr;
+        ggml_cgraph *                                      gf     = nullptr;
+        ggml_gallocr_t                                     galloc = nullptr;
+        std::vector<std::pair<std::string, ggml_tensor *>> inputs;
+        ggml_tensor *                                      mask = nullptr;
+        std::vector<ggml_tensor *>                         outs;
+        std::vector<int>                                   out_nd;
+        int64_t                                            wbytes = 0, sbytes = 0;
+        uint64_t                                           use    = 0;
+        Built()                                            = default;
+        Built(const Built &)                               = delete;
+        Built & operator=(const Built &)                   = delete;
+        ~Built();
+    };
+    std::map<std::string, std::unique_ptr<Built>> built;
+    uint64_t                                      use_clock = 0;
     struct Const {
         ggml_context *        ctx = nullptr;
         ggml_tensor *         t   = nullptr;
