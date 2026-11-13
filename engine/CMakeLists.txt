@@ -15,6 +15,28 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_OPENMP OFF CACHE BOOL "")
 # CUDA graphs (ggml defaults them on only inside llama.cpp): one launch per decode step
 set(GGML_CUDA_GRAPHS ON CACHE BOOL "")
+# -march=native on a CPU with AVX-VNNI emits vpdpbusd; binutils < 2.36 cannot assemble it (lab: binutils 2.35).
+# Check the toolchain end to end (compile + assemble); if it fails, keep native but without AVX-VNNI.
+if (GGML_NATIVE OR NOT DEFINED GGML_NATIVE)
+    include(CheckCSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS "-march=native")
+    check_c_source_compiles("
+        #include <immintrin.h>
+        int main(void) {
+        #ifdef __AVXVNNI__
+            __m256i a = _mm256_set1_epi32(1);
+            a = _mm256_dpbusd_avx_epi32(a, a, a);
+            return _mm256_extract_epi32(a, 0);
+        #else
+            return 0;
+        #endif
+        }" TTF_NATIVE_VNNI_ASSEMBLES)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if (NOT TTF_NATIVE_VNNI_ASSEMBLES)
+        message(STATUS "ttf: the assembler rejects AVX-VNNI under -march=native; building with -mno-avxvnni")
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-mno-avxvnni>)
+    endif()
+endif()
 add_subdirectory(ggml)
 # the TTF ops round like torch: no fused multiply-add across separately rounded steps
 set_source_files_properties(ggml/src/ggml-cpu/ttf-ops.cpp TARGET_DIRECTORY ggml-cpu PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
