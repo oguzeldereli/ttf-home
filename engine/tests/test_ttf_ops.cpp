@@ -95,8 +95,8 @@ std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::
             ggml_backend_graph_compute(be, gf);
         }
         const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
-        std::printf("bench K %5lld N %5lld T %3lld rank %3d %s: %8.1f us per quant+mm\n", (long long) cs.K, (long long) cs.N,
-                    (long long) cs.T, cs.rank, q2p ? "q2p " : "tq1p", us);
+        std::printf("bench K %5lld N %6lld T %3lld rank %3d %s: %8.1f us per quant+mm, weights %.1f GB/s\n", (long long) cs.K,
+                    (long long) cs.N, (long long) cs.T, cs.rank, q2p ? "q2p " : "tq1p", us, ggml_nbytes(w) / us / 1e3);
     }
     std::vector<float> out(ggml_nelements(y));
     ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
@@ -108,6 +108,17 @@ std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::
 }  // namespace
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench-cpu") {  // decode-shaped, Q2P, weights past the L3 (~70 MB)
+        ggml_backend_t cpu = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(cpu, argc > 2 ? std::atoi(argv[2]) : 8);
+        for (const Case & cs : std::vector<Case>{ { 2560, 110592, 1, 0, false, true }, { 6912, 40960, 1, 0, false, true },
+                                                 { 2560, 110592, 4, 0, false, true } }) {
+            std::vector<int8_t> tr(cs.N * cs.K, 1);
+            std::vector<float>  x(cs.K * cs.T, 0.5f), mu, c, mB, mA, r, b, acc;
+            run(cpu, true, cs, tr, x, mu, c, mB, mA, r, b, acc, 0.01f, 20);
+        }
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench") {
 #ifdef TTF_CUDA
         ggml_backend_t gpu = ggml_backend_cuda_init(0);

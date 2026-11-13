@@ -96,7 +96,13 @@ void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor
     const int64_t CH = 8;
     const int64_t nc = (N + CH - 1) / CH;
     for (int64_t ci = params->ith; ci < nc; ci += params->nth) {
-        for (int64_t n = ci * CH; n < std::min(N, (ci + 1) * CH); ++n) {
+        int32_t       a4[CH];  // decode, Q2P: the chunk's full groups of 4 rows in one pass each
+        const int64_t n0 = ci * CH, n1 = std::min(N, (ci + 1) * CH);
+        const int64_t n4 = (T == 1 && q2) ? n0 + (n1 - n0) / 4 * 4 : n0;
+        for (int64_t n = n0; n < n4; n += 4) {
+            ttf_kern::dot_q2p_r4((const uint8_t *) w->data + n * w->nb[1], w->nb[1], Kp / 128, q, a4 + (n - n0));
+        }
+        for (int64_t n = n0; n < n1; ++n) {
             const uint8_t * wr = (const uint8_t *) w->data + n * w->nb[1];
             if (T > 4 && !q2) {
                 ttf_kern::tq1p_decode_row(wr, Kp / ttf_kern::QK_TQ1P, codes.data());
@@ -106,7 +112,9 @@ void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor
             for (int64_t t = 0; t < T; t += 4) {
                 const int nt = (int) std::min<int64_t>(4, T - t);
                 int32_t   a[4];
-                if (q2) {
+                if (n < n4) {
+                    a[0] = a4[n - n0];
+                } else if (q2) {
                     ttf_kern::dot_q2p4(wr, Kp / 128, q + t * ldq, ldq, nt, a);
                 } else if (T > 4) {
                     ttf_kern::dot_codes4(codes.data(), q + t * ldq, ldq, nt, Kp, a);

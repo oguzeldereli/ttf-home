@@ -345,6 +345,54 @@ inline void dot_q2p4(const uint8_t * qs, int64_t nb, const int8_t * q, int64_t l
 #endif
 }
 
+// decode (one token): out[r] = sum_k c_r,k q[k] for 4 Q2P rows qs + r * rs, nb blocks. The token's codes are loaded once
+// per block for the 4 rows; per row the int16 sums of up to 8 blocks (each <= 4 * 512 = 2048 in magnitude, so <= 16384:
+// exact) are widened to int32 once.
+inline void dot_q2p_r4(const uint8_t * qs, size_t rs, int64_t nb, const int8_t * q, int32_t * out) {
+#if defined(__AVX2__)
+    const __m256i m3   = _mm256_set1_epi8(3);
+    const __m256i ones = _mm256_set1_epi16(1);
+    __m256i       acc[4] = { _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(),
+                             _mm256_setzero_si256() };
+    for (int64_t i0 = 0; i0 < nb; i0 += 8) {
+        __m256i       s16[4] = { _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(),
+                                 _mm256_setzero_si256() };
+        const int64_t ie     = i0 + 8 < nb ? i0 + 8 : nb;
+        for (int64_t i = i0; i < ie; ++i) {
+            const int8_t * qq = q + 128 * i;
+            const __m256i  q0 = _mm256_loadu_si256((const __m256i *) qq);
+            const __m256i  q1 = _mm256_loadu_si256((const __m256i *) (qq + 32));
+            const __m256i  q2 = _mm256_loadu_si256((const __m256i *) (qq + 64));
+            const __m256i  q3 = _mm256_loadu_si256((const __m256i *) (qq + 96));
+#pragma GCC unroll 4
+            for (int r = 0; r < 4; ++r) {
+                const __m256i p  = _mm256_loadu_si256((const __m256i *) (qs + r * rs + 32 * i));
+                const __m256i c0 = _mm256_and_si256(p, m3);
+                const __m256i c1 = _mm256_and_si256(_mm256_srli_epi16(p, 2), m3);
+                const __m256i c2 = _mm256_and_si256(_mm256_srli_epi16(p, 4), m3);
+                const __m256i c3 = _mm256_and_si256(_mm256_srli_epi16(p, 6), m3);
+                const __m256i a  = _mm256_add_epi16(_mm256_maddubs_epi16(c0, q0), _mm256_maddubs_epi16(c1, q1));
+                const __m256i b  = _mm256_add_epi16(_mm256_maddubs_epi16(c2, q2), _mm256_maddubs_epi16(c3, q3));
+                s16[r]           = _mm256_add_epi16(s16[r], _mm256_add_epi16(a, b));
+            }
+        }
+#pragma GCC unroll 4
+        for (int r = 0; r < 4; ++r) {
+            acc[r] = _mm256_add_epi32(acc[r], _mm256_madd_epi16(s16[r], ones));
+        }
+    }
+    const __m256i h01 = _mm256_hadd_epi32(acc[0], acc[1]);
+    const __m256i h23 = _mm256_hadd_epi32(acc[2], acc[3]);
+    const __m256i h   = _mm256_hadd_epi32(h01, h23);
+    const __m128i s   = _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
+    _mm_storeu_si128((__m128i *) out, s);
+#else
+    for (int r = 0; r < 4; ++r) {
+        dot_q2p4(qs + r * rs, nb, q, 0, 1, out + r);
+    }
+#endif
+}
+
 // fp32 dot of n floats (the legacy adapter's rank-r projections), sequential in 8 lanes then the lanes in order
 inline float dot_f32(const float * a, const float * b, int64_t n) {
     int64_t k = 0;
