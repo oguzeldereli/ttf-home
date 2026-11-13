@@ -5,6 +5,9 @@
 //   ttf-home MODEL "text" [-n N] [--temp T] [--top-k K] [--seed S]      text model: the continuation on stdout
 //   ttf-home MODEL "text" [-o out.wav] [--seed S] [--timesteps N] [--cfg F] [--max-len N]   speech model
 //   ttf-home MODEL --list FILE           speech model: one load, then each line "out.wav<TAB>text[<TAB>seed]"
+//   ttf-home MODEL --chat [--system S] [--think | --no-think] [--effort xhigh|medium|low]
+//            text model with a chat template: one turn per stdin line, the reply streamed; the KV state is kept
+//            across turns (/reset clears it). Sampling defaults --temp 0.7 --top-k 20; -n: the most reply tokens
 //   ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3] [--depth 16]
 //            text model: prefill tok/s at T = pp, decode tok/s at batch 1 over tg tokens, and the bytes one decode
 //            token reads (weights, state) with the bandwidth that implies; speech model: real-time factor
@@ -32,6 +35,8 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>
+
 using json = nlohmann::json;
 
 namespace {
@@ -46,6 +51,9 @@ struct Args {
     int64_t                            ctx = 0;
     float                              temp = 0.0f;
     bool                               bench = false, tokenize = false, specials = false, escapes = false, verbose = false, ids_given = false;
+    bool                               chat = false, temp_set = false, top_k_set = false;
+    int                                think = -1;  // --think 1 / --no-think 0 / the template's default -1
+    std::string                        system, effort = "xhigh";
     ttf::SpeakParams                   sp;
     uint32_t                           seed = 0;
 };
@@ -419,6 +427,208 @@ int run_lm(const ttf::Model & m, const Args & a) {
     return 0;
 }
 
+
+// ---- chat: the file's chat template, rendered per family (no Jinja engine): ChatML (Qwen: system / user /
+// assistant, the thinking switch and reasoning-effort text read from the template) and "Role: text<|eot_id|>"
+// (BitNet). The KV state is kept across turns: each turn feeds only its new tokens.
+struct ChatFmt {
+    enum Kind { NONE, CHATML, ROLE_EOT } kind = NONE;
+    bool                               think_on = false;     // the template's default for enable_thinking
+    bool                               effort_sys = false;   // reasoning-effort text in the system turn when thinking
+    std::map<std::string, std::string> effort_text;          // effort -> instruction (none for "medium")
+    std::vector<int32_t>               stop;
+};
+
+std::string trim(const std::string & x) {
+    const size_t a = x.find_first_not_of(" \t\r\n"), b = x.find_last_not_of(" \t\r\n");
+    return a == std::string::npos ? std::string() : x.substr(a, b - a + 1);
+}
+
+ChatFmt chat_fmt(const Text & t, const std::string & cfgs) {
+    ChatFmt          f;
+    const json       cfg = cfgs.empty() ? json::object() : json::parse(cfgs);
+    const std::string tpl = cfg.value("chat_template", json("")).is_string() ? cfg.value("chat_template", std::string()) : "";
+    auto              add_stop = [&](const std::string & tok) {
+        const int32_t id = t.tok->id_of(tok);
+        if (id >= 0 && std::find(f.stop.begin(), f.stop.end(), id) == f.stop.end()) {
+            f.stop.push_back(id);
+        }
+    };
+    if (tpl.find("<|im_start|>") != std::string::npos) {
+        f.kind = ChatFmt::CHATML;
+        // generation prompt: '<think>\n' when thinking, '<think>\n\n</think>\n\n' when not; which one is the default
+        f.think_on   = tpl.find("enable_thinking is defined and enable_thinking is false") != std::string::npos;
+        f.effort_sys = tpl.find("reasoning_instructions") != std::string::npos;
+        for (const char * e : { "xhigh", "low" }) {  // 'Reasoning effort is set to E. ...' literals
+            const std::string key = std::string("'Reasoning effort is set to ") + e;
+            const size_t      i   = tpl.find(key);
+            if (i != std::string::npos) {
+                const size_t j = tpl.find('\'', i + 1);
+                f.effort_text[e] = tpl.substr(i + 1, j - i - 1);
+            }
+        }
+        add_stop("<|im_end|>");
+        add_stop("<|endoftext|>");
+    } else if (tpl.find("<|eot_id|>") != std::string::npos && tpl.find("capitalize") != std::string::npos) {
+        f.kind = ChatFmt::ROLE_EOT;
+        add_stop("<|eot_id|>");
+    }
+    for (int32_t e : t.eos) {
+        if (std::find(f.stop.begin(), f.stop.end(), e) == f.stop.end()) {
+            f.stop.push_back(e);
+        }
+    }
+    return f;
+}
+
+int run_chat(const ttf::Model & m, const Args & a) {
+    const std::string graph = m.ir.at("driver").at("graphs").at("step");
+    const Text        txt   = load_text(m.kv_str("ttf.tokenizer.json"), m.kv_str("ttf.tokenizer.config"), m.ir.at("driver"));
+    const ChatFmt     f     = chat_fmt(txt, m.kv_str("ttf.tokenizer.config"));
+    if (f.kind == ChatFmt::NONE) {
+        std::fprintf(stderr, "chat: the file has no chat template this program knows (ChatML, Role: text<|eot_id|>); "
+                             "run it as a text continuation instead\n");
+        return 1;
+    }
+    const bool think = a.think < 0 ? f.think_on : a.think == 1;
+    if (a.effort != "xhigh" && a.effort != "medium" && a.effort != "low") {
+        throw std::runtime_error("--effort: xhigh, medium or low");
+    }
+    const float   temp  = a.temp_set ? a.temp : 0.7f;
+    const int     top_k = a.top_k_set ? a.top_k : 20;
+    const int     n_max = a.n_gen == 128 ? 4096 : a.n_gen;  // -n: the most tokens per reply (default 4096)
+    const int64_t ctx   = a.ctx ? a.ctx : 16384;
+    ttf::Session  s(m, a.threads, ctx);
+    std::mt19937  rng(a.seed);
+    const bool    tty = isatty(0);
+    int32_t       pos = 0;
+    int32_t       pending = -1;  // the last reply's stop token: not fed yet
+    std::string   prefix;        // text before the next user turn (the system turn on the first)
+    auto          start = [&]() {
+        s.reset();
+        pos     = 0;
+        pending = -1;
+        prefix.clear();
+        if (f.kind == ChatFmt::CHATML) {
+            std::string instr;
+            if (f.effort_sys && think && f.effort_text.count(a.effort)) {
+                instr = f.effort_text.at(a.effort);
+            }
+            const std::string sys = trim(a.system);
+            if (!sys.empty()) {
+                prefix = "<|im_start|>system\n" + (instr.empty() ? "" : instr + "\n\n") + sys + "<|im_end|>\n";
+            } else if (!instr.empty()) {
+                prefix = "<|im_start|>system\n" + instr + "<|im_end|>\n";
+            }
+        } else if (!trim(a.system).empty()) {
+            prefix = "System: " + trim(a.system) + "<|eot_id|>";
+        }
+    };
+    start();
+    if (tty) {
+        std::fprintf(stderr, "chat (%s, thinking %s); /reset clears the conversation, /exit or Ctrl-D quits\n",
+                     f.kind == ChatFmt::CHATML ? "ChatML" : "Role: text", think ? "on" : "off");
+    }
+    for (;;) {
+        if (tty) {
+            std::fprintf(stderr, "\n> ");
+        }
+        std::string line;
+        if (!std::getline(std::cin, line)) {
+            break;
+        }
+        const std::string u = trim(line);
+        if (u.empty()) {
+            continue;
+        }
+        if (u == "/exit" || u == "/quit") {
+            break;
+        }
+        if (u == "/reset") {
+            start();
+            continue;
+        }
+        std::string turn = prefix;
+        if (f.kind == ChatFmt::CHATML) {
+            turn += (pending >= 0 ? "\n" : "") + std::string("<|im_start|>user\n") + u + "<|im_end|>\n<|im_start|>assistant\n" +
+                    (think ? "<think>\n" : "<think>\n\n</think>\n\n");
+        } else {
+            turn += "User: " + u + "<|eot_id|>Assistant: ";
+        }
+        std::vector<int32_t> ids = txt.tok->encode(turn);
+        if (pos == 0) {
+            ids.insert(ids.begin(), txt.pre.begin(), txt.pre.end());
+        }
+        if (pending >= 0) {
+            ids.insert(ids.begin(), pending);
+        }
+        if (pos + (int64_t) ids.size() + 8 > ctx) {
+            std::fprintf(stderr, "[context full (%lld tokens): conversation reset]\n", (long long) ctx);
+            start();
+            ids = txt.tok->encode(prefix + turn.substr(prefix.size()));
+            ids.insert(ids.begin(), txt.pre.begin(), txt.pre.end());
+        }
+        prefix.clear();
+        static const bool show_ids = std::getenv("TTF_CHAT_IDS") != nullptr;  // the fed and generated ids, for checks
+        if (show_ids) {
+            std::fprintf(stderr, "[fed");
+            for (int32_t v : ids) {
+                std::fprintf(stderr, " %d", v);
+            }
+            std::fprintf(stderr, "]\n");
+        }
+        const double t0 = now_ms();
+        ttf::StepOut r  = s.step(graph, ids, positions(pos, (int64_t) ids.size()), true);
+        const double tp = now_ms() - t0;
+        pos += (int32_t) ids.size();
+        int32_t              next = pick(r.logits.data() + (r.T_out - 1) * r.n_vocab, r.n_vocab, temp, top_k, rng);
+        std::vector<int32_t> gen;
+        std::string          shown;
+        const double         t1 = now_ms();
+        if (f.kind == ChatFmt::CHATML && think) {  // the prompt opened the reasoning block
+            std::printf("<think>\n");
+        }
+        pending                 = -1;
+        for (int i = 0; i < n_max; ++i) {
+            if (std::find(f.stop.begin(), f.stop.end(), next) != f.stop.end()) {
+                pending = next;
+                break;
+            }
+            gen.push_back(next);
+            const std::string all = txt.tok->decode(gen, false);
+            if (all.size() > shown.size() && all.compare(0, shown.size(), shown) == 0) {
+                std::printf("%s", all.c_str() + shown.size());
+                std::fflush(stdout);
+                shown = all;
+            }
+            if (pos + 2 > ctx) {
+                break;
+            }
+            ttf::StepOut o = s.step(graph, { next }, { pos++ }, true);
+            next           = pick(o.logits.data(), o.n_vocab, temp, top_k, rng);
+        }
+        if (show_ids) {
+            std::fprintf(stderr, "[gen");
+            for (int32_t v : gen) {
+                std::fprintf(stderr, " %d", v);
+            }
+            std::fprintf(stderr, " | stop %d]\n", pending);
+        }
+        if (pending < 0) {  // cut off (length or context): close the turn as the template would
+            pending = f.stop.empty() ? -1 : f.stop[0];
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+        if (a.verbose) {
+            const double td = now_ms() - t1;
+            std::fprintf(stderr, "[prompt %zu tokens %.0f ms (%.0f tok/s); reply %zu tokens %.1f tok/s; context %d / %lld]\n",
+                         ids.size(), tp, 1000.0 * ids.size() / tp, gen.size(), gen.empty() ? 0.0 : 1000.0 * gen.size() / td,
+                         pos, (long long) ctx);
+        }
+    }
+    return 0;
+}
+
 // ---- lm_diffusion driver (speech)
 int run_speech(const ttf::Model & m, Args a) {
     std::vector<float> noise;
@@ -559,6 +769,7 @@ int run_tokenize(const std::string & path, bool specials, bool escapes) {
 
 const char * USAGE =
     "usage: ttf-home MODEL \"text\" [options]     run the model (text model: continuation; speech model: -o out.wav)\n"
+    "       ttf-home MODEL --chat [--system S] [--think | --no-think] [--effort xhigh|medium|low]   text model, stdin turns\n"
     "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3] [--depth 16]\n"
     "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
@@ -598,9 +809,21 @@ int main(int argc, char ** argv) {
         } else if (o == "-n" || o == "--gen") {
             a.n_gen = std::atoi(next().c_str());
         } else if (o == "--temp") {
-            a.temp = (float) std::atof(next().c_str());
+            a.temp     = (float) std::atof(next().c_str());
+            a.temp_set = true;
         } else if (o == "--top-k") {
-            a.top_k = std::atoi(next().c_str());
+            a.top_k     = std::atoi(next().c_str());
+            a.top_k_set = true;
+        } else if (o == "--chat") {
+            a.chat = true;
+        } else if (o == "--system") {
+            a.system = next();
+        } else if (o == "--think") {
+            a.think = 1;
+        } else if (o == "--no-think") {
+            a.think = 0;
+        } else if (o == "--effort") {
+            a.effort = next();
         } else if (o == "--seed") {
             a.seed = (uint32_t) std::strtoul(next().c_str(), nullptr, 10);
         } else if (o == "-o") {
@@ -673,7 +896,7 @@ int main(int argc, char ** argv) {
         if (a.tokenize) {
             return run_tokenize(a.model, a.specials, a.escapes);
         }
-        if (a.graph.empty() && !a.bench && a.text.empty() && a.ids.empty() && a.list.empty()) {
+        if (a.graph.empty() && !a.bench && !a.chat && a.text.empty() && a.ids.empty() && a.list.empty()) {
             std::fputs(USAGE, stderr);
             return 1;
         }
@@ -692,6 +915,9 @@ int main(int argc, char ** argv) {
             return run_graph(*m, a);
         }
         const std::string drv = m->ir.at("driver").at("name");
+        if (drv == "lm" && a.chat) {
+            return run_chat(*m, a);
+        }
         if (drv == "lm") {
             return run_lm(*m, a);
         }
