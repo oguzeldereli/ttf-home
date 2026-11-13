@@ -149,7 +149,9 @@ struct Session {
 };
 
 // Tokenizer from a HF tokenizer.json (the file's ttf.tokenizer.json, verbatim). Implemented: BPE (merges, byte fallback,
-// fuse_unk, ignore_merges), normalizers Prepend / Replace (string) / Sequence, no pre-tokenizer, added tokens split first.
+// fuse_unk, ignore_merges), normalizers NFC / Prepend / Replace (string) / Sequence, pre-tokenizers none or Split by
+// the Llama-3 / Qwen3.5 regex (GPT-4 style, matched by hand) then ByteLevel (no regex, no prefix space), the
+// TemplateProcessing post-processor's special tokens (post_pre / post_post), added tokens split first.
 // Anything else throws at load (never a silent mismatch).
 struct Tokenizer {
     static std::unique_ptr<Tokenizer> from_json(const std::string & tokenizer_json, std::string * err = nullptr);
@@ -167,17 +169,26 @@ struct Tokenizer {
     std::unordered_map<std::string, int32_t> vocab;
     std::vector<std::string>                 id_to_tok;
     std::unordered_map<uint64_t, std::pair<int32_t, int32_t>> merges;  // (id a, id b) -> (rank, merged id)
-    std::vector<std::pair<std::string, int32_t>> added;  // content, id; matched longest first
+    std::vector<std::pair<std::string, int32_t>> added;       // content, id; matched longest first on the raw text
+    std::vector<std::pair<std::string, int32_t>> added_norm;  // normalized: true ones, by normalized content, matched
+                                                              // in each normalized piece (as HF's AddedVocabulary)
+    std::vector<int32_t>                         special_ids; // added tokens with special: true (decode drops them)
     struct NormStep {
         std::string kind, a, b;  // Prepend: a; Replace: a -> b
     };
     std::vector<NormStep> norm;
     int32_t unk = -1;
     bool    byte_fallback = false, fuse_unk = false, ignore_merges = false;
+    int     split      = 0;      // 0 none, 1 the Llama-3 regex, 2 the Qwen3.5 regex
+    bool    byte_level = false;  // GPT-2 byte -> char map before the model; its inverse in decode
+    std::vector<int32_t> post_pre, post_post;  // the post-processor's special tokens around a single sequence
     int32_t byte_id[256];
+
+    std::string normalize(const std::string & text) const;  // the normalizer steps in order
 
   private:
     void bpe_word(const std::string & w, std::vector<int32_t> & out) const;
+    void model_piece(const std::string & normalized, std::vector<int32_t> & out) const;
 };
 
 // lm_diffusion driver (VoxCPM2): text ids -> waveform. Defaults (-1 / empty) come from the IR's driver attr.

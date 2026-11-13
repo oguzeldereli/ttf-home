@@ -8,7 +8,9 @@
 //   ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3]
 //            text model: prefill tok/s at T = pp, decode tok/s at batch 1 over tg tokens, and the bytes one decode
 //            token reads (weights, state) with the bandwidth that implies; speech model: real-time factor
-//   ttf-home MODEL --tokenize            stdin lines -> comma-separated ids (no weights loaded)
+//   ttf-home MODEL --tokenize [--specials] [--escapes]   stdin lines -> comma-separated ids (no weights loaded);
+//            --specials adds the special tokens (BOS ...) as HF encode with add_special_tokens; --escapes reads
+//            \n \r \t \\ in a line as those characters
 //   common: --ids 1,2,3 (in place of text), --device cpu|cuda (default cuda when built with it), --threads N,
 //           --ctx N, -v
 //   checks: --dump FILE (prefill logits, f32 [T, n_vocab]), --check-decode N (decode vs prefill on the last N),
@@ -42,7 +44,7 @@ struct Args {
     int                                n_gen = 128, threads = 4, top_k = 40, check_dec = 0, pp = 512, tg = 128, reps = 3;
     int64_t                            ctx = 0;
     float                              temp = 0.0f;
-    bool                               bench = false, tokenize = false, verbose = false, ids_given = false;
+    bool                               bench = false, tokenize = false, specials = false, escapes = false, verbose = false, ids_given = false;
     ttf::SpeakParams                   sp;
     uint32_t                           seed = 0;
 };
@@ -101,8 +103,8 @@ std::string special(const json & cfg, const char * key) {
 
 struct Text {
     std::unique_ptr<ttf::Tokenizer> tok;
-    std::string                     post;    // the driver's tokenizer_post
-    int32_t                         bos = -1;
+    std::string                     post_kind;  // the driver's tokenizer_post
+    std::vector<int32_t>            pre, post;  // special tokens around the text (HF add_special_tokens)
     std::vector<int32_t>            eos;
 };
 
@@ -114,13 +116,17 @@ Text load_text(const std::string & tj, const std::string & cfgs, const json & dr
     if (!t.tok) {
         throw std::runtime_error("tokenizer: " + err + " (give token ids with --ids)");
     }
-    t.post = drv.value("attr", json::object()).value("tokenizer_post", std::string());
-    if (t.post != "" && t.post != "mask_multichar_cjk") {
-        throw std::runtime_error("tokenizer_post " + t.post + ": not implemented");
+    t.post_kind = drv.value("attr", json::object()).value("tokenizer_post", std::string());
+    if (t.post_kind != "" && t.post_kind != "mask_multichar_cjk") {
+        throw std::runtime_error("tokenizer_post " + t.post_kind + ": not implemented");
     }
     const json cfg = cfgs.empty() ? json::object() : json::parse(cfgs);
-    if (cfg.value("add_bos_token", false)) {
-        t.bos = t.tok->id_of(special(cfg, "bos_token"));
+    // the post-processor's template first (as HF encode); else the tokenizer config's add_bos_token
+    t.pre  = t.tok->post_pre;
+    t.post = t.tok->post_post;
+    if (t.pre.empty() && cfg.value("add_bos_token", json(false)).is_boolean() && cfg.value("add_bos_token", false) &&
+        t.tok->id_of(special(cfg, "bos_token")) >= 0) {
+        t.pre.push_back(t.tok->id_of(special(cfg, "bos_token")));
     }
     for (const auto & e : drv.value("attr", json::object()).value("eos", json::array())) {
         t.eos.push_back(e.get<int32_t>());
@@ -131,10 +137,11 @@ Text load_text(const std::string & tj, const std::string & cfgs, const json & dr
     return t;
 }
 
-std::vector<int32_t> encode(const Text & t, const std::string & s, bool bos) {
-    std::vector<int32_t> ids = t.post == "mask_multichar_cjk" ? t.tok->encode_multichar_cjk(s) : t.tok->encode(s);
-    if (bos && t.bos >= 0) {
-        ids.insert(ids.begin(), t.bos);
+std::vector<int32_t> encode(const Text & t, const std::string & s, bool specials) {
+    std::vector<int32_t> ids = t.post_kind == "mask_multichar_cjk" ? t.tok->encode_multichar_cjk(s) : t.tok->encode(s);
+    if (specials) {
+        ids.insert(ids.begin(), t.pre.begin(), t.pre.end());
+        ids.insert(ids.end(), t.post.begin(), t.post.end());
     }
     return ids;
 }
@@ -498,7 +505,7 @@ int run_speech(const ttf::Model & m, Args a) {
 }
 
 // ---- tokenizer only: no weights loaded
-int run_tokenize(const std::string & path) {
+int run_tokenize(const std::string & path, bool specials, bool escapes) {
     gguf_init_params gp = { true, nullptr };
     gguf_context *   g  = gguf_init_from_file(path.c_str(), gp);
     if (!g) {
@@ -511,10 +518,22 @@ int run_tokenize(const std::string & path) {
     };
     const std::string irs = kv("ttf.ir");
     const json        ir  = irs.empty() ? json::object() : json::parse(irs);
-    const Text        t   = load_text(kv("ttf.tokenizer.json"), "", ir.value("driver", json::object()));
+    const Text        t   = load_text(kv("ttf.tokenizer.json"), kv("ttf.tokenizer.config"), ir.value("driver", json::object()));
     gguf_free(g);
     for (std::string line; std::getline(std::cin, line);) {
-        const auto ids = encode(t, line, false);
+        if (escapes) {  // \n \r \t \\ in the line
+            std::string u;
+            for (size_t i = 0; i < line.size(); ++i) {
+                if (line[i] == '\\' && i + 1 < line.size() && std::strchr("nrt\\", line[i + 1])) {
+                    const char e = line[++i];
+                    u += e == 'n' ? '\n' : e == 'r' ? '\r' : e == 't' ? '\t' : '\\';
+                } else {
+                    u += line[i];
+                }
+            }
+            line.swap(u);
+        }
+        const auto ids = encode(t, line, specials);
         for (size_t k = 0; k < ids.size(); ++k) {
             std::printf(k ? ",%d" : "%d", ids[k]);
         }
@@ -527,7 +546,7 @@ const char * USAGE =
     "usage: ttf-home MODEL \"text\" [options]     run the model (text model: continuation; speech model: -o out.wav)\n"
     "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3]\n"
     "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
-    "       ttf-home MODEL --tokenize < lines\n"
+    "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
     "options: -n N  --temp T  --top-k K  --seed S  -o FILE  --timesteps N  --cfg F  --max-len N\n"
     "         --ids 1,2,3  --device cpu|cuda  --threads N  --ctx N  -v\n"
     "checks:  --dump FILE  --check-decode N  --graph NAME --in NAME=FILE [--out DIR]  --noise FILE  --feat FILE\n";
@@ -597,6 +616,10 @@ int main(int argc, char ** argv) {
             a.reps = std::max(1, std::atoi(next().c_str()));
         } else if (o == "--tokenize") {
             a.tokenize = true;
+        } else if (o == "--escapes") {  // --tokenize: \n \r \t \\ in a line are those characters
+            a.escapes = true;
+        } else if (o == "--specials") {  // --tokenize: add the special tokens (BOS ...) as HF encode does
+            a.specials = true;
         } else if (o == "--dump") {
             a.dump = next();
         } else if (o == "--check-decode") {
@@ -629,7 +652,7 @@ int main(int argc, char ** argv) {
     }
     try {
         if (a.tokenize) {
-            return run_tokenize(a.model);
+            return run_tokenize(a.model, a.specials, a.escapes);
         }
         if (a.graph.empty() && !a.bench && a.text.empty() && a.ids.empty() && a.list.empty()) {
             std::fputs(USAGE, stderr);
