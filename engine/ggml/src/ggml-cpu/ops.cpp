@@ -9452,9 +9452,199 @@ static void ggml_flash_attn_ext_reduce_partials(
     }
 }
 
+
+// ---- TTF: one-token decode attention on an f32 K / (f32 | bf16) V cache, when the exact mode is off. Threads take
+// chunks of 128 positions dynamically (the cache rows hold every kv head, so each row is streamed once, also under
+// GQA), scores per chunk (pass 1: q . k for every head, pass 2: exp and the V sums; the running max
+// moves at most once per block), then per-head merges of the threads' partials (M, L, O) after a barrier.
+static inline float ttf_fa_dot(const float * a, const float * b, const int64_t n) {
+#if defined(__AVX2__) && defined(__FMA__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int64_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+        s1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), s1);
+    }
+    for (; i + 8 <= n; i += 8) {
+        s0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), s0);
+    }
+    s0 = _mm256_add_ps(s0, s1);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(s0), _mm256_extractf128_ps(s0, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    h = _mm_add_ss(h, _mm_shuffle_ps(h, h, 1));
+    float r = _mm_cvtss_f32(h);
+    for (; i < n; ++i) {
+        r += a[i] * b[i];
+    }
+    return r;
+#else
+    float r = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        r += a[i] * b[i];
+    }
+    return r;
+#endif
+}
+
+template <typename TV>
+static inline void ttf_fa_mad(float * o, const TV * v, const float p, const int64_t n);
+
+template <> inline void ttf_fa_mad<float>(float * o, const float * v, const float p, const int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 pp = _mm256_set1_ps(p);
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(pp, _mm256_loadu_ps(v + i), _mm256_loadu_ps(o + i)));
+    }
+#endif
+    for (; i < n; ++i) {
+        o[i] += p * v[i];
+    }
+}
+
+template <> inline void ttf_fa_mad<ggml_bf16_t>(float * o, const ggml_bf16_t * v, const float p, const int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX2__) && defined(__FMA__)
+    const __m256 pp = _mm256_set1_ps(p);
+    for (; i + 8 <= n; i += 8) {
+        const __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i *) (v + i))), 16);
+        _mm256_storeu_ps(o + i, _mm256_fmadd_ps(pp, _mm256_castsi256_ps(w), _mm256_loadu_ps(o + i)));
+    }
+#endif
+    for (; i < n; ++i) {
+        o[i] += p * GGML_BF16_TO_FP32(v[i]);
+    }
+}
+
+template <typename TV>
+static void ttf_fa_decode(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int64_t DK = k->ne[0], DV = v->ne[0], S = k->ne[1], H = q->ne[2], Hkv = k->ne[2], G = H / Hkv;
+    float scale;
+    memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
+    const int ith = params->ith, nth = params->nth;
+    float * part = (float *) params->wdata;  // [H][nth][2 + DV]
+    const int64_t ps = 2 + DV;
+    constexpr int64_t B = 128;  // work items: (128 positions, one kv head), taken dynamically (P and E cores differ)
+    const int64_t nchunk = (S + B - 1) / B, nitem = nchunk * Hkv;
+    static thread_local std::vector<float> sc;
+    sc.resize((size_t) (B * G));
+    for (int64_t h = 0; h < H; ++h) {
+        float * P = part + (h * nth + ith) * ps;
+        P[0] = -INFINITY;
+        P[1] = 0.0f;
+        memset(P + 2, 0, DV * sizeof(float));
+    }
+    const ggml_fp16_t * mr = mask ? (const ggml_fp16_t *) mask->data : nullptr;
+    if (ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+    ggml_barrier(params->threadpool);
+    for (int64_t it = ith; it < nitem; it = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+        const int64_t b0 = (it / Hkv) * B, hk = it % Hkv;
+        const int64_t nb = std::min(B, S - b0);
+        for (int64_t i = 0; i < nb; ++i) {  // pass 1: scores of the group's G heads
+            const int64_t s  = b0 + i;
+            const float   mk = mr ? GGML_FP16_TO_FP32(mr[s]) : 0.0f;
+            float *       si = sc.data() + i * G;
+            if (mk == -INFINITY) {
+                for (int64_t g = 0; g < G; ++g) {
+                    si[g] = -INFINITY;
+                }
+                continue;
+            }
+            const float * kr = (const float *) ((const char *) k->data + s * k->nb[1] + hk * k->nb[2]);
+            for (int64_t g = 0; g < G; ++g) {
+                const float * qr = (const float *) ((const char *) q->data + (hk * G + g) * q->nb[2]);
+                si[g]            = ttf_fa_dot(qr, kr, DK) * scale + mk;
+            }
+        }
+        for (int64_t g = 0; g < G; ++g) {  // the running max: rescale once per item if it moves
+            float mb = -INFINITY;
+            for (int64_t i = 0; i < nb; ++i) {
+                mb = std::max(mb, sc[i * G + g]);
+            }
+            float * P = part + ((hk * G + g) * nth + ith) * ps;
+            if (mb > P[0]) {
+                if (P[0] != -INFINITY) {
+                    const float f = expf(P[0] - mb);
+                    P[1] *= f;
+                    ggml_vec_scale_f32((int) DV, P + 2, f);
+                }
+                P[0] = mb;
+            }
+        }
+        for (int64_t i = 0; i < nb; ++i) {  // pass 2: weights and V sums
+            const int64_t s  = b0 + i;
+            const float * si = sc.data() + i * G;
+            if (mr && GGML_FP16_TO_FP32(mr[s]) == -INFINITY) {
+                continue;
+            }
+            const TV * vr = (const TV *) ((const char *) v->data + s * v->nb[1] + hk * v->nb[2]);
+            for (int64_t g = 0; g < G; ++g) {
+                float *     P = part + ((hk * G + g) * nth + ith) * ps;
+                const float p = expf(si[g] - P[0]);
+                P[1] += p;
+                ttf_fa_mad<TV>(P + 2, vr, p, DV);
+            }
+        }
+    }
+    ggml_barrier(params->threadpool);
+    for (int64_t h = ith; h < H; h += nth) {  // merge the threads' partials of head h
+        float M = -INFINITY;
+        for (int t = 0; t < nth; ++t) {
+            M = std::max(M, part[(h * nth + t) * ps]);
+        }
+        float * o = (float *) ((char *) dst->data + h * dst->nb[1]);
+        memset(o, 0, DV * sizeof(float));
+        float L = 0.0f;
+        for (int t = 0; t < nth; ++t) {
+            const float * P = part + (h * nth + t) * ps;
+            if (P[0] == -INFINITY) {
+                continue;
+            }
+            const float f = expf(P[0] - M);
+            L += P[1] * f;
+            ttf_fa_mad<float>(o, P + 2, f, DV);
+        }
+        if (L > 0.0f) {
+            ggml_vec_scale_f32((int) DV, o, 1.0f / L);
+        }
+    }
+}
+
+static bool ttf_fa_decode_ok(const ggml_compute_params * params, const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    float max_bias, softcap;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+    static const bool off = getenv("TTF_NO_CPU_FA_DEC") != nullptr;
+    // scratch: the plan's decode size holds H * nth * (2 + DV) floats
+    return !off && !params->use_ref && ggml_get_op_params_i32(dst, 3) != GGML_PREC_F32 && dst->src[5] == nullptr &&
+           q->ne[1] == 1 && q->ne[3] == 1 && k->ne[3] == 1 && q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 &&
+           (v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_BF16) && k->ne[2] > 0 && q->ne[2] % k->ne[2] == 0 &&
+           v->ne[2] == k->ne[2] && max_bias == 0.0f && softcap == 0.0f && (!mask || (mask->type == GGML_TYPE_F16 &&
+           mask->ne[2] == 1 && mask->ne[3] == 1)) && q->nb[0] == 4 && k->nb[0] == 4 &&
+           params->wsize >= sizeof(float) * (size_t) (q->ne[2] * params->nth * (2 + v->ne[0]));
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (ttf_fa_decode_ok(params, dst)) {
+        if (dst->src[2]->type == GGML_TYPE_BF16) {
+            ttf_fa_decode<ggml_bf16_t>(params, dst);
+        } else {
+            ttf_fa_decode<float>(params, dst);
+        }
+        return;
+    }
 
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
