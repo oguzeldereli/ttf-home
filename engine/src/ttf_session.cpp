@@ -441,16 +441,29 @@ struct Builder {
             return o;
         }
         if (s.dfa) {  // CUDA: V cached like K
+            if (kv.v->type != GGML_TYPE_F32) {  // a BF16 cache holds V exactly only if V is a D-rounded ttf_mm output
+                const ggml_tensor * vs = v;
+                while (vs->view_src || vs->op == GGML_OP_CONT || vs->op == GGML_OP_RESHAPE || vs->op == GGML_OP_VIEW ||
+                       vs->op == GGML_OP_PERMUTE) {
+                    vs = vs->view_src ? vs->view_src : vs->src[0];
+                }
+                if (vs->op != GGML_OP_TTF_MM || ggml_get_op_params_i32(vs, 0) == 0) {
+                    throw std::runtime_error("attn " + sid + ": bf16 V cache but V is not a D-rounded linear output");
+                }
+            }
             ggml_tensor * vc = ggml_set_rows(ctx, kv.v, v2, pos);
             ggml_tensor * K  = ggml_view_3d(ctx, kc, kv.hd, S, kv.hkv, kc->nb[1], kv.hd * sizeof(float), 0);
-            ggml_tensor * V  = ggml_view_3d(ctx, vc, kv.hd, S, kv.hkv, vc->nb[1], kv.hd * sizeof(float), 0);
+            ggml_tensor * V  = ggml_view_3d(ctx, vc, kv.hd, S, kv.hkv, vc->nb[1], kv.hd * ggml_type_size(vc->type), 0);
             if (T <= 16) {  // decode: one kernel reading K and V once per kv head
                 return ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), K, V, mask, scl, 0.0f, 0.0f);
             }
             ggml_tensor * Q  = ggml_permute(ctx, q, 0, 2, 1, 3);                         // [hd, T, H]
             ggml_tensor * kq = ggml_mul_mat(ctx, K, Q);                                  // [S, T, H]
             kq               = ggml_soft_max_ext(ctx, kq, mask, scl, 0.0f);
-            ggml_tensor * Vt = ggml_cont(ctx, ggml_permute(ctx, V, 1, 0, 2, 3));        // [S, hd, Hkv]
+            ggml_tensor * Vp = ggml_permute(ctx, V, 1, 0, 2, 3);                         // [S, hd, Hkv]
+            ggml_tensor * Vt = V->type == GGML_TYPE_F32
+                                   ? ggml_cont(ctx, Vp)
+                                   : ggml_cpy(ctx, Vp, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, kv.hd, kv.hkv));
             ggml_tensor * o  = ggml_mul_mat(ctx, Vt, kq);                                // [hd, T, H]
             return cont(ggml_permute(ctx, o, 0, 2, 1, 3));                     // [hd, H, T]
         }
@@ -869,6 +882,52 @@ struct Builder {
 
 }  // namespace
 
+// every attn node on state sid takes its V from a ttf.linear (through reshape / view / permute only) and the model's
+// D is bf16: the V values are bf16 numbers (ttf_mm rounds its output to D)
+static bool v_is_d_rounded(const Model & m, const std::string & sid) {
+    if (!m.d_bf16 || std::getenv("TTF_KV_V_F32")) {
+        return false;
+    }
+    bool any = false;
+    for (const auto & [gname, g] : m.ir.at("graphs").items()) {
+        std::map<std::string, const json *> prod;
+        for (const auto & n : g.at("nodes")) {
+            for (const auto & o : n.value("out", json::array())) {
+                prod[o.get<std::string>()] = &n;
+            }
+        }
+        for (const auto & n : g.at("nodes")) {
+            if (n.at("op") != "attn" || n.value("attr", json::object()).value("state", "") != sid) {
+                continue;
+            }
+            any = true;
+            const auto & ins = n.at("in");
+            if (ins.size() < 3 || ins[2].is_null()) {
+                return false;
+            }
+            std::string v = ins[2];
+            for (int hop = 0; hop < 16; ++hop) {
+                auto it = prod.find(v);
+                if (it == prod.end()) {
+                    return false;
+                }
+                const std::string op = it->second->at("op");
+                if (op == "ttf.linear") {
+                    break;
+                }
+                if (op != "reshape" && op != "view" && op != "permute") {
+                    return false;
+                }
+                v = it->second->at("in")[0];
+            }
+            if (prod.count(v) == 0 || prod.at(v)->at("op") != "ttf.linear") {
+                return false;
+            }
+        }
+    }
+    return any;
+}
+
 Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_threads(n_threads_), max_ctx(max_ctx_) {
     backend = m.backend;
     m.use_threads(n_threads);
@@ -897,7 +956,10 @@ Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_
         kvs.hd  = e.at("head_dim");
         kvs.hkv = e.at("heads_kv");
         kvs.k   = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, kvs.hd * kvs.hkv, max_ctx);
-        kvs.v   = fa || dfa ? ggml_new_tensor_2d(sctx, GGML_TYPE_F32, kvs.hd * kvs.hkv, max_ctx)
+        // CUDA: V in BF16 when every attn on this state takes V straight from a ttf.linear in a D = bf16 model
+        // (its output is rounded to bf16, so the cache is lossless; op_attn checks it). TTF_KV_V_F32=1: F32.
+        const ggml_type vt = dfa && v_is_d_rounded(m, id) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        kvs.v   = fa || dfa ? ggml_new_tensor_2d(sctx, vt, kvs.hd * kvs.hkv, max_ctx)
                      : ggml_new_tensor_2d(sctx, GGML_TYPE_F32, max_ctx, kvs.hd * kvs.hkv);  // transposed (see op_attn)
         kvs.filled.assign(max_ctx, false);
         kv[e.at("id").get<std::string>()] = kvs;
