@@ -7,9 +7,11 @@
 #    include "ggml-cuda.h"
 #endif
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <random>
 #include <vector>
 
@@ -33,7 +35,7 @@ float bf16r(float v) {
 std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::vector<int8_t> & trits,
                        const std::vector<float> & x, const std::vector<float> & mu, const std::vector<float> & c,
                        const std::vector<float> & mB, const std::vector<float> & mA, const std::vector<float> & r,
-                       const std::vector<float> & b, const std::vector<float> & acc, float beta) {
+                       const std::vector<float> & b, const std::vector<float> & acc, float beta, int reps = 0) {
     const int64_t Kp = q2p ? (cs.K + 127) / 128 * 128 : (cs.K + 159) / 160 * 160;
     ggml_init_params ip = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
     ggml_context *   ctx = ggml_init(ip);
@@ -87,6 +89,15 @@ std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::
         ggml_backend_tensor_set(tA, mA.data(), 0, ggml_nbytes(tA));
     }
     ggml_backend_graph_compute(be, gf);
+    if (reps > 0) {  // bench: quant + mm, repeated (one sync each)
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) {
+            ggml_backend_graph_compute(be, gf);
+        }
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+        std::printf("bench K %5lld N %5lld T %3lld rank %3d %s: %8.1f us per quant+mm\n", (long long) cs.K, (long long) cs.N,
+                    (long long) cs.T, cs.rank, q2p ? "q2p " : "tq1p", us);
+    }
     std::vector<float> out(ggml_nelements(y));
     ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
     ggml_backend_buffer_free(buf);
@@ -96,7 +107,23 @@ std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::
 
 }  // namespace
 
-int main() {
+int main(int argc, char ** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench") {
+#ifdef TTF_CUDA
+        ggml_backend_t gpu = ggml_backend_cuda_init(0);
+        std::mt19937   rng(1);
+        for (const Case & cs : std::vector<Case>{ { 1024, 4096, 1, 0, true, true },  { 1024, 4096, 4, 0, true, true },
+                                                 { 1024, 4096, 8, 0, true, true },  { 1024, 4096, 24, 0, true, true },
+                                                 { 1024, 4096, 24, 104, true, true }, { 4096, 1024, 24, 0, true, true },
+                                                 { 1024, 104, 24, 0, true, true },  { 1024, 3584, 1, 0, true, true } }) {
+            std::vector<int8_t> tr(cs.N * cs.K, 1);
+            std::vector<float>  x(cs.K * cs.T, 0.5f), mu(cs.K, 0.0f), c(cs.K, 1.0f), mB(cs.K * cs.rank, 0.01f),
+                mA(cs.rank * cs.N, 0.01f), r(cs.N, 1.0f), b(cs.N, 0.0f), acc(cs.N * cs.T, 0.0f);
+            run(gpu, false, cs, tr, x, mu, c, mB, mA, r, b, acc, 0.01f, 300);
+        }
+#endif
+        return 0;
+    }
     std::vector<Case> cases = {
         { 1024, 300, 1, 0, false, true },   { 1024, 300, 1, 24, true, true },  { 2816, 257, 3, 104, true, true },
         { 1000, 130, 17, 64, true, true },  { 2048, 64, 5, 104, true, false }, { 4096, 96, 1, 104, true, true },

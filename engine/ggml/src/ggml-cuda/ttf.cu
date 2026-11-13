@@ -217,8 +217,9 @@ static __device__ __forceinline__ uint32_t ttf_tq1p_lut_entry(const uint32_t b) 
     return lo | (hi << 8);
 }
 
-// grid (ceil(N / WARPS), ceil(T / TOK)); block WARPS warps, one row each, TOK tokens per pass
-template <bool Q2>
+// grid (ceil(N / (WARPS R)), <= ceil(T / TOK)); block WARPS warps, R rows each (R = 4 when T > TOK: each activation load
+// then feeds 4 rows), TOK tokens per pass; the block strides over its token chunks
+template <bool Q2, int R>
 static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
                                      const float * beta, const float * mA, const int rank, const float * r,
                                      const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
@@ -231,94 +232,135 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
         __syncthreads();
     }
     const int     lane = threadIdx.x % WARP_SIZE;
-    const int64_t n    = (int64_t) blockIdx.x * TTF_MM_WARPS + threadIdx.x / WARP_SIZE;
-    const int64_t t0   = (int64_t) blockIdx.y * TTF_MM_TOK;
-    if (n >= N) {
+    const int64_t n0   = ((int64_t) blockIdx.x * TTF_MM_WARPS + threadIdx.x / WARP_SIZE) * R;
+    if (n0 >= N) {
         return;
     }
-    const int      nt = (int) min((int64_t) TTF_MM_TOK, T - t0);
-    const int *    wr = (const int *) (w + n * nbw1);
-    int            a[TTF_MM_TOK] = { 0, 0, 0, 0 };
-    if (Q2) {
-        // Q2P: block = 8 ints; lane handles int m = lane % 8 of block 4 it + lane / 8: elements 32 j + 4 m .. + 3
-        const int64_t nb = Kp / 128;
-        for (int64_t bi = lane / 8; bi < nb; bi += 4) {
-            const int m = lane % 8;
-            const int v = wr[bi * 8 + m];
+    const int nr = (int) min((int64_t) R, N - n0);
+    const int m  = lane % 8;
+    for (int64_t t0 = (int64_t) blockIdx.y * TTF_MM_TOK; t0 < T; t0 += (int64_t) gridDim.y * TTF_MM_TOK) {
+        const int nt = (int) min((int64_t) TTF_MM_TOK, T - t0);
+        int       a[R][TTF_MM_TOK];
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int cj = (v >> (2 * j)) & 0x03030303;
+        for (int rr = 0; rr < R; ++rr) {
+#pragma unroll
+            for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
+                a[rr][tt] = 0;
+            }
+        }
+        const int64_t QB = Q2 ? 128 : 160;
+        const int64_t nb = Kp / QB;
+        for (int64_t bi = lane / 8; bi < nb; bi += 4) {
+            int wa[R], wb[R];
+#pragma unroll
+            for (int rr = 0; rr < R; ++rr) {
+                const int v = rr < nr ? ((const int *) (w + (n0 + rr) * nbw1))[bi * 8 + m] : 0;
+                if (Q2) {
+                    wa[rr] = v;
+                    wb[rr] = 0;
+                } else {
+                    const uint32_t e0 = lut[(v) & 0xFF], e1 = lut[(v >> 8) & 0xFF], e2 = lut[(v >> 16) & 0xFF],
+                                   e3 = lut[(uint32_t) v >> 24];
+                    const uint32_t p01 = __byte_perm(e0, e1, 0x5140);
+                    const uint32_t p23 = __byte_perm(e2, e3, 0x5140);
+                    wa[rr]             = (int) __byte_perm(p01, p23, 0x5410);
+                    wb[rr]             = (int) __byte_perm(p01, p23, 0x7632);
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < (Q2 ? 4 : 5); ++j) {
 #pragma unroll
                 for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
                     if (tt < nt) {
-                        const int q4 = *(const int *) (qa + (t0 + tt) * ldq + 128 * bi + 32 * j + 4 * m);
-                        a[tt]        = __dp4a(cj, q4, a[tt]);
+                        const int q4 = *(const int *) (qa + (t0 + tt) * ldq + QB * bi + 32 * j + 4 * m);
+#pragma unroll
+                        for (int rr = 0; rr < R; ++rr) {
+                            const int cj = j < 4 ? (wa[rr] >> (2 * j)) & 0x03030303 : wb[rr] & 0x03030303;
+                            a[rr][tt]    = __dp4a(cj, q4, a[rr][tt]);
+                        }
                     }
                 }
             }
         }
-    } else {
-        const int64_t nb = Kp / 160;
-        for (int64_t bi = lane / 8; bi < nb; bi += 4) {
-            const int      m  = lane % 8;
-            const int      v  = wr[bi * 8 + m];
-            const uint32_t e0 = lut[(v) & 0xFF], e1 = lut[(v >> 8) & 0xFF], e2 = lut[(v >> 16) & 0xFF],
-                           e3 = lut[(uint32_t) v >> 24];
-            const uint32_t p01 = __byte_perm(e0, e1, 0x5140);
-            const uint32_t p23 = __byte_perm(e2, e3, 0x5140);
-            const int      wa  = (int) __byte_perm(p01, p23, 0x5410);
-            const int      wb  = (int) __byte_perm(p01, p23, 0x7632);
 #pragma unroll
-            for (int j = 0; j < 5; ++j) {
-                const int cj = j < 4 ? (wa >> (2 * j)) & 0x03030303 : wb & 0x03030303;
+        for (int rr = 0; rr < R; ++rr) {
 #pragma unroll
-                for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
-                    if (tt < nt) {
-                        const int q4 = *(const int *) (qa + (t0 + tt) * ldq + 160 * bi + 32 * j + 4 * m);
-                        a[tt]        = __dp4a(cj, q4, a[tt]);
-                    }
+            for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
+                for (int o = 16; o > 0; o >>= 1) {
+                    a[rr][tt] += __shfl_xor_sync(0xffffffff, a[rr][tt], o);
                 }
             }
         }
-    }
+        // adapter up projection in ttf_dot8's order, spread over the warp: lane 8 tt + l runs lane l of token tt's dot;
+        // lane tt then sums its 8 partials in order and adds the tail (per row; rr < nr is warp-uniform)
+        float ad[R];
 #pragma unroll
-    for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
-        for (int o = 16; o > 0; o >>= 1) {
-            a[tt] += __shfl_xor_sync(0xffffffff, a[tt], o);
+        for (int rr = 0; rr < R; ++rr) {
+            ad[rr] = 0.0f;
+            if (mA && rr < nr) {
+                const int     tt = lane / 8, l = lane % 8;
+                const int64_t n8 = rank / 8 * 8;
+                const float * ar = mA + (n0 + rr) * rank;
+                float         pl = 0.0f;
+                if (tt < nt) {
+                    const float * u = (const float *) (qa + (t0 + tt) * ldq + Kp + TTF_QROW_TAIL);
+                    for (int64_t k = l; k < n8; k += 8) {
+                        pl = __fmaf_rn(u[k], ar[k], pl);
+                    }
+                }
+                float rs = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    rs = __fadd_rn(rs, __shfl_sync(0xffffffff, pl, (lane & 3) * 8 + i));
+                }
+                if (lane < nt) {
+                    const float * u = (const float *) (qa + (t0 + lane) * ldq + Kp + TTF_QROW_TAIL);
+                    for (int64_t k = n8; k < rank; ++k) {
+                        rs = __fadd_rn(rs, __fmul_rn(u[k], ar[k]));
+                    }
+                }
+                ad[rr] = ttf_rd(rs, bf16);
+            }
+        }
+        if (lane >= nt) {
+            continue;
+        }
+        // lane tt finishes token t0 + tt for each row
+        const int64_t t   = t0 + lane;
+        const char *  row = qa + t * ldq;
+        const float   s   = *(const float *) (row + Kp);
+        const int     qs  = *(const int *) (row + Kp + 4);
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            if (rr >= nr) {
+                break;
+            }
+            const int64_t n  = n0 + rr;
+            int           at = a[rr][0];
+#pragma unroll
+            for (int tt = 1; tt < TTF_MM_TOK; ++tt) {
+                if (lane == tt) {
+                    at = a[rr][tt];
+                }
+            }
+            float y = ttf_rbf(__fmul_rn(__fmul_rn(s, (float) (at - qs)), beta[0]));
+            y       = ttf_rd(y, bf16);
+            if (mA) {
+                y = ttf_rd(__fadd_rn(y, ad[rr]), bf16);
+            }
+            if (r) {
+                y = ttf_rd(__fmul_rn(y, ttf_rd(r[n], bf16)), bf16);
+            }
+            if (b) {
+                y = ttf_rd(__fadd_rn(y, ttf_rd(b[n], bf16)), bf16);
+            }
+            const int64_t i = t * N + n;
+            if (acc) {
+                y = ttf_rd(__fadd_rn(acc[i], y), bf16);
+            }
+            out[i] = y;
         }
     }
-    if (lane >= nt) {
-        return;
-    }
-    // lane tt finishes token t0 + tt
-    int at = a[0];
-#pragma unroll
-    for (int tt = 1; tt < TTF_MM_TOK; ++tt) {
-        if (lane == tt) {
-            at = a[tt];
-        }
-    }
-    const int64_t t   = t0 + lane;
-    const char *  row = qa + t * ldq;
-    const float   s   = *(const float *) (row + Kp);
-    const int     qs  = *(const int *) (row + Kp + 4);
-    float         y   = ttf_rbf(__fmul_rn(__fmul_rn(s, (float) (at - qs)), beta[0]));
-    y                 = ttf_rd(y, bf16);
-    if (mA) {
-        const float * u = (const float *) (row + Kp + TTF_QROW_TAIL);
-        y               = ttf_rd(__fadd_rn(y, ttf_rd(ttf_dot8(u, mA + n * rank, rank), bf16)), bf16);
-    }
-    if (r) {
-        y = ttf_rd(__fmul_rn(y, ttf_rd(r[n], bf16)), bf16);
-    }
-    if (b) {
-        y = ttf_rd(__fadd_rn(y, ttf_rd(b[n], bf16)), bf16);
-    }
-    const int64_t i = t * N + n;
-    if (acc) {
-        y = ttf_rd(__fadd_rn(acc[i], y), bf16);
-    }
-    out[i] = y;
 }
 
 void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -339,7 +381,12 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (T == 0) {
         return;
     }
-    const dim3 grid((unsigned) ((N + TTF_MM_WARPS - 1) / TTF_MM_WARPS), (unsigned) ((T + TTF_MM_TOK - 1) / TTF_MM_TOK));
+    // grid.y: token chunks split over blocks only as far as needed to fill the GPU (~2048 blocks); each block loops
+    // over its chunks
+    const int     R  = T > TTF_MM_TOK ? 4 : 1;
+    const int64_t gx = (N + TTF_MM_WARPS * R - 1) / (TTF_MM_WARPS * R), nch = (T + TTF_MM_TOK - 1) / TTF_MM_TOK;
+    const int64_t gy = std::max<int64_t>(1, std::min<int64_t>(nch, 2048 / gx));
+    const dim3    grid((unsigned) gx, (unsigned) gy);
     const dim3 block(TTF_MM_WARPS * WARP_SIZE);
     auto       go = [&](auto kern) {
         kern<<<grid, block, 0, ctx.stream()>>>(
@@ -349,9 +396,9 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (float *) dst->data, N, T, Kp);
     };
     if (q2) {
-        go(ttf_mm_kernel<true>);
+        R == 4 ? go(ttf_mm_kernel<true, 4>) : go(ttf_mm_kernel<true, 1>);
     } else {
-        go(ttf_mm_kernel<false>);
+        R == 4 ? go(ttf_mm_kernel<false, 4>) : go(ttf_mm_kernel<false, 1>);
     }
     CUDA_CHECK(cudaGetLastError());
 }
