@@ -6,6 +6,8 @@
 #include "ggml-impl.h"
 #include "ggml-cpu-impl.h"
 #include "ttf-kern.h"
+#include "quants.h"
+#include "vec.h"
 
 #include <algorithm>
 #include <cstring>
@@ -182,4 +184,30 @@ void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor
     for (int64_t ci = params->ith; ci < nd.nc; ci = ggml_threadpool_chunk_add(params->threadpool, 1)) {
         nd.chunk(ci, codes);
     }
+}
+
+// TTF_I4 x BF16: the row dequantised to bf16 (exactly dequantize_row_ttf_i4's values; this file is built without fp
+// contraction), then ggml_vec_dot_bf16, so the result equals a BF16 copy of the weight's
+extern "C" void ggml_vec_dot_ttf_i4_bf16(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                                         size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    thread_local std::vector<ggml_bf16_t> w;
+    w.resize(n);
+    const block_ttf_i4 * x = (const block_ttf_i4 *) vx;
+    for (int i = 0; i < n / QK_TTF_I4; ++i) {
+        for (int g = 0; g < QK_TTF_I4 / 64; ++g) {
+            const float     lo = x[i].lo[g], sc = x[i].s[g];
+            const uint8_t * q  = x[i].qs + 32 * g;
+            ggml_bf16_t *   o  = w.data() + (int64_t) i * QK_TTF_I4 + 64 * g;
+            for (int b = 0; b < 32; ++b) {
+                for (int h = 0; h < 2; ++h) {
+                    const float p = sc * (float) ((q[b] >> (4 * h)) & 15);
+                    const float v = lo + p;
+                    uint32_t    u;
+                    std::memcpy(&u, &v, 4);
+                    o[2 * b + h].bits = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+                }
+            }
+        }
+    }
+    ggml_vec_dot_bf16(n, s, bs, w.data(), bx, const_cast<ggml_bf16_t *>((const ggml_bf16_t *) vy), by, nrc);
 }

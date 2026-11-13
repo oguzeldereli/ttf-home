@@ -192,10 +192,11 @@ struct ttf_qpart {
 struct ttf_qparts {
     ttf_qpart p[TTF_QMAX];
 };
+#define TTF_QCH 4096  // decode adapter blocks: xc / bj chunk staged in shared memory (2 x 16 KB)
 
 static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, const int64_t K, const bool bf16,
                                         const int xsz, const ttf_qparts P, const char * ux, const int64_t nbu1,
-                                        const int act) {
+                                        const int act, const int one_j) {
     __shared__ float sf[32];
     __shared__ int   si[32];
     const int        z    = blockIdx.z;  // static indices: the parameters stay in the parameter bank
@@ -211,11 +212,52 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
     const float *    xr  = (const float *) (x + row * nbx1);
     const float *    ur  = act != TTF_ACT_NONE ? (const float *) (ux + row * nbu1) : nullptr;
     char *           o   = dst + row * nbd1;
+    extern __shared__ float xs[];
+    if (blockIdx.y > 0 && one_j) {
+        // few rows (decode): one block per down projection j, so the rank's reads spread over the SMs. The block
+        // stages TTF_QCH of xc and of bj in shared memory, and warp 0 runs ttf_adapter_dot's two chains over them in
+        // its order (chunks are whole 64-blocks), so u is bit-identical
+        const int j = blockIdx.y - 1;
+        if (j >= rank) {
+            return;
+        }
+        const int     lane = threadIdx.x % WARP_SIZE;
+        const float * bj   = mB + (int64_t) j * K;
+        float *       ws   = xs + TTF_QCH;
+        float         a0 = 0.0f, a1 = 0.0f;
+        for (int64_t c0 = 0; c0 < K; c0 += TTF_QCH) {
+            const int n = (int) min((int64_t) TTF_QCH, K - c0);
+            for (int k = threadIdx.x; k < n; k += blockDim.x) {
+                xs[k] = ttf_xc_v(ttf_xin(xr, ur, act, c0 + k), mu, c, c0 + k, bf16);
+                ws[k] = bj[c0 + k];
+            }
+            __syncthreads();
+            if (threadIdx.x < WARP_SIZE) {
+                for (int k = lane; k < n; k += 64) {
+                    a0 = __fmaf_rn(xs[k], ws[k], a0);
+                    if (k + 32 < n) {
+                        a1 = __fmaf_rn(xs[k + 32], ws[k + 32], a1);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x < WARP_SIZE) {
+            float sum = __fadd_rn(a0, a1);
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, off));
+            }
+            if (lane == 0) {
+                *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(sum, bf16);
+            }
+        }
+        return;
+    }
     if (blockIdx.y > 0) {
         const int lane = threadIdx.x % WARP_SIZE;
         const int j    = (blockIdx.y - 1) * (int) (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
         // xc staged once per block in shared memory (the warps' dots all read it); dynamic smem: K floats or 0
-        extern __shared__ float xs[];
         const bool staged = xsz > 0;
         if (staged) {
             for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
@@ -319,11 +361,16 @@ static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * cons
     // few rows (decode): 1024 threads per row, the row held in registers; many rows: 256 (more blocks per SM)
     const int  nsm = ggml_cuda_info().devices[ctx.device].nsm;
     const int  nth = rows < nsm ? 1024 : 256;
-    const dim3 grid((unsigned) rows, 1 + (rmax + nth / WARP_SIZE - 1) / (nth / WARP_SIZE), (unsigned) np);
+    // few rows: one adapter block per down projection (TTF_QUANT_WARP_J=1: one warp each, as for many rows)
+    static const bool warp_j = getenv("TTF_QUANT_WARP_J") != nullptr;
+    const int  one_j = rmax > 0 && rows * np * 4 <= nsm && !warp_j;
+    const dim3 grid((unsigned) rows, 1 + (one_j ? rmax : (rmax + nth / WARP_SIZE - 1) / (nth / WARP_SIZE)), (unsigned) np);
     // adapter blocks stage xc in shared memory when it fits (48 KB)
     const int xsz = rmax > 0 && x->ne[0] * (int64_t) sizeof(float) <= 48 * 1024 ? (int) (x->ne[0] * sizeof(float)) : 0;
-    ttf_quant_kernel<<<grid, nth, xsz, ctx.stream()>>>((const char *) x->data, x->nb[1], x->ne[0], bf16, xsz, P,
-                                                       act ? (const char *) u->data : nullptr, act ? u->nb[1] : 0, act);
+    const int smem = one_j ? 2 * TTF_QCH * (int) sizeof(float) : xsz;
+    ttf_quant_kernel<<<grid, nth, smem, ctx.stream()>>>((const char *) x->data, x->nb[1], x->ne[0], bf16, xsz, P,
+                                                        act ? (const char *) u->data : nullptr, act ? u->nb[1] : 0, act,
+                                                        one_j);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1330,7 +1377,7 @@ bool ggml_cuda_ttf_attn_supported(const ggml_tensor * dst) {
     memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
     const int64_t G = Hkv > 0 && H % Hkv == 0 ? H / Hkv : 0;
     return (HD == 64 || HD == 128 || HD == 256) && K->ne[0] == HD && V->ne[0] == HD && V->ne[2] == Hkv &&
-           (G == 1 || G == 2 || G == 4 || G == 8) && Q->ne[3] == 1 && K->ne[3] == 1 && max_bias == 0.0f &&
+           (G == 1 || G == 2 || G == 3 || G == 4 || G == 6 || G == 8) && Q->ne[3] == 1 && K->ne[3] == 1 && max_bias == 0.0f &&
            softcap == 0.0f && dst->src[5] == nullptr && Q->ne[1] <= 16 && Q->nb[0] == 4 && K->nb[0] == 4 &&
            V->nb[0] == ggml_type_size(V->type) && ggml_is_contiguous(dst) &&
            (!dst->src[3] || dst->src[3]->ne[2] == 1);
@@ -1368,7 +1415,9 @@ void ggml_cuda_ttf_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         switch (G) {
             case 1: go(ttf_attn_dec_kernel<D, 1, TV>); break;
             case 2: go(ttf_attn_dec_kernel<D, 2, TV>); break;
+            case 3: go(ttf_attn_dec_kernel<D, 3, TV>); break;
             case 4: go(ttf_attn_dec_kernel<D, 4, TV>); break;
+            case 6: go(ttf_attn_dec_kernel<D, 6, TV>); break;
             default: go(ttf_attn_dec_kernel<D, 8, TV>); break;
         }
         if (nsp > 1) {
@@ -1385,6 +1434,150 @@ void ggml_cuda_ttf_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         vb ? pick(std::integral_constant<int, 128>{}, bf16_t{}) : pick(std::integral_constant<int, 128>{}, f32_t{});
     } else {
         vb ? pick(std::integral_constant<int, 256>{}, bf16_t{}) : pick(std::integral_constant<int, 256>{}, f32_t{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ---- TTF_I4: int-k weights (block_ttf_i4: 256 elements, groups of 64 with f32 lo / s, 4-bit codes) ----
+// element value bf16(lo + s q): the product and the sum each rounded to f32, then to bf16 (nearest even), as the CPU's
+// dequantize_row_ttf_i4 and the loader's expansion
+
+static __device__ __forceinline__ float ttf_i4_val(const float lo, const float s, const uint32_t q) {
+    return __bfloat162float(__float2bfloat16_rn(__fadd_rn(lo, __fmul_rn(s, (float) q))));
+}
+
+// one output row per block, the row's elements over the threads; ids I32 [n, B]
+static __global__ void ttf_i4_get_rows_kernel(const block_ttf_i4 * w, const int64_t nbw1, const int32_t * ids,
+                                              const int64_t nbi1, const int64_t n, const int64_t K, float * dst,
+                                              const int64_t nbd1, const int64_t nbd2) {
+    const int64_t i = blockIdx.x % n, b = blockIdx.x / n;
+    const int64_t r = *(const int32_t *) ((const char *) ids + b * nbi1 + i * sizeof(int32_t));
+    const block_ttf_i4 * wr = (const block_ttf_i4 *) ((const char *) w + r * nbw1);
+    float * o = (float *) ((char *) dst + b * nbd2 + i * nbd1);
+    for (int64_t e = threadIdx.x; e < K; e += blockDim.x) {
+        const block_ttf_i4 & bl = wr[e / QK_TTF_I4];
+        const int             k = (int) (e % QK_TTF_I4);
+        const uint32_t        q = (bl.qs[k / 2] >> (4 * (k & 1))) & 15;
+        o[e]                    = ttf_i4_val(bl.lo[k / 64], bl.s[k / 64], q);
+    }
+}
+
+void ggml_cuda_ttf_i4_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w   = dst->src[0];
+    const ggml_tensor * ids = dst->src[1];
+    GGML_ASSERT(w->type == GGML_TYPE_TTF_I4 && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[2] == 1 && w->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    const int64_t n = ids->ne[0], B = ids->ne[1];
+    if (n * B == 0) {
+        return;
+    }
+    ttf_i4_get_rows_kernel<<<(unsigned) (n * B), 256, 0, ctx.stream()>>>(
+        (const block_ttf_i4 *) w->data, w->nb[1], (const int32_t *) ids->data, ids->nb[1], n, w->ne[0],
+        (float *) dst->data, dst->nb[1], dst->nb[2]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// y [V, T] = w [K, V]^T x [K, T], x rounded to bf16. Blocks stride over the rows, one warp per row; a lane takes 16-byte
+// code chunks (32 elements of one group) and keeps NT column sums. x of the NT columns is staged in shared memory as
+// bf16 (K NT 2 bytes)
+#define TTF_I4_WARPS 8
+template <int NT>
+static __global__ void __launch_bounds__(TTF_I4_WARPS * WARP_SIZE)
+ttf_i4_mm_kernel(const block_ttf_i4 * w, const int64_t nbw1, const int64_t V, const int64_t K, const float * x,
+                 const int64_t nbx1, const int nt, float * dst, const int64_t nbd1) {
+    extern __shared__ __align__(16) nv_bfloat16 xs16[];  // [NT][K]
+    for (int t = 0; t < NT; ++t) {
+        for (int64_t k = threadIdx.x; k < K; k += blockDim.x) {
+            xs16[t * K + k] = t < nt ? __float2bfloat16_rn(((const float *) ((const char *) x + t * nbx1))[k])
+                                     : __float2bfloat16_rn(0.0f);
+        }
+    }
+    __syncthreads();
+    const int     lane = threadIdx.x % WARP_SIZE;
+    const int64_t nch  = K / 32;  // 16-byte code chunks per row
+    for (int64_t row = (int64_t) blockIdx.x * TTF_I4_WARPS + threadIdx.x / WARP_SIZE; row < V;
+         row += (int64_t) gridDim.x * TTF_I4_WARPS) {
+        const block_ttf_i4 * wr = (const block_ttf_i4 *) ((const char *) w + row * nbw1);
+        float acc[NT];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            acc[t] = 0.0f;
+        }
+        for (int64_t ci = lane; ci < nch; ci += WARP_SIZE) {
+            const block_ttf_i4 & bl = wr[ci / 8];
+            const int            c  = (int) (ci % 8);
+            const uint4          qv = *(const uint4 *) (bl.qs + 16 * c);
+            const float          lo = bl.lo[c / 2], s = bl.s[c / 2];
+            const uint32_t       qw[4] = { qv.x, qv.y, qv.z, qv.w };
+            const int64_t        k0 = ci * 32;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                float wv[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    wv[e] = ttf_i4_val(lo, s, (qw[u] >> (4 * e)) & 15);
+                }
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    const uint4 xv = *(const uint4 *) (xs16 + t * K + k0 + 8 * u);
+                    const nv_bfloat162 * xp = (const nv_bfloat162 *) &xv;
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) {
+                        const float2 xf = __bfloat1622float2(xp[e]);
+                        acc[t] = fmaf(wv[2 * e], xf.x, acc[t]);
+                        acc[t] = fmaf(wv[2 * e + 1], xf.y, acc[t]);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            float v = acc[t];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                v += __shfl_xor_sync(0xffffffff, v, off);
+            }
+            if (lane == 0 && t < nt) {
+                *(float *) ((char *) dst + t * nbd1 + row * sizeof(float)) = v;
+            }
+        }
+    }
+}
+
+bool ggml_cuda_ttf_i4_supported(const ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    return w->type == GGML_TYPE_TTF_I4 && x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) &&
+           w->ne[0] % QK_TTF_I4 == 0 && w->ne[0] * 2 * 4 <= 96 * 1024;
+}
+
+void ggml_cuda_ttf_i4_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    GGML_ASSERT(ggml_cuda_ttf_i4_supported(dst));
+    const int64_t K = w->ne[0], V = w->ne[1], T = x->ne[1];
+    const int     nsm  = ggml_cuda_info().devices[ctx.device].nsm;
+    const int     grid = (int) std::min<int64_t>((V + TTF_I4_WARPS - 1) / TTF_I4_WARPS, (int64_t) nsm * 4);
+    for (int64_t t0 = 0; t0 < T; t0 += 4) {
+        const int nt = (int) std::min<int64_t>(4, T - t0);
+        const float * xp = (const float *) ((const char *) x->data + t0 * x->nb[1]);
+        float *       dp = (float *) ((char *) dst->data + t0 * dst->nb[1]);
+        auto go = [&](auto kern, int NT) {
+            const size_t smem = (size_t) NT * K * sizeof(nv_bfloat16);
+            if (smem > 48 * 1024) {
+                CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+            }
+            kern<<<grid, TTF_I4_WARPS * WARP_SIZE, smem, ctx.stream()>>>((const block_ttf_i4 *) w->data, w->nb[1], V, K,
+                                                                         xp, x->nb[1], nt, dp, dst->nb[1]);
+        };
+        if (nt == 1) {
+            go(ttf_i4_mm_kernel<1>, 1);
+        } else if (nt == 2) {
+            go(ttf_i4_mm_kernel<2>, 2);
+        } else {
+            go(ttf_i4_mm_kernel<4>, 4);
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }

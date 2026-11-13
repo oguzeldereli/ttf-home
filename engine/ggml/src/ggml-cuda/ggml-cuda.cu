@@ -2566,6 +2566,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_repeat_back(ctx, dst);
             break;
         case GGML_OP_GET_ROWS:
+            if (dst->src[0]->type == GGML_TYPE_TTF_I4) {
+                ggml_cuda_ttf_i4_get_rows(ctx, dst);
+                break;
+            }
             ggml_cuda_op_get_rows(ctx, dst);
             break;
         case GGML_OP_GET_ROWS_BACK:
@@ -2744,6 +2748,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_rms_norm_back(ctx, dst);
             break;
         case GGML_OP_MUL_MAT:
+            if (dst->src[0]->type == GGML_TYPE_TTF_I4) {
+                ggml_cuda_ttf_i4_mm(ctx, dst);
+                break;
+            }
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
@@ -7185,6 +7193,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                if (a->type == GGML_TYPE_TTF_I4) {
+                    return op->op == GGML_OP_MUL_MAT && ggml_cuda_ttf_i4_supported(op);
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
@@ -7247,6 +7258,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
             {
+                if (op->src[0]->type == GGML_TYPE_TTF_I4) {
+                    return op->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_I32 && op->src[0]->ne[2] == 1 &&
+                           op->src[1]->ne[2] == 1;
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:

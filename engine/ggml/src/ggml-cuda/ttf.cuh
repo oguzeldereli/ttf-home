@@ -21,3 +21,7 @@ bool ggml_cuda_ttf_act_quant(ggml_backend_cuda_context & ctx, const ggml_tensor 
 // GGML_OP_FLASH_ATTN_EXT with an f32 K (and f32 / bf16 V), decode-sized Q: ttf's flash-decoding kernel
 bool ggml_cuda_ttf_attn_supported(const ggml_tensor * dst);
 void ggml_cuda_ttf_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+// TTF_I4 (int-k) weights: MUL_MAT by an f32 src1 (rounded to bf16, as the CPU's vec_dot type) and GET_ROWS to f32
+bool ggml_cuda_ttf_i4_supported(const ggml_tensor * dst);
+void ggml_cuda_ttf_i4_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+void ggml_cuda_ttf_i4_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

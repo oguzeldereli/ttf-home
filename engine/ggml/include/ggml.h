@@ -434,7 +434,8 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_F8_E4M3 = 43,
         GGML_TYPE_TQ1_P   = 44, // TTF: 160 trits in 32 bytes (1.6 bpw), no block scale
-        GGML_TYPE_COUNT   = 45,
+        GGML_TYPE_TTF_I4  = 45, // TTF int-k: 4-bit codes, groups of 64 with f32 lo / s; values bf16(lo + s q) (5 bpw)
+        GGML_TYPE_COUNT   = 46,
     };
 
     // [TAG_GGML_PREC]

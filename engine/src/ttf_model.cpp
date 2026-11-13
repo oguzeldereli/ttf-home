@@ -9,10 +9,15 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <set>
 #include <tuple>
 #include <cstring>
-#if defined(__linux__)
+#if defined(__unix__) || defined(__APPLE__)
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#define TTF_MMAP 1
 #endif
 #include <stdexcept>
 
@@ -21,6 +26,15 @@ namespace ttf {
 namespace {
 
 constexpr int64_t QK = 160;  // TQ1_P block
+
+// ggml's block_ttf_i4 (ggml-common.h, internal to ggml): 256 elements, f32 lo / s per group of 64, 4-bit codes
+constexpr int64_t QK_TTF_I4 = 256;
+struct block_ttf_i4 {
+    float   lo[QK_TTF_I4 / 64];
+    float   s[QK_TTF_I4 / 64];
+    uint8_t qs[QK_TTF_I4 / 2];
+};
+static_assert(sizeof(block_ttf_i4) == 160, "block_ttf_i4");
 
 float bf16_round(float v) {
     uint32_t u;
@@ -98,6 +112,11 @@ Model::~Model() {
     if (meta) {
         ggml_free(meta);
     }
+#ifdef TTF_MMAP
+    if (map) {
+        munmap(map, map_size);
+    }
+#endif
     if (gguf) {
         gguf_free(gguf);
     }
@@ -134,11 +153,47 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
         } else {
             throw std::runtime_error("unknown device " + device);
         }
-        gguf_init_params gp = { /*no_alloc =*/false, /*ctx =*/&m->meta };
+        // the file's tensors are mapped, not read: the page cache holds them, so a model as big as RAM still loads (on
+        // a device they are uploaded one by one, then unmapped)
+#ifdef TTF_MMAP
+        const bool use_map = !getenv("TTF_NO_MMAP");
+#else
+        const bool use_map = false;
+#endif
+        gguf_init_params gp = { /*no_alloc =*/use_map, /*ctx =*/&m->meta };
         m->gguf             = gguf_init_from_file(path.c_str(), gp);
         if (!m->gguf) {
             throw std::runtime_error("cannot read " + path);
         }
+#ifdef TTF_MMAP
+        if (use_map) {
+            const int fd = open(path.c_str(), O_RDONLY);
+            struct stat st;
+            if (fd < 0 || fstat(fd, &st) != 0) {
+                if (fd >= 0) {
+                    close(fd);
+                }
+                throw std::runtime_error("cannot open " + path);
+            }
+            void * a = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            close(fd);
+            if (a == MAP_FAILED) {
+                throw std::runtime_error("cannot map " + path);
+            }
+            m->map      = a;
+            m->map_size = (size_t) st.st_size;
+            const size_t  d0 = gguf_get_data_offset(m->gguf);
+            const int64_t nt = gguf_get_n_tensors(m->gguf);
+            for (int64_t i = 0; i < nt; ++i) {
+                ggml_tensor * t = ggml_get_tensor(m->meta, gguf_get_tensor_name(m->gguf, i));
+                const size_t  o = d0 + gguf_get_tensor_offset(m->gguf, i);
+                if (!t || o + ggml_nbytes(t) > m->map_size) {
+                    throw std::runtime_error(path + ": tensor data out of range");
+                }
+                t->data = (char *) a + o;
+            }
+        }
+#endif
         if (m->kv_str("general.architecture") != "ttf") {
             throw std::runtime_error("not a .ttf file (general.architecture != ttf)");
         }
@@ -335,7 +390,10 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                 throw std::runtime_error(p + ": int-k layout / bits not yet");
             }
             const int64_t K = a.at("K"), V = a.at("V"), g = a.at("g");
-            ggml_tensor * d = ggml_new_tensor_2d(m->wctx, dt, K, V);
+            // D = bf16, 4-bit groups of 64: kept packed as TTF_I4 (same values, 5 bits instead of 16 per weight);
+            // TTF_INTK_EXPAND=1 expands to D as before
+            const bool    pk = dt == GGML_TYPE_BF16 && g == 64 && K % QK_TTF_I4 == 0 && !getenv("TTF_INTK_EXPAND");
+            ggml_tensor * d = ggml_new_tensor_2d(m->wctx, pk ? GGML_TYPE_TTF_I4 : dt, K, V);
             ggml_set_name(d, (p + ".weight").c_str());
             ikd.emplace_back(d, p, g);
             if (head) {
@@ -352,13 +410,29 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             ggml_set_name(d, (p + ".alpha.inv").c_str());
             snd.emplace_back(d, p);
         }
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(m->wctx, ggml_backend_cpu_buffer_type());
+        // on a device the derived tensors live there directly: each is built in a host staging buffer and uploaded
+        const bool            dev = device != "cpu";
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(
+            m->wctx, dev ? ggml_backend_get_default_buffer_type(m->backend) : ggml_backend_cpu_buffer_type());
         if (!buf) {
-            throw std::runtime_error("cannot allocate the weights");
+            throw std::runtime_error("cannot allocate the weights" + (dev ? " on " + device : std::string()));
         }
         m->bufs.push_back(buf);
+        std::vector<uint8_t> stage;
+        auto beg = [&](ggml_tensor * d) -> void * {  // where to write d's bytes
+            if (!dev) {
+                return d->data;
+            }
+            stage.resize(ggml_nbytes(d));
+            return stage.data();
+        };
+        auto end = [&](ggml_tensor * d) {
+            if (dev) {
+                ggml_backend_tensor_set(d, stage.data(), 0, ggml_nbytes(d));
+            }
+        };
 #if defined(__linux__)
-        {
+        if (!dev) {
             // back the weights with transparent huge pages before they are first written: with THP defrag=madvise the
             // fault path only compacts for madvised ranges, and decode streams the weights each token (TLB misses)
             const uintptr_t a = (uintptr_t) ggml_backend_buffer_get_base(buf), e = a + ggml_backend_buffer_get_size(buf);
@@ -377,6 +451,7 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             const int64_t   nb = pe.packed->ne[0];
             row.assign(P.Kp, 0.0f);
             const size_t rs = m->q2p ? (size_t) P.Kp / 4 : ggml_row_size(GGML_TYPE_TQ1_P, P.Kp);
+            uint8_t *    wd = (uint8_t *) beg(P.w);
             for (int64_t n = 0; n < P.N; ++n) {
                 const uint8_t * r = pk + n * pe.packed->nb[1];
                 for (int64_t i = 0; i < nb; ++i) {
@@ -393,7 +468,7 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                         v /= 3;
                     }
                 }
-                uint8_t * dst = (uint8_t *) P.w->data + n * rs;
+                uint8_t * dst = wd + n * rs;
                 if (m->q2p) {  // element 32 n + b of block i = bits 2n of byte 32 i + b, code = trit + 1
                     std::memset(dst, 0, rs);
                     for (int64_t k = 0; k < P.Kp; ++k) {
@@ -405,6 +480,7 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                     ggml_quantize_chunk(GGML_TYPE_TQ1_P, row.data(), dst, 0, 1, P.Kp, nullptr);
                 }
             }
+            end(P.w);
         }
         auto f32of = [&](const std::string & name) {  // a float tensor of the file as f32
             const ggml_tensor * t = m->get(name);
@@ -431,6 +507,25 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             const std::vector<float> lo = f32of(p + ".lo"), sc = f32of(p + ".s");
             const int64_t            K = d->ne[0], V = d->ne[1], G = K / g;
             std::vector<float>       row(K);
+            void *                   dd = beg(d);
+            if (d->type == GGML_TYPE_TTF_I4) {  // rows copy: the block's nibble order is the file's
+                GGML_ASSERT(ggml_type_size(GGML_TYPE_TTF_I4) == sizeof(block_ttf_i4) && ggml_blck_size(GGML_TYPE_TTF_I4) == QK_TTF_I4);
+                block_ttf_i4 * bl = (block_ttf_i4 *) dd;
+                const int64_t  nb = K / QK_TTF_I4;
+                for (int64_t v = 0; v < V; ++v) {
+                    const uint8_t * cr = (const uint8_t *) c->data + v * c->nb[1];
+                    for (int64_t b = 0; b < nb; ++b) {
+                        block_ttf_i4 & o = bl[v * nb + b];
+                        for (int j = 0; j < QK_TTF_I4 / 64; ++j) {
+                            o.lo[j] = lo[v * G + b * (QK_TTF_I4 / 64) + j];
+                            o.s[j]  = sc[v * G + b * (QK_TTF_I4 / 64) + j];
+                        }
+                        std::memcpy(o.qs, cr + b * (QK_TTF_I4 / 2), QK_TTF_I4 / 2);
+                    }
+                }
+                end(d);
+                continue;
+            }
             for (int64_t v = 0; v < V; ++v) {
                 const uint8_t * cr = (const uint8_t *) c->data + v * c->nb[1];
                 for (int64_t k = 0; k < K; ++k) {
@@ -439,24 +534,29 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                     row[k]         = lo[v * G + k / g] + pq;
                 }
                 if (d->type == GGML_TYPE_BF16) {
-                    ggml_fp32_to_bf16_row_ref(row.data(), (ggml_bf16_t *) d->data + v * K, K);
+                    ggml_fp32_to_bf16_row_ref(row.data(), (ggml_bf16_t *) dd + v * K, K);
                 } else {
-                    std::memcpy((float *) d->data + v * K, row.data(), K * 4);
+                    std::memcpy((float *) dd + v * K, row.data(), K * 4);
                 }
             }
+            end(d);
         }
         for (auto & [d, p] : snd) {  // torch: (alpha + 1e-9).reciprocal()
             std::vector<float> al = f32of(p + ".alpha");
+            float *            dd = (float *) beg(d);
             for (size_t i = 0; i < al.size(); ++i) {
-                ((float *) d->data)[i] = 1.0f / (al[i] + 1e-9f);
+                dd[i] = 1.0f / (al[i] + 1e-9f);
             }
+            end(d);
         }
         for (auto & [d, t] : f32c) {
+            float * dd = (float *) beg(d);
             if (t->type == GGML_TYPE_BF16) {
-                ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, (float *) d->data, ggml_nelements(t));
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) t->data, dd, ggml_nelements(t));
             } else {
-                ggml_fp16_to_fp32_row((const ggml_fp16_t *) t->data, (float *) d->data, ggml_nelements(t));
+                ggml_fp16_to_fp32_row((const ggml_fp16_t *) t->data, dd, ggml_nelements(t));
             }
+            end(d);
         }
         for (auto & [d, w, kind] : fd) {
             const int64_t      n = ggml_nelements(w);
@@ -485,10 +585,11 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                 }
                 f.swap(t);
             }
-            std::memcpy(d->data, f.data(), n * sizeof(float));
+            std::memcpy(beg(d), f.data(), n * sizeof(float));
+            end(d);
         }
         for (auto & [d, s] : dvec) {
-            float *       dv = (float *) d->data;
+            float *       dv = (float *) beg(d);
             const int64_t n  = ggml_nelements(s);
             if (s->type == GGML_TYPE_BF16) {
                 ggml_bf16_to_fp32_row((const ggml_bf16_t *) s->data, dv, n);
@@ -502,6 +603,7 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                     dv[i] = bf16_round(dv[i]);
                 }
             }
+            end(d);
         }
         for (size_t i = 0; i < dmat.size(); ++i) {
             ggml_tensor *       d  = dmat[i].first;
@@ -528,26 +630,47 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                 }
                 sv = tmp.data();
             }
+            void * dd = beg(d);
             if (d->type == GGML_TYPE_BF16) {
-                ggml_fp32_to_bf16_row_ref(sv, (ggml_bf16_t *) d->data, n0 * n1);
+                ggml_fp32_to_bf16_row_ref(sv, (ggml_bf16_t *) dd, n0 * n1);
             } else if (m->d_bf16) {
-                float * dv = (float *) d->data;
+                float * dv = (float *) dd;
                 for (int64_t j = 0; j < n0 * n1; ++j) {
                     dv[j] = bf16_round(sv[j]);
                 }
             } else {
-                std::memcpy(d->data, sv, n0 * n1 * sizeof(float));
+                std::memcpy(dd, sv, n0 * n1 * sizeof(float));
             }
+            end(d);
         }
+        std::vector<uint8_t>().swap(stage);
         for (ggml_tensor * t = ggml_get_first_tensor(m->wctx); t; t = ggml_get_next_tensor(m->wctx, t)) {
             m->tensors[ggml_get_name(t)] = t;
         }
-        if (device != "cpu") {  // everything the graphs read, copied to the device
+        if (dev) {  // the file's tensors the graphs read, copied to the device (the derived ones are there already)
             std::map<const ggml_tensor *, ggml_tensor *> to;
+            // file tensors read only here, to build derived ones, stay off the device: int-k codes / lo / s, the
+            // magnitude factors (the parts read their D copies)
+            std::set<const ggml_tensor *> src_only;
+            for (auto & [d, p, g] : ikd) {
+                for (const char * sfx : { ".codes", ".lo", ".s" }) {
+                    src_only.insert(m->get(p + sfx));
+                }
+            }
+            for (size_t i = 0; i < dmat.size(); ++i) {
+                const std::string n = ggml_get_name(dmat[i].first);
+                auto ends = [&](const std::string & x) { return n.size() >= x.size() && n.compare(n.size() - x.size(), x.size(), x) == 0; };
+                if (ends(".mag_A.D") || ends(".mag_B.DT")) {
+                    src_only.insert(dmat[i].second);
+                }
+            }
             ggml_init_params dp = { ggml_tensor_overhead() * (m->tensors.size() + 1), nullptr, true };
             m->dctx             = ggml_init(dp);
             for (auto & [name, t] : m->tensors) {
                 if (name.size() > 8 && name.compare(name.size() - 8, 8, ".wpacked") == 0) {
+                    continue;
+                }
+                if (t->buffer == buf || src_only.count(t)) {
                     continue;
                 }
                 ggml_tensor * d = ggml_dup_tensor(m->dctx, t);
@@ -564,7 +687,7 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
                 ggml_backend_tensor_set(d, h->data, 0, ggml_nbytes(h));
             }
             auto mv = [&](ggml_tensor *& p) {
-                if (p) {
+                if (p && p->buffer != buf) {
                     p = to.at(p);
                 }
             };
@@ -579,6 +702,15 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             for (auto & [p, h] : m->head_w) {
                 mv(h);
             }
+#ifdef TTF_MMAP
+            if (m->map) {  // nothing reads the file's tensors on the host any more
+                for (ggml_tensor * t = ggml_get_first_tensor(m->meta); t; t = ggml_get_next_tensor(m->meta, t)) {
+                    t->data = nullptr;
+                }
+                munmap(m->map, m->map_size);
+                m->map = nullptr;
+            }
+#endif
         }
     } catch (const std::exception & e) {
         if (err) {

@@ -924,6 +924,13 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    [GGML_TYPE_TTF_I4] = {
+        .type_name                = "ttf_i4",
+        .blck_size                = QK_TTF_I4,
+        .type_size                = sizeof(block_ttf_i4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ttf_i4,
+    },
     [GGML_TYPE_TQ1_P] = {
         .type_name                = "tq1_p",
         .blck_size                = QK_TQ1_P,

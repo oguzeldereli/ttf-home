@@ -2462,6 +2462,36 @@ void dequantize_row_tq1_p(const block_tq1_p * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+// TTF_I4: bf16(lo + s q), product and sum rounded separately (volatile: no contraction into an fma)
+static inline uint16_t ttf_i4_val(const float lo, const float s, const int q) {
+    volatile float p = s * (float) q;
+    volatile float v = lo + p;
+    return ggml_compute_fp32_to_bf16(v).bits;
+}
+
+void dequantize_row_ttf_i4_bf16(const block_ttf_i4 * GGML_RESTRICT x, ggml_bf16_t * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TTF_I4 == 0);
+    const int64_t nb = k / QK_TTF_I4;
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int e = 0; e < QK_TTF_I4; ++e) {
+            const int q = (e & 1) ? (x[i].qs[e / 2] >> 4) : (x[i].qs[e / 2] & 15);
+            y[i * QK_TTF_I4 + e].bits = ttf_i4_val(x[i].lo[e / 64], x[i].s[e / 64], q);
+        }
+    }
+}
+
+void dequantize_row_ttf_i4(const block_ttf_i4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TTF_I4 == 0);
+    const int64_t nb = k / QK_TTF_I4;
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int e = 0; e < QK_TTF_I4; ++e) {
+            const int      q = (e & 1) ? (x[i].qs[e / 2] >> 4) : (x[i].qs[e / 2] & 15);
+            const uint32_t u = (uint32_t) ttf_i4_val(x[i].lo[e / 64], x[i].s[e / 64], q) << 16;
+            memcpy(&y[i * QK_TTF_I4 + e], &u, 4);
+        }
+    }
+}
+
 size_t quantize_tq1_p(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     (void)quant_weights; // not used
     const size_t row_size = ggml_row_size(GGML_TYPE_TQ1_P, n_per_row);
@@ -5639,6 +5669,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_TQ1_P:
             // trits only: nothing to validate
             break;
+        case GGML_TYPE_TTF_I4:
+            {
+                const block_ttf_i4 * q = (const block_ttf_i4 *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    for (int g = 0; g < QK_TTF_I4/64; ++g) {
+                        if (!validate_float(q[i].lo[g], i) || !validate_float(q[i].s[g], i)) {
+                            return false;
+                        }
+                    }
+                }
+            } break;
         case GGML_TYPE_TQ1_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_tq1_0, data, nb);

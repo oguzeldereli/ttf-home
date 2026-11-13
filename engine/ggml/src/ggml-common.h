@@ -287,6 +287,17 @@ typedef struct {
     uint8_t qs[QK_TQ1_P/5];
 } block_tq1_p;
 static_assert(sizeof(block_tq1_p) == 32, "wrong tq1_p block size/padding");
+
+// 5 bpw: a TTF int-k weight (4-bit codes q, groups of 64 elements with f32 lo and s). Element e of the block is the
+// bf16 rounding (nearest even) of lo[e / 64] + s[e / 64] * q, the product and the sum each rounded to f32 (no fma);
+// q is the low nibble of qs[e / 2] for even e, the high one for odd e (the .ttf file's row order, so rows copy).
+#define QK_TTF_I4 256
+typedef struct {
+    float   lo[QK_TTF_I4/64];
+    float   s[QK_TTF_I4/64];
+    uint8_t qs[QK_TTF_I4/2];
+} block_ttf_i4;
+static_assert(sizeof(block_ttf_i4) == 160, "wrong ttf_i4 block size/padding");
 static_assert(sizeof(block_tq1_0) == sizeof(ggml_half) + QK_K / 64 + (QK_K - 4 * QK_K / 64) / 5, "wrong tq1_0 block size/padding");
 
 // 2.0625 bpw

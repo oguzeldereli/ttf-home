@@ -56,6 +56,8 @@ struct Model {
     mutable std::map<int, struct ggml_threadpool *> pools;
     void use_threads(int n_threads) const;
     ggml_context * dctx    = nullptr;  // device copies (non-CPU)
+    void *         map      = nullptr;  // the file, mapped (CPU: the file's tensors point into it)
+    size_t         map_size = 0;
     std::string    family;
 
     std::map<std::string, Part>          parts;    // by part name ("layers.0.attn.wq", "<p>.lin", ...)
