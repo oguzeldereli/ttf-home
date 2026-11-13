@@ -463,7 +463,7 @@ struct Builder {
             ggml_tensor * Vp = ggml_permute(ctx, V, 1, 0, 2, 3);                         // [S, hd, Hkv]
             ggml_tensor * Vt = V->type == GGML_TYPE_F32
                                    ? ggml_cont(ctx, Vp)
-                                   : ggml_cpy(ctx, Vp, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, kv.hd, kv.hkv));
+                                   : ggml_cast(ctx, Vp, GGML_TYPE_F32);
             ggml_tensor * o  = ggml_mul_mat(ctx, Vt, kq);                                // [hd, T, H]
             return cont(ggml_permute(ctx, o, 0, 2, 1, 3));                     // [hd, H, T]
         }
