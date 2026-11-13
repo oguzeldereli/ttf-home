@@ -228,6 +228,66 @@ int main(int argc, char ** argv) {
         }
         return 0;
     }
+    if (argc > 5 && std::string(argv[1]) == "--bench-cold") {  // --bench-cold K N T rank: NC weight copies (> L2), CUDA
+#ifdef TTF_CUDA
+        ggml_backend_t gpu = ggml_backend_cuda_init(0);
+        const int64_t  K = std::atoll(argv[2]), N = std::atoll(argv[3]), T = std::atoll(argv[4]);
+        const int      rank = std::atoi(argv[5]);
+        const int64_t  Kp   = (K + 159) / 160 * 160;
+        const int      NC   = (int) std::max<int64_t>(4, (int64_t) (400e6 / (double) (N * Kp / 5)));
+        ggml_init_params ip = { (size_t) (16 * NC + 64) * ggml_tensor_overhead() + ggml_graph_overhead_custom(16 * NC + 64, false), nullptr, true };
+        ggml_context *   ctx = ggml_init(ip);
+        ggml_tensor * tx  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T);
+        ggml_tensor * tmu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K), * tc = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
+        ggml_tensor * tB  = rank ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, rank) : nullptr;
+        ggml_tensor * tA  = rank ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, N) : nullptr;
+        ggml_tensor * tr  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N), * tb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N);
+        ggml_tensor * tbe = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * qa  = ggml_ttf_quant(ctx, tx, tmu, tc, tB, Kp, true);
+        ggml_cgraph * gf  = ggml_new_graph_custom(ctx, 16 * NC + 64, false);
+        std::vector<ggml_tensor *> ws;
+        for (int i = 0; i < NC; ++i) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ1_P, Kp, N);
+            ws.push_back(w);
+            ggml_build_forward_expand(gf, ggml_ttf_mm(ctx, w, qa, tbe, tA, tr, tb, nullptr, true));
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+        ggml_backend_buffer_clear(buf, 0);
+        std::mt19937 rng(3);
+        std::vector<float>   row(Kp, 0.0f);
+        std::vector<uint8_t> wb(ggml_nbytes(ws[0]));
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t k = 0; k < K; ++k) {
+                row[k] = (float) ((int) (rng() % 3) - 1);
+            }
+            ggml_quantize_chunk(GGML_TYPE_TQ1_P, row.data(), wb.data() + n * ws[0]->nb[1], 0, 1, Kp, nullptr);
+        }
+        for (auto * w : ws) {
+            ggml_backend_tensor_set(w, wb.data(), 0, wb.size());
+        }
+        std::vector<float> ones(std::max<int64_t>(K, N), 1.0f), xs(K * T, 0.3f), sm(std::max<int64_t>(K, N) * std::max(rank, 1), 0.01f);
+        ggml_backend_tensor_set(tx, xs.data(), 0, ggml_nbytes(tx));
+        ggml_backend_tensor_set(tc, ones.data(), 0, ggml_nbytes(tc));
+        ggml_backend_tensor_set(tr, ones.data(), 0, ggml_nbytes(tr));
+        if (rank) {
+            ggml_backend_tensor_set(tB, sm.data(), 0, ggml_nbytes(tB));
+            ggml_backend_tensor_set(tA, sm.data(), 0, ggml_nbytes(tA));
+        }
+        float beta = 0.01f;
+        ggml_backend_tensor_set(tbe, &beta, 0, 4);
+        ggml_backend_graph_compute(gpu, gf);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 10; ++i) {
+            ggml_backend_graph_compute(gpu, gf);
+        }
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 10 / NC;
+        std::printf("cold K %lld N %lld T %lld rank %d: %d copies, %.1f us per mm (incl. 1/%d quant), %.0f GB/s\n", (long long) K,
+                    (long long) N, (long long) T, rank, NC, us, NC, ggml_nbytes(ws[0]) / us / 1e3);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+#endif
+        return 0;
+    }
     if (argc > 5 && std::string(argv[1]) == "--bench-case") {  // --bench-case K N T rank: CUDA, side vectors, bf16
 #ifdef TTF_CUDA
         ggml_backend_t gpu = ggml_backend_cuda_init(0);
