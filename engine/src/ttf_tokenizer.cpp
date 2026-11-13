@@ -3,6 +3,7 @@
 #include "ttf.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -246,6 +247,43 @@ std::vector<int32_t> Tokenizer::encode(const std::string & text) const {
     std::vector<int32_t>     ids;
     encode(text, t, ids);
     return ids;
+}
+
+std::string Tokenizer::decode(const std::vector<int32_t> & ids, bool strip_prepend) const {
+    std::string out;
+    for (int32_t id : ids) {
+        if (id < 0 || id >= (int32_t) id_to_tok.size()) {
+            continue;
+        }
+        const std::string & t = id_to_tok[id];
+        if (byte_fallback && t.size() == 6 && t.compare(0, 3, "<0x") == 0 && t[5] == '>') {
+            out += (char) std::strtol(t.substr(3, 2).c_str(), nullptr, 16);
+            continue;
+        }
+        bool special = false;
+        for (const auto & [c, aid] : added) {
+            special = special || aid == id;
+        }
+        if (!special) {
+            out += t;
+        }
+    }
+    for (auto it = norm.rbegin(); it != norm.rend(); ++it) {
+        if (it->kind == "Replace") {
+            replace_all(out, it->b, it->a);
+        } else if (it->kind == "Prepend" && strip_prepend) {
+            std::string pre = it->a;  // as it reads after the later steps were undone
+            for (auto j = norm.rbegin(); j != it; ++j) {
+                if (j->kind == "Replace") {
+                    replace_all(pre, j->b, j->a);
+                }
+            }
+            if (out.compare(0, pre.size(), pre) == 0) {
+                out.erase(0, pre.size());
+            }
+        }
+    }
+    return out;
 }
 
 std::vector<int32_t> Tokenizer::encode_multichar_cjk(const std::string & text) const {

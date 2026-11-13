@@ -49,14 +49,9 @@ if (GGML_CUDA)
     target_compile_definitions(ttf_engine PUBLIC TTF_CUDA)
 endif()
 
-add_executable(ttf-run tools/ttf_run.cpp)
-target_link_libraries(ttf-run PRIVATE ttf_engine)
-
-add_executable(ttf-speak tools/ttf_speak.cpp)
-target_link_libraries(ttf-speak PRIVATE ttf_engine)
+# the one program: any .ttf model (text or speech), benchmarks, tokenizer, per-graph checks
+add_executable(ttf-home tools/ttf_home.cpp)
+target_link_libraries(ttf-home PRIVATE ttf_engine)
 
 add_executable(test-ttf-ops tests/test_ttf_ops.cpp)
 target_link_libraries(test-ttf-ops PRIVATE ttf_engine)
-
-add_executable(ttf-tok tools/ttf_tok.cpp)
-target_link_libraries(ttf-tok PRIVATE ttf_engine)

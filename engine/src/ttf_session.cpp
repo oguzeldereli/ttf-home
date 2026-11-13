@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 namespace ttf {
@@ -890,6 +891,50 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             }
         }
         ggml_backend_tensor_set_async(backend, b.mask, mk.data(), 0, mk.size() * sizeof(float));
+    }
+    {  // bytes read per call (the roofline numerator)
+        std::set<const ggml_tensor *> seen;
+        last_wbytes = last_sbytes = 0;
+        auto in_model = [&](const ggml_tensor * t) {
+            const ggml_tensor * o = t->view_src ? t->view_src : t;
+            if (!o->buffer) {
+                return 0;
+            }
+            if (o->buffer == sbuf) {
+                return 2;
+            }
+            for (ggml_backend_buffer_t mb : m.bufs) {
+                if (o->buffer == mb) {
+                    return 1;
+                }
+            }
+            return 0;
+        };
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * nd = ggml_graph_node(gf, i);
+            if (nd->op == GGML_OP_VIEW || nd->op == GGML_OP_RESHAPE || nd->op == GGML_OP_PERMUTE ||
+                nd->op == GGML_OP_TRANSPOSE || nd->op == GGML_OP_NONE) {
+                continue;  // metadata only; the op that reads the view counts the view's bytes
+            }
+            for (int k = 0; k < GGML_MAX_SRC && nd->src[k]; ++k) {
+                const ggml_tensor * t = nd->src[k];
+                const int           w = in_model(t);
+                if (!w || !seen.insert(t).second) {
+                    continue;
+                }
+                // a get_rows source: the rows gathered; a set_rows / cpy destination: the bytes written
+                int64_t nb = (int64_t) ggml_nbytes(t);
+                if (nd->op == GGML_OP_GET_ROWS && k == 0) {
+                    nb = ggml_nelements(nd->src[1]) * t->nb[1];
+                } else if (nd->op == GGML_OP_SET_ROWS && k == 2) {  // src 0 the rows, 2 the destination
+                    nb = ggml_nelements(nd->src[0]) * (int64_t) ggml_type_size(t->type) / ggml_blck_size(t->type);
+                } else if (nd->op == GGML_OP_CPY && k == 1) {
+                    nb = ggml_nelements(nd->src[0]) * (int64_t) ggml_type_size(t->type) / ggml_blck_size(t->type);
+                }
+                (w == 1 ? last_wbytes : last_sbytes) += nb;
+
+            }
+        }
     }
     const auto t2 = std::chrono::steady_clock::now();
     if (std::getenv("TTF_PROF_OPS")) {  // node by node, time per op (+ part shape for TTF_MM)

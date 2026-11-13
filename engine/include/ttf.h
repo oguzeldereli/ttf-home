@@ -142,6 +142,9 @@ struct Session {
     double                    prof_build = 0, prof_alloc = 0, prof_compute = 0;  // ms, summed over calls
     double                    prof_galloc = 0;                                   // ms, the allocator part of alloc
     int                       prof_nodes = 0;                                    // last graph
+    // last graph: bytes of model weights it reads (a get_rows source counts only the rows it gathers; each tensor once)
+    // and of session state (KV cache, conv / delta-rule states) it reads or writes (writes: the bytes written)
+    int64_t                   last_wbytes = 0, last_sbytes = 0;
     std::map<std::string, std::pair<double, int>> prof_ops;                      // TTF_PROF_OPS: ms, count
 };
 
@@ -157,6 +160,9 @@ struct Tokenizer {
     // vocabulary becomes its single characters (the U+2581 dropped), as mask_multichar_chinese_tokens
     std::vector<int32_t> encode_multichar_cjk(const std::string & text) const;
     int32_t id_of(const std::string & tok) const;
+    // ids -> text: byte-fallback tokens become their bytes, the Replace normalizers are undone (b -> a), a leading
+    // Prepend is dropped once (at the start of the text only when strip_prepend)
+    std::string decode(const std::vector<int32_t> & ids, bool strip_prepend = true) const;
 
     std::unordered_map<std::string, int32_t> vocab;
     std::vector<std::string>                 id_to_tok;
