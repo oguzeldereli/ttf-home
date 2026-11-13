@@ -499,7 +499,7 @@ static __device__ __forceinline__ uint32_t ttf_tq1p_lut_entry(const uint32_t b) 
 
 // grid (ceil(N / (WARPS R)), <= ceil(T / TOK)); block WARPS warps, R rows each (R = 4 when T > TOK: each activation load
 // then feeds 4 rows), TOK tokens per pass; the block strides over its token chunks
-template <bool Q2, int R>
+template <bool Q2, int R, bool H>
 static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int64_t nbw1, const char * qa,
                                                    const int64_t ldq, const float * beta, const float * mA,
                                                    const int rank, const float * r, const float * b, const float * acc,
@@ -531,7 +531,76 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
         }
         const int64_t QB = Q2 ? 128 : 160;
         const int64_t nb = Kp / QB;
-        if (ldq % 16 == 0 && nbw1 % 16 == 0 && ((uintptr_t) qa | (uintptr_t) w) % 16 == 0) {
+        const bool v16 = ldq % 16 == 0 && nbw1 % 16 == 0 && ((uintptr_t) qa | (uintptr_t) w) % 16 == 0;
+        constexpr int RH = R >= 2 ? R / 2 : 1;  // rows per half warp (H)
+        if (H && v16 && 2 * nb <= 16) {
+            // short rows (<= 16 chunks, e.g. K 1024 = 14): half-warp h takes rows 2 q + h, lane l of the half chunk
+            // l; the other half's sums for a row stay 0, so the full-warp reduction below gives the same integers
+            const int     h  = lane >> 4;
+            const int64_t c  = lane & 15;
+            int           a2[RH][TTF_MM_TOK];
+#pragma unroll
+            for (int qq = 0; qq < RH; ++qq) {
+#pragma unroll
+                for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
+                    a2[qq][tt] = 0;
+                }
+            }
+            if (c < 2 * nb) {
+                const int64_t bi = c / 2;
+                const int     p0 = 16 * (int) (c & 1);
+                int           wa4[RH][4], wb4[RH][4];
+#pragma unroll
+                for (int qq = 0; qq < RH; ++qq) {
+                    const int  rr    = 2 * qq + h;
+                    const int4 v4    = rr < nr ? ((const int4 *) (w + (n0 + rr) * nbw1))[c] : make_int4(0, 0, 0, 0);
+                    const int  vv[4] = { v4.x, v4.y, v4.z, v4.w };
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        if (Q2) {
+                            wa4[qq][i] = vv[i];
+                            wb4[qq][i] = 0;
+                        } else {
+                            const int      v = vv[i];
+                            const uint32_t e0 = lut[(v) & 0xFF], e1 = lut[(v >> 8) & 0xFF], e2 = lut[(v >> 16) & 0xFF],
+                                           e3 = lut[(uint32_t) v >> 24];
+                            const uint32_t p01 = __byte_perm(e0, e1, 0x5140);
+                            const uint32_t p23 = __byte_perm(e2, e3, 0x5140);
+                            wa4[qq][i]         = (int) __byte_perm(p01, p23, 0x5410);
+                            wb4[qq][i]         = (int) __byte_perm(p01, p23, 0x7632);
+                        }
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < (Q2 ? 4 : 5); ++j) {
+#pragma unroll
+                    for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
+                        if (tt < nt) {
+                            const int4 q     = *(const int4 *) (qa + (t0 + tt) * ldq + QB * bi + 32 * j + p0);
+                            const int  qv[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+                            for (int qq = 0; qq < RH; ++qq) {
+#pragma unroll
+                                for (int i = 0; i < 4; ++i) {
+                                    const int cj = j < 4 ? (wa4[qq][i] >> (2 * j)) & 0x03030303 : wb4[qq][i] & 0x03030303;
+                                    a2[qq][tt]   = __dp4a(cj, qv[i], a2[qq][tt]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+#pragma unroll
+            for (int qq = 0; qq < RH; ++qq) {
+#pragma unroll
+                for (int tt = 0; tt < TTF_MM_TOK; ++tt) {
+                    if (2 * qq + 1 < R) {
+                        a[2 * qq][tt]     = h ? 0 : a2[qq][tt];
+                        a[2 * qq + 1][tt] = h ? a2[qq][tt] : 0;
+                    }
+                }
+            }
+        } else if (v16) {
             // lanes take the rows' 16-byte chunks (a TQ1_P / Q2P block is 32 bytes = 2 chunks; byte p of the block
             // holds plane j's trit k = QB bi + 32 j + p): per step a warp has 512 bytes of each of its R rows in
             // flight; the activations for plane j are the 16 bytes at QB bi + 32 j + p0, loaded once for the R rows.
@@ -696,12 +765,12 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
     }
 }
 
-template <bool Q2, int R>
-static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
+template <bool Q2, int R, bool H = false>
+static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 7 : 4) ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
                                      const float * beta, const float * mA, const int rank, const float * r,
                                      const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
                                      const int64_t T, const int64_t Kp) {
-    ttf_mm_body<Q2, R>(w, nbw1, qa, ldq, beta, mA, rank, r, b, acc, bf16, out, N, T, Kp, blockIdx.x);
+    ttf_mm_body<Q2, R, H>(w, nbw1, qa, ldq, beta, mA, rank, r, b, acc, bf16, out, N, T, Kp, blockIdx.x);
 }
 
 // up to TTF_MMMAX parts (each its own weights, activations, epilogue) in one launch: part z owns blocks
@@ -728,12 +797,12 @@ struct ttf_mmparts {
 };
 
 // register cap as the single-part kernel gets (128 with R = 4): the part selection otherwise costs occupancy
-template <bool Q2, int R>
-static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 4 ? 4 : 7) ttf_mm_multi_kernel(const ttf_mmparts P, const bool bf16, const int64_t T) {
+template <bool Q2, int R, bool H = false>
+static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 7 : 4) ttf_mm_multi_kernel(const ttf_mmparts P, const bool bf16, const int64_t T) {
     const int        bx = blockIdx.x;
     const int        z  = bx >= P.p[2].bx0 ? 2 : bx >= P.p[1].bx0 ? 1 : 0;  // unused parts: bx0 = INT_MAX
     const ttf_mmpart q  = z == 0 ? P.p[0] : z == 1 ? P.p[1] : P.p[2];
-    ttf_mm_body<Q2, R>(q.w, q.nbw1, q.qa, q.ldq, q.beta, q.mA, q.rank, q.r, q.b, q.acc, bf16, q.out, q.N, T, q.Kp,
+    ttf_mm_body<Q2, R, H>(q.w, q.nbw1, q.qa, q.ldq, q.beta, q.mA, q.rank, q.r, q.b, q.acc, bf16, q.out, q.N, T, q.Kp,
                        bx - q.bx0);
 }
 
@@ -858,6 +927,11 @@ static __global__ void ttf_mma_kernel(const uint8_t * w, const int64_t nbw1, con
     }
 }
 
+static bool ttf_mm_no_half() {
+    static const bool d = getenv("TTF_MM_NO_HALF") != nullptr;
+    return d;
+}
+
 void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * w   = dst->src[0];
     const ggml_tensor * qa  = dst->src[1];
@@ -907,6 +981,9 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // loads in flight per lane, one epilogue latency per 4 rows); 1 row per warp when N is too small to fill the GPU
     static const int64_t r4_min_n = getenv("TTF_MM_R4_N") ? atoll(getenv("TTF_MM_R4_N")) : 2048;
     const int     R  = T > TTF_MM_TOK || N >= r4_min_n ? 4 : 1;
+    // short rows (<= 16 chunks of 16 bytes) with 4 rows per warp: half warps (H), 2 rows each. (With 1 row per warp,
+    // H's 2 rows per warp cost more than the idle lanes: their epilogues run one after the other; 340M o: 5.6 vs 4.8 us)
+    const bool    H  = R == 4 && 2 * (Kp / (q2 ? 128 : 160)) <= 16 && !ttf_mm_no_half();
     const int64_t gx = (N + TTF_MM_WARPS * R - 1) / (TTF_MM_WARPS * R), nch = (T + TTF_MM_TOK - 1) / TTF_MM_TOK;
     const int64_t gy = std::max<int64_t>(1, std::min<int64_t>(nch, 2048 / gx));
     const dim3    grid((unsigned) gx, (unsigned) gy);
@@ -919,9 +996,11 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             (float *) dst->data, N, T, Kp);
     };
     if (q2) {
-        R == 4 ? go(ttf_mm_kernel<true, 4>) : go(ttf_mm_kernel<true, 1>);
+        H ? go(ttf_mm_kernel<true, 4, true>)
+          : (R == 4 ? go(ttf_mm_kernel<true, 4>) : go(ttf_mm_kernel<true, 1>));
     } else {
-        R == 4 ? go(ttf_mm_kernel<false, 4>) : go(ttf_mm_kernel<false, 1>);
+        H ? go(ttf_mm_kernel<false, 4, true>)
+          : (R == 4 ? go(ttf_mm_kernel<false, 4>) : go(ttf_mm_kernel<false, 1>));
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -957,6 +1036,12 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
     static const int64_t r4_min_n = getenv("TTF_MM_R4_N") ? atoll(getenv("TTF_MM_R4_N")) : 2048;
     static const int64_t r4_tot_n = getenv("TTF_MM_R4_TOT") ? atoll(getenv("TTF_MM_R4_TOT")) : (int64_t) 1 << 40;
     // rows per warp as each part alone would use (all parts must agree), or 4 when the group is tall enough
+    const bool q2h = wt == GGML_TYPE_I8;
+    bool       H   = !ttf_mm_no_half();
+    for (int p = 0; p < np; ++p) {
+        const int64_t Kp = q2h ? 4 * ds[p]->src[0]->ne[0] : ds[p]->src[0]->ne[0];
+        H = H && 2 * (Kp / (q2h ? 128 : 160)) <= 16;
+    }
     int R = 0;
     for (int p = 0; p < np; ++p) {
         const int Rp = ds[p]->src[0]->ne[1] >= r4_min_n || Ntot >= r4_tot_n ? 4 : 1;
@@ -965,6 +1050,7 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
         }
         R = Rp;
     }
+    H             = H && R == 4;  // as the single-part kernel
     const bool q2 = wt == GGML_TYPE_I8;
     int        bx = 0;
     for (int p = 0; p < np; ++p) {
@@ -993,9 +1079,11 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
     const dim3 block(TTF_MM_WARPS * WARP_SIZE);
     auto       go = [&](auto kern) { kern<<<grid, block, 0, ctx.stream()>>>(P, bf16 != 0, T); };
     if (q2) {
-        R == 4 ? go(ttf_mm_multi_kernel<true, 4>) : go(ttf_mm_multi_kernel<true, 1>);
+        H ? go(ttf_mm_multi_kernel<true, 4, true>)
+          : (R == 4 ? go(ttf_mm_multi_kernel<true, 4>) : go(ttf_mm_multi_kernel<true, 1>));
     } else {
-        R == 4 ? go(ttf_mm_multi_kernel<false, 4>) : go(ttf_mm_multi_kernel<false, 1>);
+        H ? go(ttf_mm_multi_kernel<false, 4, true>)
+          : (R == 4 ? go(ttf_mm_multi_kernel<false, 4>) : go(ttf_mm_multi_kernel<false, 1>));
     }
     CUDA_CHECK(cudaGetLastError());
     return true;
