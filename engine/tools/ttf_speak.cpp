@@ -1,6 +1,7 @@
 // ttf-speak: a .ttf lm_diffusion model (VoxCPM2) on text token ids -> 16-bit PCM WAV.
-//   ttf-speak MODEL --ids 1,2,3 --out x.wav [--seed N] [--timesteps N] [--cfg F] [--max-len N] [--threads N]
-//             [--device cpu|cuda] [--noise FILE (f32 [patches, P, D])] [--feat FILE (writes the latents)] [-v]
+//   ttf-speak MODEL (--text "..." | --ids 1,2,3) --out x.wav [--seed N] [--timesteps N] [--cfg F] [--max-len N]
+//             [--threads N] [--device cpu|cuda] [--noise FILE (f32 [patches, P, D])] [--feat FILE (the latents)] [-v]
+//   ttf-speak MODEL --list FILE [...]: one model load, then each line "out.wav<TAB>text[<TAB>seed]" (default --seed)
 #include "ttf.h"
 
 #include <cstdint>
@@ -44,7 +45,7 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "usage: %s MODEL --ids 1,2,3 --out x.wav [options]\n", argv[0]);
         return 1;
     }
-    std::string          path = argv[1], out = "out.wav", device = "cpu", noise_path, feat_path;
+    std::string          path = argv[1], out = "out.wav", device = "cpu", noise_path, feat_path, text, list;
     std::vector<int32_t> ids;
     int                  n_threads = 4;
     ttf::SpeakParams     p;
@@ -65,6 +66,10 @@ int main(int argc, char ** argv) {
                     ids.push_back((int32_t) std::strtol(tok.c_str(), nullptr, 10));
                 }
             }
+        } else if (a == "--text") {
+            text = next();
+        } else if (a == "--list") {
+            list = next();
         } else if (a == "--out") {
             out = next();
         } else if (a == "--seed") {
@@ -104,26 +109,76 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
     }
+    struct Job {
+        std::string out, text;  // text "" = --ids
+        uint32_t    seed;
+    };
+    std::vector<Job> jobs;
+    if (!list.empty()) {
+        std::ifstream f(list);
+        for (std::string line; std::getline(f, line);) {
+            const size_t tab = line.find('\t');
+            if (tab != std::string::npos) {
+                std::string  rest = line.substr(tab + 1);
+                uint32_t     sd   = p.seed;
+                const size_t t2   = rest.find('\t');
+                if (t2 != std::string::npos) {
+                    sd   = (uint32_t) std::strtoul(rest.c_str() + t2 + 1, nullptr, 10);
+                    rest = rest.substr(0, t2);
+                }
+                jobs.push_back({ line.substr(0, tab), rest, sd });
+            }
+        }
+    } else {
+        jobs.push_back({ out, text, p.seed });
+    }
+    std::unique_ptr<ttf::Tokenizer> tok;
+    const std::string post = m->ir.at("driver").at("attr").value("tokenizer_post", std::string(""));
+    for (const auto & j : jobs) {
+        if (!j.text.empty() && !tok) {
+            tok = ttf::Tokenizer::from_json(m->kv_str("ttf.tokenizer.json"), &err);
+            if (!tok) {
+                std::fprintf(stderr, "tokenizer: %s\n", err.c_str());
+                return 1;
+            }
+        }
+    }
+    if (post != "" && post != "mask_multichar_cjk") {
+        std::fprintf(stderr, "tokenizer_post %s: not implemented\n", post.c_str());
+        return 1;
+    }
     try {
-        ttf::Session  s(*m, n_threads, 4096);
-        ttf::SpeakOut o   = ttf::speak(s, ids, p);
-        const double  sec = (double) o.wav.size() / o.sample_rate;
-        const double  ms  = o.ms_prefill + o.ms_dit + o.ms_lm + o.ms_vae;
-        std::fprintf(stderr,
-                     "%d patches, %.2f s audio; prefill %.0f ms, dit %.0f ms, lm %.0f ms (locenc %.0f), vae %.0f ms; RTF %.3f\n",
-                     o.n_patches, sec, o.ms_prefill, o.ms_dit, o.ms_lm, o.ms_enc, o.ms_vae, ms / 1000.0 / sec);
-        std::fprintf(stderr, "session: build %.0f ms, alloc %.0f ms (allocator %.0f), compute %.0f ms\n", s.prof_build,
-                     s.prof_alloc, s.prof_galloc, s.prof_compute);
-        if (!write_wav(out, o.wav, o.sample_rate)) {
-            std::fprintf(stderr, "cannot write %s\n", out.c_str());
-            return 1;
+        ttf::Session s(*m, n_threads, 4096);
+        for (const Job & jb : jobs) {
+            out    = jb.out;
+            p.seed = jb.seed;
+            if (!jb.text.empty()) {
+                ids = post == "mask_multichar_cjk" ? tok->encode_multichar_cjk(jb.text) : tok->encode(jb.text);
+            }
+            if (ids.empty()) {
+                std::fprintf(stderr, "%s: no tokens\n", out.c_str());
+                return 1;
+            }
+            s.prof_build = s.prof_alloc = s.prof_galloc = s.prof_compute = 0;
+            ttf::SpeakOut o   = ttf::speak(s, ids, p);
+            const double  sec = (double) o.wav.size() / o.sample_rate;
+            const double  ms  = o.ms_prefill + o.ms_dit + o.ms_lm + o.ms_vae;
+            std::fprintf(stderr,
+                         "%d patches, %.2f s audio; prefill %.0f ms, dit %.0f ms, lm %.0f ms (locenc %.0f), vae %.0f ms; RTF %.3f\n",
+                         o.n_patches, sec, o.ms_prefill, o.ms_dit, o.ms_lm, o.ms_enc, o.ms_vae, ms / 1000.0 / sec);
+            std::fprintf(stderr, "session: build %.0f ms, alloc %.0f ms (allocator %.0f), compute %.0f ms\n", s.prof_build,
+                         s.prof_alloc, s.prof_galloc, s.prof_compute);
+            if (!write_wav(out, o.wav, o.sample_rate)) {
+                std::fprintf(stderr, "cannot write %s\n", out.c_str());
+                return 1;
+            }
+            if (!feat_path.empty()) {
+                FILE * f = std::fopen(feat_path.c_str(), "wb");
+                std::fwrite(o.feat.data(), 4, o.feat.size(), f);
+                std::fclose(f);
+            }
+            std::fprintf(stderr, "wrote %s\n", out.c_str());
         }
-        if (!feat_path.empty()) {
-            FILE * f = std::fopen(feat_path.c_str(), "wb");
-            std::fwrite(o.feat.data(), 4, o.feat.size(), f);
-            std::fclose(f);
-        }
-        std::fprintf(stderr, "wrote %s\n", out.c_str());
     } catch (const std::exception & e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

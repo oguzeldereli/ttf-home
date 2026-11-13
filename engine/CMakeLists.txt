@@ -19,7 +19,7 @@ add_subdirectory(ggml)
 # the TTF ops round like torch: no fused multiply-add across separately rounded steps
 set_source_files_properties(ggml/src/ggml-cpu/ttf-ops.cpp TARGET_DIRECTORY ggml-cpu PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
-add_library(ttf_engine STATIC src/ttf_model.cpp src/ttf_session.cpp src/ttf_speak.cpp)
+add_library(ttf_engine STATIC src/ttf_model.cpp src/ttf_session.cpp src/ttf_speak.cpp src/ttf_tokenizer.cpp)
 target_include_directories(ttf_engine PUBLIC include)
 target_link_libraries(ttf_engine PUBLIC ggml)
 target_compile_options(ttf_engine PRIVATE -ffp-contract=off)
@@ -35,3 +35,6 @@ target_link_libraries(ttf-speak PRIVATE ttf_engine)
 
 add_executable(test-ttf-ops tests/test_ttf_ops.cpp)
 target_link_libraries(test-ttf-ops PRIVATE ttf_engine)
+
+add_executable(ttf-tok tools/ttf_tok.cpp)
+target_link_libraries(ttf-tok PRIVATE ttf_engine)

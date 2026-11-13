@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -142,6 +143,35 @@ struct Session {
     double                    prof_galloc = 0;                                   // ms, the allocator part of alloc
     int                       prof_nodes = 0;                                    // last graph
     std::map<std::string, std::pair<double, int>> prof_ops;                      // TTF_PROF_OPS: ms, count
+};
+
+// Tokenizer from a HF tokenizer.json (the file's ttf.tokenizer.json, verbatim). Implemented: BPE (merges, byte fallback,
+// fuse_unk, ignore_merges), normalizers Prepend / Replace (string) / Sequence, no pre-tokenizer, added tokens split first.
+// Anything else throws at load (never a silent mismatch).
+struct Tokenizer {
+    static std::unique_ptr<Tokenizer> from_json(const std::string & tokenizer_json, std::string * err = nullptr);
+    // tokens as strings and ids, no BOS / EOS (HF tokenize + convert_tokens_to_ids)
+    void encode(const std::string & text, std::vector<std::string> & toks, std::vector<int32_t> & ids) const;
+    std::vector<int32_t> encode(const std::string & text) const;
+    // VoxCPM2's post-step: a token whose text without U+2581 is >= 2 CJK ideographs (U+4E00..U+9FFF) and in the
+    // vocabulary becomes its single characters (the U+2581 dropped), as mask_multichar_chinese_tokens
+    std::vector<int32_t> encode_multichar_cjk(const std::string & text) const;
+    int32_t id_of(const std::string & tok) const;
+
+    std::unordered_map<std::string, int32_t> vocab;
+    std::vector<std::string>                 id_to_tok;
+    std::unordered_map<uint64_t, std::pair<int32_t, int32_t>> merges;  // (id a, id b) -> (rank, merged id)
+    std::vector<std::pair<std::string, int32_t>> added;  // content, id; matched longest first
+    struct NormStep {
+        std::string kind, a, b;  // Prepend: a; Replace: a -> b
+    };
+    std::vector<NormStep> norm;
+    int32_t unk = -1;
+    bool    byte_fallback = false, fuse_unk = false, ignore_merges = false;
+    int32_t byte_id[256];
+
+  private:
+    void bpe_word(const std::string & w, std::vector<int32_t> & out) const;
 };
 
 // lm_diffusion driver (VoxCPM2): text ids -> waveform. Defaults (-1 / empty) come from the IR's driver attr.
