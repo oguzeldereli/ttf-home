@@ -560,7 +560,17 @@ struct Builder {
         } else if (op == "glu") {
             const std::string act = n.value("attr", json::object()).value("act", std::string("silu"));
             ggml_tensor *     g   = in(n, 0);
-            y = ggml_mul(ctx, act == "silu" ? ggml_silu(ctx, g) : ggml_gelu(ctx, g), in(n, 1));
+            ggml_tensor *     ga;
+            if (act == "silu") {
+                ga = ggml_silu(ctx, g);
+            } else if (act == "gelu") {
+                ga = ggml_gelu(ctx, g);
+            } else if (act == "relu2") {  // relu(g)^2 (BitNet b1.58)
+                ga = ggml_sqr(ctx, ggml_relu(ctx, g));
+            } else {
+                throw std::runtime_error("glu act " + act + ": not implemented");
+            }
+            y = ggml_mul(ctx, ga, in(n, 1));
         } else if (op == "reshape") {
             y = op_reshape(n);
             r = (int) n.at("attr").at("shape").size();
@@ -893,7 +903,7 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         ggml_backend_tensor_set_async(backend, b.mask, mk.data(), 0, mk.size() * sizeof(float));
     }
     {  // bytes read per call (the roofline numerator)
-        std::set<const ggml_tensor *> seen;
+        std::map<const ggml_tensor *, std::pair<int, int64_t>> seen;  // per tensor: kind, the most any op reads of it
         last_wbytes = last_sbytes = 0;
         auto in_model = [&](const ggml_tensor * t) {
             const ggml_tensor * o = t->view_src ? t->view_src : t;
@@ -919,7 +929,7 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             for (int k = 0; k < GGML_MAX_SRC && nd->src[k]; ++k) {
                 const ggml_tensor * t = nd->src[k];
                 const int           w = in_model(t);
-                if (!w || !seen.insert(t).second) {
+                if (!w) {
                     continue;
                 }
                 // a get_rows source: the rows gathered; a set_rows / cpy destination: the bytes written
@@ -931,9 +941,12 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
                 } else if (nd->op == GGML_OP_CPY && k == 1) {
                     nb = ggml_nelements(nd->src[0]) * (int64_t) ggml_type_size(t->type) / ggml_blck_size(t->type);
                 }
-                (w == 1 ? last_wbytes : last_sbytes) += nb;
-
+                auto & e = seen[t];  // a tied embedding: one row by get_rows, all of it by the head
+                e        = { w, std::max(e.second, nb) };
             }
+        }
+        for (const auto & [t, e] : seen) {
+            (e.first == 1 ? last_wbytes : last_sbytes) += e.second;
         }
     }
     const auto t2 = std::chrono::steady_clock::now();
