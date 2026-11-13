@@ -8,6 +8,10 @@
 #endif
 
 #include <cmath>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <cstdlib>
 #include <set>
 #include <tuple>
@@ -443,44 +447,78 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
         }
 #endif
 
-        // pass 2: fill
-        std::vector<float> row;
-        for (auto & pe : pend) {
-            Part &         P   = m->parts[pe.part];
-            const uint8_t * pk = (const uint8_t *) pe.packed->data;
-            const int64_t   nb = pe.packed->ne[0];
-            row.assign(P.Kp, 0.0f);
-            const size_t rs = m->q2p ? (size_t) P.Kp / 4 : ggml_row_size(GGML_TYPE_TQ1_P, P.Kp);
-            uint8_t *    wd = (uint8_t *) beg(P.w);
-            for (int64_t n = 0; n < P.N; ++n) {
-                const uint8_t * r = pk + n * pe.packed->nb[1];
-                for (int64_t i = 0; i < nb; ++i) {
-                    int v = r[i];
-                    for (int j = 0; j < 5; ++j) {
-                        const int64_t k = 5 * i + j;
-                        if (k < P.K) {
-                            const int d = v % 3;
-                            if (d > 2) {
-                                throw std::runtime_error(pe.part + ": bad trit byte");
+        // pass 2: fill. The parts are converted in parallel (TTF_LOAD_THREADS, default up to 8), each in its own row /
+        // staging buffers; device uploads one at a time
+        {
+            const char * lt_env = getenv("TTF_LOAD_THREADS");
+            const int    nthr   = std::max(1, lt_env ? std::atoi(lt_env)
+                                                     : (int) std::min<unsigned>(8, std::max(1u, std::thread::hardware_concurrency() / 2)));
+            std::atomic<size_t> next{ 0 };
+            std::mutex          up_mu;
+            std::string         fail;
+            auto work = [&]() {
+                std::vector<float>   row;
+                std::vector<uint8_t> st;
+                for (size_t ip; (ip = next.fetch_add(1)) < pend.size();) {
+                    const Pending & pe = pend[ip];
+                    Part &          P  = m->parts.at(pe.part);
+                    const uint8_t * pk = (const uint8_t *) pe.packed->data;
+                    const int64_t   nb = pe.packed->ne[0];
+                    row.assign(P.Kp, 0.0f);
+                    const size_t rs = m->q2p ? (size_t) P.Kp / 4 : ggml_row_size(GGML_TYPE_TQ1_P, P.Kp);
+                    uint8_t *    wd;
+                    if (dev) {
+                        st.resize(ggml_nbytes(P.w));
+                        wd = st.data();
+                    } else {
+                        wd = (uint8_t *) P.w->data;
+                    }
+                    for (int64_t n = 0; n < P.N; ++n) {
+                        const uint8_t * r = pk + n * pe.packed->nb[1];
+                        for (int64_t i = 0; i < nb; ++i) {
+                            int v = r[i];
+                            if (v > 242) {
+                                std::lock_guard<std::mutex> lk(up_mu);
+                                fail = pe.part + ": bad trit byte";
+                                return;
                             }
-                            row[k] = (float) (d - 1);
+                            for (int j = 0; j < 5; ++j) {
+                                const int64_t k = 5 * i + j;
+                                if (k < P.K) {
+                                    row[k] = (float) (v % 3 - 1);
+                                }
+                                v /= 3;
+                            }
                         }
-                        v /= 3;
+                        uint8_t * dst = wd + n * rs;
+                        if (m->q2p) {  // element 32 n + b of block i = bits 2n of byte 32 i + b, code = trit + 1
+                            std::memset(dst, 0, rs);
+                            for (int64_t k = 0; k < P.Kp; ++k) {
+                                const int     code = (int) row[k] + 1;
+                                const int64_t i = k / 128, rr = k % 128;
+                                dst[32 * i + rr % 32] |= (uint8_t) (code << (2 * (rr / 32)));
+                            }
+                        } else {
+                            ggml_quantize_chunk(GGML_TYPE_TQ1_P, row.data(), dst, 0, 1, P.Kp, nullptr);
+                        }
+                    }
+                    if (dev) {
+                        std::lock_guard<std::mutex> lk(up_mu);
+                        ggml_backend_tensor_set(P.w, st.data(), 0, st.size());
                     }
                 }
-                uint8_t * dst = wd + n * rs;
-                if (m->q2p) {  // element 32 n + b of block i = bits 2n of byte 32 i + b, code = trit + 1
-                    std::memset(dst, 0, rs);
-                    for (int64_t k = 0; k < P.Kp; ++k) {
-                        const int code = (int) row[k] + 1;
-                        const int64_t i = k / 128, r = k % 128;
-                        dst[32 * i + r % 32] |= (uint8_t) (code << (2 * (r / 32)));
-                    }
-                } else {
-                    ggml_quantize_chunk(GGML_TYPE_TQ1_P, row.data(), dst, 0, 1, P.Kp, nullptr);
-                }
+            };
+            std::vector<std::thread> th;
+            for (int t = 1; t < nthr; ++t) {
+                th.emplace_back(work);
             }
-            end(P.w);
+            work();
+            for (auto & t : th) {
+                t.join();
+            }
+            if (!fail.empty()) {
+                throw std::runtime_error(fail);
+            }
         }
         auto f32of = [&](const std::string & name) {  // a float tensor of the file as f32
             const ggml_tensor * t = m->get(name);

@@ -1172,13 +1172,14 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     Built * e   = nullptr;
     bool    fresh = false;
     auto    hit = cacheable ? built.find(key) : built.end();
-    // kept from the second call with a key on (one-off shapes such as a vae_decode length are never kept)
+    // kept from the second call with a key on (one-off shapes such as a vae_decode length are never kept); one-token
+    // decode graphs at once (every step repeats them; a 27B build is ~70 ms)
     bool keep = false;
     if (cacheable && hit == built.end()) {
         if (seen_keys.size() > 4096) {
             seen_keys.clear();
         }
-        keep = !seen_keys.insert(key).second;
+        keep = !seen_keys.insert(key).second || T == 1;
     }
     if (hit != built.end()) {
         e = hit->second.get();
