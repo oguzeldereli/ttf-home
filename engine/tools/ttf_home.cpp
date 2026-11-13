@@ -323,6 +323,9 @@ int run_lm(const ttf::Model & m, const Args & a) {
     }
     if (a.check_dec > 0) {  // prefill all vs prefill all but N, then N decode steps: the state path
         const int64_t L = (int64_t) ids.size(), P0 = L - a.check_dec;
+        if (P0 < 1) {
+            throw std::runtime_error("--check-decode N needs N < the prompt's " + std::to_string(L) + " tokens");
+        }
         ttf::StepOut  full = s.step(graph, ids, positions(0, L), false);
         s.reset();
         s.step(graph, std::vector<int32_t>(ids.begin(), ids.begin() + P0), positions(0, P0), true);

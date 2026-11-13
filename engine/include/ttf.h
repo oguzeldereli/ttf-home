@@ -52,6 +52,9 @@ struct Model {
     bool           q2p    = true;   // runtime trit layout: Q2P (CPU default) or TQ1_P (CUDA default)
     std::string    device = "cpu";
     ggml_backend_t backend = nullptr;  // the device's backend, shared by sessions
+    // CPU: one persistent worker pool per thread count (ggml otherwise spawns and joins its threads on every graph)
+    mutable std::map<int, struct ggml_threadpool *> pools;
+    void use_threads(int n_threads) const;
     ggml_context * dctx    = nullptr;  // device copies (non-CPU)
     std::string    family;
 

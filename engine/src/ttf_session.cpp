@@ -706,9 +706,7 @@ struct Builder {
 
 Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_threads(n_threads_), max_ctx(max_ctx_) {
     backend = m.backend;
-    if (m.device == "cpu") {
-        ggml_backend_cpu_set_n_threads(backend, n_threads);
-    }
+    m.use_threads(n_threads);
     const json & st = m.ir.value("state", json::array());
     ggml_init_params ip = { ggml_tensor_overhead() * (st.size() * 2 + 4), nullptr, true };
     sctx                = ggml_init(ip);
@@ -782,6 +780,7 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
 }
 
 Values Session::run(const std::string & graph, const Values & in, bool last_only) {
+    m.use_threads(n_threads);  // sessions share the backend: each runs with its own thread count
     const auto t0 = std::chrono::steady_clock::now();
     const json & g = m.ir.at("graphs").at(graph);
     // T: the positions' length, else the first input's leading dim

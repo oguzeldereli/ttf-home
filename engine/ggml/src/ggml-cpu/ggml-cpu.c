@@ -591,6 +591,7 @@ static struct ggml_state g_state = {0};
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
+        atomic_store_explicit(&tp->current_chunk, 1, memory_order_relaxed);  // TTF: see below
         return;
     }
 
@@ -605,6 +606,9 @@ void ggml_barrier(struct ggml_threadpool * tp) {
     if (n_barrier == (n_threads - 1)) {
         // last thread
         atomic_store_explicit(&tp->n_barrier, 0, memory_order_relaxed);
+        // TTF: every node starts with the chunk counter at n_threads, so an op that hands out chunks dynamically
+        // (ttf_mm) needs no barrier of its own to reset it (ops that set it themselves still may)
+        atomic_store_explicit(&tp->current_chunk, n_threads, memory_order_relaxed);
 
         // exit barrier (full seq-cst fence)
         atomic_fetch_add_explicit(&tp->n_barrier_passed, 1, memory_order_seq_cst);
@@ -3135,6 +3139,37 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+// TTF_CPU_NODE_PROF (profiling only): per (op, src0 shape for matmuls) wall time of thread 0, printed at exit
+#include <stdlib.h>
+static struct { char key[96]; int64_t us; int64_t n; } ttf_np[256];
+static int ttf_np_n = 0;
+static void ttf_node_prof_dump(void) {
+    int64_t tot = 0;
+    for (int i = 0; i < ttf_np_n; ++i) tot += ttf_np[i].us;
+    for (int i = 0; i < ttf_np_n; ++i)
+        for (int j = i + 1; j < ttf_np_n; ++j)
+            if (ttf_np[j].us > ttf_np[i].us) { __typeof__(ttf_np[0]) t = ttf_np[i]; ttf_np[i] = ttf_np[j]; ttf_np[j] = t; }
+    fprintf(stderr, "cpu node profile (thread 0, work + barrier): %.1f ms total\n", tot / 1000.0);
+    for (int i = 0; i < ttf_np_n && i < 30; ++i)
+        fprintf(stderr, "  %9.1f ms %5.1f%% %8lld nodes %7.2f us/node  %s\n", ttf_np[i].us / 1000.0, 100.0 * ttf_np[i].us / (tot ? tot : 1),
+                (long long) ttf_np[i].n, (double) ttf_np[i].us / ttf_np[i].n, ttf_np[i].key);
+}
+static bool ttf_node_prof_on(void) {
+    static int on = -1;
+    if (on < 0) { on = getenv("TTF_CPU_NODE_PROF") != NULL; if (on) atexit(ttf_node_prof_dump); }
+    return on;
+}
+static void ttf_node_prof_add(const struct ggml_tensor * node, int64_t us) {
+    char k[96];
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_TTF_MM)
+        snprintf(k, sizeof(k), "%s %lldx%lld %s", ggml_op_desc(node), (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1], ggml_type_name(node->src[0]->type));
+    else
+        snprintf(k, sizeof(k), "%s", ggml_op_desc(node));
+    for (int i = 0; i < ttf_np_n; ++i)
+        if (strcmp(ttf_np[i].key, k) == 0) { ttf_np[i].us += us; ttf_np[i].n++; return; }
+    if (ttf_np_n < 256) { snprintf(ttf_np[ttf_np_n].key, sizeof(ttf_np[0].key), "%s", k); ttf_np[ttf_np_n].us = us; ttf_np[ttf_np_n].n = 1; ttf_np_n++; }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3163,6 +3198,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    // TTF_CPU_NODE_PROF: thread 0 times each node from its start to the barrier after it (work + barrier wait)
+    const bool node_prof = state->ith == 0 && ttf_node_prof_on();
+    int64_t    t_node    = node_prof ? ggml_time_us() : 0;
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3192,6 +3230,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+        if (node_prof) {
+            const int64_t t = ggml_time_us();
+            ttf_node_prof_add(node, t - t_node);
+            t_node = t;
         }
     }
 
@@ -3325,6 +3368,8 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     n_graph = ((n_graph + 1) << GGML_THREADPOOL_N_THREADS_BITS) | (n_threads & GGML_THREADPOOL_N_THREADS_MASK);
 
     GGML_PRINT_DEBUG("compute-kickoff: n_threads %d n_graph %d\n", n_threads, n_graph);
+
+    atomic_store_explicit(&threadpool->current_chunk, n_threads, memory_order_relaxed);  // TTF: see ggml_barrier
 
     // Indicate the graph is ready to be processed
     // We need the full seq-cst fence here because of the polling threads (used in thread_sync)

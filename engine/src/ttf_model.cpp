@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <tuple>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 #include <stdexcept>
 
 namespace ttf {
@@ -60,7 +63,32 @@ std::vector<std::pair<std::string, int64_t>> linear_parts(const json & node) {
 
 }  // namespace
 
+void Model::use_threads(int n_threads) const {
+    if (device != "cpu") {
+        return;
+    }
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+    if (getenv("TTF_NO_POOL")) {
+        return;
+    }
+    auto it = pools.find(n_threads);
+    if (it == pools.end()) {
+        ggml_threadpool_params tp = ggml_threadpool_params_default(n_threads);
+        if (const char * e = getenv("TTF_POLL")) {
+            tp.poll = (uint32_t) atoi(e);
+        }
+        it = pools.emplace(n_threads, ggml_threadpool_new(&tp)).first;
+    }
+    ggml_backend_cpu_set_threadpool(backend, it->second);
+}
+
 Model::~Model() {
+    if (backend && device == "cpu") {
+        ggml_backend_cpu_set_threadpool(backend, nullptr);
+    }
+    for (auto & p : pools) {
+        ggml_threadpool_free(p.second);
+    }
     if (dctx) {
         ggml_free(dctx);
     }
@@ -329,6 +357,17 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             throw std::runtime_error("cannot allocate the weights");
         }
         m->bufs.push_back(buf);
+#if defined(__linux__)
+        {
+            // back the weights with transparent huge pages before they are first written: with THP defrag=madvise the
+            // fault path only compacts for madvised ranges, and decode streams the weights each token (TLB misses)
+            const uintptr_t a = (uintptr_t) ggml_backend_buffer_get_base(buf), e = a + ggml_backend_buffer_get_size(buf);
+            const uintptr_t h = 2u << 20, a2 = (a + h - 1) & ~(h - 1), e2 = e & ~(h - 1);
+            if (e2 > a2 && !getenv("TTF_NO_THP")) {
+                madvise((void *) a2, e2 - a2, MADV_HUGEPAGE);
+            }
+        }
+#endif
 
         // pass 2: fill
         std::vector<float> row;

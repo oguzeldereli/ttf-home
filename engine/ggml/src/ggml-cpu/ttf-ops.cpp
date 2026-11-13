@@ -57,6 +57,8 @@ void ggml_compute_forward_ttf_quant(const ggml_compute_params * params, ggml_ten
     }
 }
 
+static constexpr int64_t CHMAX = 256;
+
 void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * w   = dst->src[0];
     const ggml_tensor * qa  = dst->src[1];
@@ -92,11 +94,19 @@ void ggml_compute_forward_ttf_mm(const ggml_compute_params * params, ggml_tensor
     }
     const int8_t *       q = (const int8_t *) qa->data;
     std::vector<uint8_t> codes(T > 4 && !q2 ? Kp : 0);  // TQ1_P prefill: a row decoded once, reused over the tokens
-    // rows in chunks of 8, round-robin over threads (small N: adapter ranks)
-    const int64_t CH = 8;
+    // rows in chunks handed out dynamically (a shared counter, as ggml's mul_mat): on a hybrid CPU the slower cores
+    // take fewer chunks instead of holding up the barrier. ~16 chunks per thread, at least 8 rows: chunks of a few
+    // KB restart the hardware prefetcher too often (BitNet 2B decode, 8 threads: +4%)
+    const int64_t CH = std::min<int64_t>(CHMAX, std::max<int64_t>(8, N / (16 * params->nth) / 8 * 8));
     const int64_t nc = (N + CH - 1) / CH;
-    for (int64_t ci = params->ith; ci < nc; ci += params->nth) {
-        int32_t       a4[CH];  // decode, Q2P: the chunk's full groups of 4 rows in one pass each
+#ifdef GGML_USE_OPENMP
+    if (params->ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, params->nth);
+    }
+    ggml_barrier(params->threadpool);
+#endif  // else ggml_barrier left the counter at nth when this node started
+    for (int64_t ci = params->ith; ci < nc; ci = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+        int32_t       a4[CHMAX];  // decode, Q2P: the chunk's full groups of 4 rows in one pass each
         const int64_t n0 = ci * CH, n1 = std::min(N, (ci + 1) * CH);
         const int64_t n4 = (T == 1 && q2) ? n0 + (n1 - n0) / 4 * 4 : n0;
         for (int64_t n = n0; n < n4; n += 4) {
