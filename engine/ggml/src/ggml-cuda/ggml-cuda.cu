@@ -4486,6 +4486,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 
 // try and fuse nodes and return the number of nodes to skip
 // GGML_CUDA_TTF_LINEAR_OFF=1: no fused TTF linear (A/B)
+static bool ggml_cuda_ttf_norm_quant_disabled() {
+    static const bool d = getenv("TTF_NO_NQ_FUSE") != nullptr;
+    return d;
+}
+
 static bool ggml_cuda_ttf_linear_disabled() {
     static const bool v = getenv("GGML_CUDA_TTF_LINEAR_OFF") != nullptr;
     return v;
@@ -5021,6 +5026,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (ggml_cuda_conv_state_match(cgraph, i, p) > 0) {
             ggml_cuda_conv_state_launch(*cuda_ctx, p);
             return ggml_cuda_next_compute(cgraph, i) - i;      // the concat and the cpy; conv + silu skipped later
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM && !ggml_cuda_ttf_norm_quant_disabled()) {
+        // TTF: RMS_NORM, MUL (weight row), [views], TTF_QUANT of the product as one kernel; the norm and the product
+        // are not written (one use each)
+        const int jm = ggml_cuda_next_compute(cgraph, i);
+        const int jq = jm > 0 ? ggml_cuda_next_compute(cgraph, jm) : -1;
+        if (jq > 0) {
+            ggml_tensor * mul = cgraph->nodes[jm];
+            ggml_tensor * q   = cgraph->nodes[jq];
+            bool ok = mul->op == GGML_OP_MUL && (mul->src[0] == node || mul->src[1] == node) && q->op == GGML_OP_TTF_QUANT &&
+                      ggml_cuda_strip_views(q->src[0]) == mul && ggml_node_get_use_count(cgraph, i) == 1 &&
+                      ggml_node_get_use_count(cgraph, jm) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                      !(mul->flags & GGML_TENSOR_FLAG_OUTPUT);
+            for (int j = jm + 1; ok && j < jq; ++j) {  // the views between: one use each, of the chain
+                const ggml_tensor * v = cgraph->nodes[j];
+                ok = ggml_cuda_strip_views(v) == mul && ggml_node_get_use_count(cgraph, j) <= 1 && !(v->flags & GGML_TENSOR_FLAG_OUTPUT);
+            }
+            if (ok && ggml_cuda_ttf_norm_quant(*cuda_ctx, node, mul, q)) {
+                return jq - i;
+            }
         }
     }
 

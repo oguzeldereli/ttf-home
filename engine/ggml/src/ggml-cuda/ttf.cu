@@ -252,6 +252,134 @@ void ggml_cuda_op_ttf_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
     CUDA_CHECK(cudaGetLastError());
 }
 
+// RMS_NORM -> MUL (weight row) -> TTF_QUANT (no adapter) as one kernel, one block per row. The norm is ggml's
+// rms_norm_f32 vec path (same block size per width, same per-thread order, same block_reduce), so the values equal
+// the unfused graph's; they stay in registers for the quantisation (steps 0-4, as ttf_quant_kernel).
+template <int BS, int VPT>
+static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, const float * mul, const float eps,
+                                             const int K, const float * mu, const float * c, const int64_t Kp,
+                                             const bool bf16, char * dst, const int64_t nbd1) {
+    __shared__ float sf[32];
+    __shared__ int   si[32];
+    const int        tid = threadIdx.x;
+    const float4 *   x4  = (const float4 *) (x + blockIdx.x * sx);
+    const float4 *   m4  = (const float4 *) mul;
+    char *           o   = dst + blockIdx.x * nbd1;
+    const int        n4  = K / 4;
+    float4           xs[VPT];
+    float            tmp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k * BS;
+        if (i < n4) {
+            xs[k] = x4[i];
+            tmp += xs[k].x * xs[k].x + xs[k].y * xs[k].y + xs[k].z * xs[k].z + xs[k].w * xs[k].w;
+        }
+    }
+    tmp               = block_reduce<block_reduce_method::SUM, BS>(tmp, sf);
+    const float scale = rsqrtf(tmp / K + eps);
+    __syncthreads();  // sf reused below
+    float am = 0.0f;
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k * BS;
+        if (i < n4) {
+            float4       r = make_float4(scale * xs[k].x, scale * xs[k].y, scale * xs[k].z, scale * xs[k].w);
+            const float4 m = m4[i];
+            r.x *= m.x;
+            r.y *= m.y;
+            r.z *= m.z;
+            r.w *= m.w;
+            float * rv = &r.x;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {  // xc (steps 0-2)
+                const int64_t col = 4 * (int64_t) i + e;
+                float         t   = ttf_rd(rv[e], bf16);
+                if (mu) {
+                    t = ttf_rd(__fsub_rn(t, mu[col]), bf16);
+                }
+                if (c) {
+                    t = ttf_rd(__fmul_rn(t, c[col]), bf16);
+                }
+                rv[e] = t;
+                am    = fmaxf(am, fabsf(t));
+            }
+            xs[k] = r;
+        }
+    }
+    am             = ttf_block_max(am, sf);
+    const float fl = ttf_rd(1e-5f, bf16);
+    const float s  = __fmul_rn(fmaxf(am, fl), 1.0f / 127.0f);
+    int         qs = 0;
+#pragma unroll
+    for (int k = 0; k < VPT; k++) {
+        const int i = tid + k * BS;
+        if (i < n4) {
+            const float * rv = &xs[k].x;
+            char4         q4;
+            signed char * qp = &q4.x;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int q = (int) fminf(127.0f, fmaxf(-128.0f, rintf(__fdiv_rn(rv[e], s))));
+                qp[e]       = (signed char) q;
+                qs += q;
+            }
+            *(char4 *) (o + 4 * (int64_t) i) = q4;
+        }
+    }
+    for (int64_t k = K + tid; k < Kp; k += BS) {
+        o[k] = 0;
+    }
+    qs = ttf_block_sum_i(qs, si);
+    if (tid == 0) {
+        *(float *) (o + Kp)   = s;
+        *(int *) (o + Kp + 4) = qs;
+    }
+}
+
+// rms: RMS_NORM on x [K, rows] F32 (rows contiguous); mul: its MUL by a weight row; q: TTF_QUANT of the product (or
+// of a reshape of it), no adapter. False when the shapes do not fit the kernel (the caller then runs the nodes).
+bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul,
+                              ggml_tensor * q) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const int64_t       K = x->ne[0], rows = ggml_nrows(x);
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || q->src[3] || K % 4 != 0 || K > 16384 ||
+        x->nb[0] != sizeof(float) || x->nb[1] % 16 != 0 || ((uintptr_t) x->data % 16) != 0 || ggml_nrows(x) != x->ne[1] ||
+        w->ne[0] != K || ggml_nelements(w) != K || !ggml_is_contiguous(w) || ((uintptr_t) w->data % 16) != 0 ||
+        ggml_nrows(q) != rows || q->ne[0] < ggml_get_op_params_i32(q, 0) || !ggml_is_contiguous(q) ||
+        q->src[0]->ne[0] != K || (q->src[1] && !ggml_is_contiguous(q->src[1])) || (q->src[2] && !ggml_is_contiguous(q->src[2]))) {
+        return false;
+    }
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const int64_t Kp   = ggml_get_op_params_i32(q, 0);
+    const bool    bf16 = ggml_get_op_params_i32(q, 1) != 0;
+    const float * mu   = q->src[1] ? (const float *) q->src[1]->data : nullptr;
+    const float * c    = q->src[2] ? (const float *) q->src[2]->data : nullptr;
+    const int64_t n4   = K / 4;
+    auto go = [&](auto kern, const int bs) {
+        kern<<<(unsigned) rows, bs, 0, ctx.stream()>>>((const float *) x->data, x->nb[1] / 4, (const float *) w->data,
+                                                       eps, (int) K, mu, c, Kp, bf16, (char *) q->data, q->nb[1]);
+    };
+    // rms_norm_f32_dispatch's vec choices
+    if (n4 <= 32) {
+        go(ttf_norm_quant_kernel<32, 1>, 32);
+    } else if (n4 <= 128) {
+        go(ttf_norm_quant_kernel<128, 1>, 128);
+    } else if (n4 <= 256) {
+        go(ttf_norm_quant_kernel<256, 1>, 256);
+    } else if (n4 <= 512) {
+        go(ttf_norm_quant_kernel<512, 1>, 512);
+    } else if (n4 <= 1024) {
+        go(ttf_norm_quant_kernel<1024, 1>, 1024);
+    } else {
+        go(ttf_norm_quant_kernel<1024, 4>, 1024);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static __device__ __forceinline__ uint32_t ttf_tq1p_lut_entry(const uint32_t b) {
     uint32_t lo = 0;
     uint32_t p  = 1;
