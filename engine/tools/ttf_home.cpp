@@ -181,7 +181,8 @@ void print_ops(const ttf::Session & s, int n) {
     }
     std::sort(ops.rbegin(), ops.rend());
     for (size_t i = 0; i < ops.size() && i < 25; ++i) {
-        std::fprintf(stderr, "  %7.3f ms/call %5.1f%%  %s\n", ops[i].first / n, 100 * ops[i].first / tot, ops[i].second.c_str());
+        std::fprintf(stderr, "  %7.3f ms/call %5.1f%%  %5.0f nodes/call  %s\n", ops[i].first / n, 100 * ops[i].first / tot,
+                     (double) s.prof_ops.at(ops[i].second).second / n, ops[i].second.c_str());
     }
 }
 

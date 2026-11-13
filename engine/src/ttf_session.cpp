@@ -63,6 +63,9 @@ struct Builder {
     int64_t                              T     = 0;
     bool                                 last_only = false;
     bool                                 bf16;
+    // ttf_quant results by (data, offset, shape, mu, c, mag_B, Kp): parts on one input (q / k / v, gate / up) share
+    // the quantised activations (identical by construction: the same op on the same bytes)
+    std::map<std::vector<uintptr_t>, ggml_tensor *> qcache = {};
 
     ggml_tensor * rd(ggml_tensor * t) {  // round to D
         if (!bf16) {
@@ -129,7 +132,20 @@ struct Builder {
             throw std::runtime_error(p + ": input K " + std::to_string(x2->ne[0]) + " != " + std::to_string(P.K));
         }
         // step 6 (legacy adapter) fused: the down projection in ttf_quant, the up projection in ttf_mm
-        ggml_tensor * qa = ggml_ttf_quant(ctx, x2, P.mu, P.c, P.mag_A ? P.mag_B : nullptr, P.Kp, bf16);
+        ggml_tensor *                qb  = P.mag_A ? P.mag_B : nullptr;
+        const ggml_tensor *          src = x2;
+        size_t                       off = 0;
+        while (src->view_src && (src->op == GGML_OP_RESHAPE || src->op == GGML_OP_VIEW) && ggml_is_contiguous(src)) {
+            off += src->view_offs;
+            src = src->view_src;
+        }
+        const std::vector<uintptr_t> qk  = { (uintptr_t) src, off, (uintptr_t) x2->ne[0], (uintptr_t) x2->ne[1],
+                                             (uintptr_t) x2->ne[2], (uintptr_t) x2->ne[3], (uintptr_t) P.mu,
+                                             (uintptr_t) P.c, (uintptr_t) qb, (uintptr_t) P.Kp, ggml_is_contiguous(x2) };
+        ggml_tensor *& qa = qcache[qk];
+        if (!qa) {
+            qa = ggml_ttf_quant(ctx, x2, P.mu, P.c, qb, P.Kp, bf16);
+        }
         return ggml_ttf_mm(ctx, P.w, qa, P.beta, P.mag_B ? P.mag_A : nullptr, P.r, P.b, acc_in, bf16);
     }
 
