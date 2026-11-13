@@ -289,6 +289,16 @@ struct Builder {
         ggml_tensor * k2 = ggml_reshape_2d(ctx, cont(k), kv.hd * kv.hkv, T);
         ggml_tensor * v2 = ggml_reshape_2d(ctx, cont(v), kv.hd * kv.hkv, T);
         ggml_tensor * kc = ggml_set_rows(ctx, kv.k, k2, pos);
+        if (s.fa) {  // V cached like K; Q [hd, T, H], K / V [hd, S, Hkv] views; out [hd, H, T]
+            ggml_tensor * vc = ggml_set_rows(ctx, kv.v, v2, pos);
+            ggml_tensor * K  = ggml_view_3d(ctx, kc, kv.hd, S, kv.hkv, kc->nb[1], kv.hd * sizeof(float), 0);
+            ggml_tensor * V  = ggml_view_3d(ctx, vc, kv.hd, S, kv.hkv, vc->nb[1], kv.hd * sizeof(float), 0);
+            ggml_tensor * o  = ggml_flash_attn_ext(ctx, ggml_permute(ctx, q, 0, 2, 1, 3), K, V, mask, scl, 0.0f, 0.0f);
+            if (s.fa_exact) {  // the vec path for any T (no tiled prefill): decode == prefill exactly
+                ggml_flash_attn_ext_set_prec(o, GGML_PREC_F32);
+            }
+            return o;
+        }
         // V is cached transposed ([max_ctx, C]: position fastest), so the second product reads it without a copy;
         // written element-wise by set_rows on its one-float rows at c * max_ctx + pos (index input vidx, per C)
         const int64_t C  = kv.hd * kv.hkv;
@@ -707,6 +717,8 @@ struct Builder {
 Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_threads(n_threads_), max_ctx(max_ctx_) {
     backend = m.backend;
     m.use_threads(n_threads);
+    fa       = m.device == "cpu" && !getenv("TTF_NO_FA");
+    fa_exact = getenv("TTF_FA_EXACT") != nullptr;
     const json & st = m.ir.value("state", json::array());
     ggml_init_params ip = { ggml_tensor_overhead() * (st.size() * 2 + 4), nullptr, true };
     sctx                = ggml_init(ip);
@@ -729,7 +741,8 @@ Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_
         kvs.hd  = e.at("head_dim");
         kvs.hkv = e.at("heads_kv");
         kvs.k   = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, kvs.hd * kvs.hkv, max_ctx);
-        kvs.v   = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, max_ctx, kvs.hd * kvs.hkv);  // transposed (see op_attn)
+        kvs.v   = fa ? ggml_new_tensor_2d(sctx, GGML_TYPE_F32, kvs.hd * kvs.hkv, max_ctx)
+                     : ggml_new_tensor_2d(sctx, GGML_TYPE_F32, max_ctx, kvs.hd * kvs.hkv);  // transposed (see op_attn)
         kvs.filled.assign(max_ctx, false);
         kv[e.at("id").get<std::string>()] = kvs;
     }
@@ -883,7 +896,7 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             e.inputs.emplace_back(name, t);
         }
         if (!used.empty()) {
-            b.mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S, T);
+            b.mask = ggml_new_tensor_2d(ctx, fa ? GGML_TYPE_F16 : GGML_TYPE_F32, S, T);  // flash attn: F16
             ggml_set_name(b.mask, "kq_mask");
             ggml_set_input(b.mask);
         }
@@ -1042,7 +1055,8 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         }
         ggml_backend_tensor_set_async(backend, e->vidx[i].second, vix[i].data(), 0, vix[i].size() * sizeof(int32_t));
     }
-    std::vector<float> mk;
+    std::vector<float>       mk;
+    std::vector<ggml_fp16_t> mk16;
     if (e->mask) {
         const auto & f = used[0]->filled;
         mk.resize(S * T);
@@ -1051,7 +1065,13 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
                 mk[t * S + j] = (f[j] && j <= pos[t]) ? 0.0f : -std::numeric_limits<float>::infinity();
             }
         }
-        ggml_backend_tensor_set_async(backend, e->mask, mk.data(), 0, mk.size() * sizeof(float));
+        if (e->mask->type == GGML_TYPE_F16) {
+            mk16.resize(mk.size());
+            ggml_fp32_to_fp16_row(mk.data(), mk16.data(), (int64_t) mk.size());
+            ggml_backend_tensor_set_async(backend, e->mask, mk16.data(), 0, mk16.size() * sizeof(ggml_fp16_t));
+        } else {
+            ggml_backend_tensor_set_async(backend, e->mask, mk.data(), 0, mk.size() * sizeof(float));
+        }
     }
     if (fresh) {  // bytes read per call (the roofline numerator)
         std::map<const ggml_tensor *, std::pair<int, int64_t>> seen;  // per tensor: kind, the most any op reads of it

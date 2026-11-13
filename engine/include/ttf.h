@@ -118,6 +118,12 @@ struct Session {
     const Model &  m;
     int            n_threads;
     int64_t        max_ctx;
+    // causal attention by ggml_flash_attn_ext (CPU; V cached like K). Else two mul_mats with V cached transposed
+    // (CUDA). TTF_NO_FA=1: the mul_mat path on the CPU too.
+    bool           fa = false;
+    // flash attn: the per-row vec path also for prefill (T >= 32 otherwise tiles: ~40% faster at T 1024, but a row's
+    // result then differs from decode's in the last bits). Set by --check-decode / TTF_FA_EXACT=1. Before the first call.
+    bool           fa_exact = false;
     ggml_backend_t backend = nullptr;
     ggml_context * sctx    = nullptr;  // state tensors
     ggml_backend_buffer_t sbuf = nullptr;

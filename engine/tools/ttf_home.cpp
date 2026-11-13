@@ -260,6 +260,7 @@ int run_lm(const ttf::Model & m, const Args & a) {
     const std::string graph = m.ir.at("driver").at("graphs").at("step");
     const int64_t     ctx   = a.ctx ? a.ctx : std::max<int64_t>(2048, a.pp + a.tg + 8);
     ttf::Session      s(m, a.threads, ctx);
+    s.fa_exact = s.fa_exact || a.check_dec > 0;  // the state path check compares bit for bit
     if (a.bench) {
         const int64_t        nv = m.config.value("vocab_size", (int64_t) 1000);
         std::mt19937         rng(1);
