@@ -607,6 +607,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_TTF_QUANT,
+        GGML_OP_TTF_MM,
+
         GGML_OP_COUNT,
     };
 
@@ -2900,6 +2903,36 @@ extern "C" {
         struct ggml_tensor *  a,
         struct ggml_tensor *  grad,
         struct ggml_tensor *  sgd_params); // alpha, weight decay
+
+    // TTF (ternary) linear, as the trainer computes it (ttf TTF_FORMAT_IR_SPEC.md, Arithmetic steps 1-8):
+    // ttf_quant: x F32 [K, ...] -> I8 [Kp + 32 + 4 rank, ...] per row: Kp int8 codes of Q(xc), xc = rD(rD(x - mu) * c)
+    //   (zero past K), then the fp32 scale and the int32 code sum (bytes Kp .. Kp + 8), then, with mag_B (F32 [K, rank],
+    //   in D), the legacy adapter's down projection u = rD(xc @ mag_B) as rank floats at Kp + 32.
+    //   mu / c / mag_B optional (NULL), already in D. D = bf16 when d_bf16.
+    GGML_API struct ggml_tensor * ggml_ttf_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * mu,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * mag_B,
+        int64_t               Kp,
+        bool                  d_bf16);
+
+    // ttf_mm: w TQ1_P [Kp, N] (or Q2P: I8 [Kp / 4, N], 128 trits per 32 bytes, element 32 n + b = bits 2n of byte b,
+    //   code = trit + 1) times qa (ttf_quant's output) -> F32 [N, ...]:
+    //   t = bf16((s * acc) * beta); y = rD(t); [y = rD(y + rD(u @ mag_A^T))]; [y = rD(y * r)]; [y = rD(y + b)];
+    //   [y = rD(acc_in + y)]. mag_A (F32 [rank, N], in D; qa must carry u) / r / b / acc_in optional (NULL);
+    //   r and b already in D.
+    GGML_API struct ggml_tensor * ggml_ttf_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * qa,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * mag_A,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * acc_in,
+        bool                  d_bf16);
 
     // build forward multiple tensors and select one of them for computing
     // this is useful for creating graphs that have constant topology but compute different things based on the input

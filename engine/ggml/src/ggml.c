@@ -1123,9 +1123,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "TTF_QUANT",
+    "TTF_MM",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1239,9 +1242,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "ttf_quant(x)",
+    "ttf_mm(w,x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6446,6 +6452,69 @@ struct ggml_tensor * ggml_opt_step_sgd(
     result->src[1] = grad;
     result->src[2] = params;
 
+    return result;
+}
+
+// ttf_quant / ttf_mm
+
+struct ggml_tensor * ggml_ttf_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * mu,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * mag_B,
+        int64_t               Kp,
+        bool                  d_bf16) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(Kp >= x->ne[0] && Kp % 32 == 0);
+    GGML_ASSERT(!mu || (mu->type == GGML_TYPE_F32 && mu->ne[0] >= x->ne[0] && ggml_is_contiguous(mu)));
+    GGML_ASSERT(!c  || (c->type  == GGML_TYPE_F32 && c->ne[0]  >= x->ne[0] && ggml_is_contiguous(c)));
+    GGML_ASSERT(!mag_B || (mag_B->type == GGML_TYPE_F32 && mag_B->ne[0] == x->ne[0] && ggml_is_contiguous(mag_B)));
+    const int64_t rank = mag_B ? mag_B->ne[1] : 0;
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, Kp + 32 + 4*rank, x->ne[1], x->ne[2], x->ne[3]);
+    const int32_t params[2] = { (int32_t) Kp, d_bf16 ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_TTF_QUANT;
+    result->src[0] = x;
+    result->src[1] = mu;
+    result->src[2] = c;
+    result->src[3] = mag_B;
+    return result;
+}
+
+struct ggml_tensor * ggml_ttf_mm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * qa,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * mag_A,
+        struct ggml_tensor  * r,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * acc_in,
+        bool                  d_bf16) {
+    // w: TQ1_P [Kp, N], or Q2P as I8 [Kp / 4, N] (128 trits / 32 bytes, 2-bit codes; the CPU layout)
+    GGML_ASSERT((w->type == GGML_TYPE_TQ1_P || w->type == GGML_TYPE_I8) && qa->type == GGML_TYPE_I8);
+    const int64_t Kp   = w->type == GGML_TYPE_TQ1_P ? w->ne[0] : 4*w->ne[0];
+    GGML_ASSERT(w->type == GGML_TYPE_TQ1_P || Kp % 128 == 0);
+    const int64_t rank = mag_A ? mag_A->ne[0] : 0;
+    GGML_ASSERT(qa->ne[0] == Kp + 32 + 4*rank);
+    GGML_ASSERT(!mag_A || (mag_A->type == GGML_TYPE_F32 && mag_A->ne[1] == w->ne[1] && ggml_is_contiguous(mag_A)));
+    GGML_ASSERT(beta && beta->type == GGML_TYPE_F32 && ggml_nelements(beta) == 1);
+    const int64_t N = w->ne[1];
+    GGML_ASSERT(!r || (r->type == GGML_TYPE_F32 && r->ne[0] == N));
+    GGML_ASSERT(!b || (b->type == GGML_TYPE_F32 && b->ne[0] == N));
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, N, qa->ne[1], qa->ne[2], qa->ne[3]);
+    GGML_ASSERT(!acc_in || (acc_in->type == GGML_TYPE_F32 && ggml_are_same_shape(acc_in, result)));
+    const int32_t params[1] = { d_bf16 ? 1 : 0 };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_TTF_MM;
+    result->src[0] = w;
+    result->src[1] = qa;
+    result->src[2] = beta;
+    result->src[3] = mag_A;
+    result->src[4] = r;
+    result->src[5] = b;
+    result->src[6] = acc_in;
     return result;
 }
 
