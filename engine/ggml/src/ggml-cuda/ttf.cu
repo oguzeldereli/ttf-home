@@ -109,6 +109,46 @@ static __device__ __forceinline__ int ttf_block_sum_i(int v, int * sh) {
 // one block per row; 256 threads
 // grid (rows, 1 + ceil(rank / 8)), 256 threads: blockIdx.y 0 makes the codes, s and qsum; blockIdx.y > 0 makes 8 of
 // the adapter's down projections u_j = rD(xc . mB_j), one warp each, in dot_f32_64's order
+// the adapter's down projection u_j = xc . bj by one warp (lane-strided, two chains, then a shuffle tree; lane 0
+// holds the sum); xk(k) gives xc[k]. One order for every kernel that makes u (bit-identical results)
+template <class XK>
+static __device__ __forceinline__ float ttf_adapter_dot(XK xk, const float * bj, const int64_t K, const int lane) {
+    float         a0 = 0.0f, a1 = 0.0f;
+    const int64_t K64 = K / 64 * 64;
+    int64_t       k0  = 0;
+    // full blocks, 4 at a time: the loads of 4 blocks issue before the (ordered) fma chains
+#pragma unroll 2
+    for (; k0 + 256 <= K64; k0 += 256) {
+        float xa[8], wa[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const int64_t k = k0 + 32 * u + lane;
+            xa[u]           = xk(k);
+            wa[u]           = bj[k];
+        }
+#pragma unroll
+        for (int u = 0; u < 8; u += 2) {
+            a0 = __fmaf_rn(xa[u], wa[u], a0);
+            a1 = __fmaf_rn(xa[u + 1], wa[u + 1], a1);
+        }
+    }
+    for (; k0 < K; k0 += 64) {
+        const int64_t k = k0 + lane;
+        if (k < K) {
+            a0 = __fmaf_rn(xk(k), bj[k], a0);
+        }
+        if (k + 32 < K) {
+            a1 = __fmaf_rn(xk(k + 32), bj[k + 32], a1);
+        }
+    }
+    float s = __fadd_rn(a0, a1);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        s = __fadd_rn(s, __shfl_down_sync(0xffffffff, s, off));
+    }
+    return s;
+}
+
 // up to TTF_QMAX quantisations of one input in one launch (parts on one input: own mu / c / adapter), blockIdx.z
 struct ttf_qpart {
     const float * mu;
@@ -156,39 +196,7 @@ static __global__ void ttf_quant_kernel(const char * x, const int64_t nbx1, cons
             return;
         }
         const float * bj = mB + (int64_t) j * K;
-        float         a0 = 0.0f, a1 = 0.0f;
-        const int64_t K64 = K / 64 * 64;
-        int64_t       k0  = 0;
-        // full blocks, 4 at a time: the loads of 4 blocks issue before the (ordered) fma chains
-#pragma unroll 2
-        for (; k0 + 256 <= K64; k0 += 256) {
-            float xa[8], wa[8];
-#pragma unroll
-            for (int u = 0; u < 8; ++u) {
-                const int64_t k = k0 + 32 * u + lane;
-                xa[u]           = staged ? xs[k] : ttf_xc(xr, mu, c, k, bf16);
-                wa[u]           = bj[k];
-            }
-#pragma unroll
-            for (int u = 0; u < 8; u += 2) {
-                a0 = __fmaf_rn(xa[u], wa[u], a0);
-                a1 = __fmaf_rn(xa[u + 1], wa[u + 1], a1);
-            }
-        }
-        for (; k0 < K; k0 += 64) {
-            const int64_t k = k0 + lane;
-            if (k < K) {
-                a0 = __fmaf_rn(ttf_xc(xr, mu, c, k, bf16), bj[k], a0);
-            }
-            if (k + 32 < K) {
-                a1 = __fmaf_rn(ttf_xc(xr, mu, c, k + 32, bf16), bj[k + 32], a1);
-            }
-        }
-        float s = __fadd_rn(a0, a1);
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            s = __fadd_rn(s, __shfl_down_sync(0xffffffff, s, off));
-        }
+        const float   s  = ttf_adapter_dot([&](int64_t k) { return staged ? xs[k] : ttf_xc(xr, mu, c, k, bf16); }, bj, K, lane);
         if (lane == 0) {
             *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(s, bf16);
         }
@@ -307,16 +315,22 @@ bool ggml_cuda_ttf_quant_multi(ggml_backend_cuda_context & ctx, ggml_tensor * co
 // RMS_NORM -> MUL (weight row) -> TTF_QUANT (no adapter) as one kernel, one block per row. The norm is ggml's
 // rms_norm_f32 vec path (same block size per width, same per-thread order, same block_reduce), so the values equal
 // the unfused graph's; they stay in registers for the quantisation (steps 0-4, as ttf_quant_kernel).
+// grid (rows, 1 + adapter blocks, parts): blockIdx.y > 0 recomputes the row's norm (same reduction), stages xc in
+// shared memory and makes BS / 32 of the part's adapter down projections (ttf_adapter_dot, as ttf_quant_kernel)
 template <int BS, int VPT>
 static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, const float * mul, const float eps,
-                                             const int K, const float * mu, const float * c, const int64_t Kp,
-                                             const bool bf16, char * dst, const int64_t nbd1) {
+                                             const int K, const bool bf16, const ttf_qparts P) {
     __shared__ float sf[32];
     __shared__ int   si[32];
+    const int        z    = blockIdx.z;
+    const ttf_qpart  qp   = z == 0 ? P.p[0] : z == 1 ? P.p[1] : z == 2 ? P.p[2] : P.p[3];
+    const float *    mu   = qp.mu;
+    const float *    c    = qp.c;
+    const int64_t    Kp   = qp.Kp;
     const int        tid = threadIdx.x;
     const float4 *   x4  = (const float4 *) (x + blockIdx.x * sx);
     const float4 *   m4  = (const float4 *) mul;
-    char *           o   = dst + blockIdx.x * nbd1;
+    char *           o   = qp.dst + blockIdx.x * qp.nbd1;
     const int        n4  = K / 4;
     float4           xs[VPT];
     float            tmp = 0.0f;
@@ -359,6 +373,26 @@ static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, 
             xs[k] = r;
         }
     }
+    if (blockIdx.y > 0) {
+        extern __shared__ float xsh[];
+#pragma unroll
+        for (int k = 0; k < VPT; k++) {
+            const int i = tid + k * BS;
+            if (i < n4) {
+                *(float4 *) (xsh + 4 * i) = xs[k];
+            }
+        }
+        __syncthreads();
+        const int lane = tid % WARP_SIZE;
+        const int j    = (blockIdx.y - 1) * (BS / WARP_SIZE) + tid / WARP_SIZE;
+        if (j < qp.rank) {
+            const float s = ttf_adapter_dot([&](int64_t k) { return xsh[k]; }, qp.mB + (int64_t) j * K, K, lane);
+            if (lane == 0) {
+                *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(s, bf16);
+            }
+        }
+        return;
+    }
     am             = ttf_block_max(am, sf);
     const float fl = ttf_rd(1e-5f, bf16);
     const float s  = __fmul_rn(fmaxf(am, fl), 1.0f / 127.0f);
@@ -392,27 +426,47 @@ static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, 
 // rms: RMS_NORM on x [K, rows] F32 (rows contiguous); mul: its MUL by a weight row; q: TTF_QUANT of the product (or
 // of a reshape of it), no adapter. False when the shapes do not fit the kernel (the caller then runs the nodes).
 bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul,
-                              ggml_tensor * q) {
+                              ggml_tensor * const * qs, const int np) {
     const ggml_tensor * x = rms->src[0];
     const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
     const int64_t       K = x->ne[0], rows = ggml_nrows(x);
-    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || q->src[3] || K % 4 != 0 || K > 16384 ||
+    if (np < 1 || np > TTF_QMAX || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || K % 4 != 0 || K > 16384 ||
         x->nb[0] != sizeof(float) || x->nb[1] % 16 != 0 || ((uintptr_t) x->data % 16) != 0 || ggml_nrows(x) != x->ne[1] ||
-        w->ne[0] != K || ggml_nelements(w) != K || !ggml_is_contiguous(w) || ((uintptr_t) w->data % 16) != 0 ||
-        ggml_nrows(q) != rows || q->ne[0] < ggml_get_op_params_i32(q, 0) || !ggml_is_contiguous(q) ||
-        q->src[0]->ne[0] != K || (q->src[1] && !ggml_is_contiguous(q->src[1])) || (q->src[2] && !ggml_is_contiguous(q->src[2]))) {
+        w->ne[0] != K || ggml_nelements(w) != K || !ggml_is_contiguous(w) || ((uintptr_t) w->data % 16) != 0) {
+        return false;
+    }
+    ttf_qparts P = {};
+    int        rmax = 0;
+    for (int p = 0; p < np; ++p) {
+        const ggml_tensor * q  = qs[p];
+        const ggml_tensor * mB = q->src[3];
+        if (ggml_nrows(q) != rows || q->ne[0] < ggml_get_op_params_i32(q, 0) || !ggml_is_contiguous(q) ||
+                q->src[0]->ne[0] != K || (q->src[1] && !ggml_is_contiguous(q->src[1])) ||
+                (q->src[2] && !ggml_is_contiguous(q->src[2])) || (mB && (!ggml_is_contiguous(mB) || mB->ne[0] != K)) ||
+                ggml_get_op_params_i32(q, 1) != ggml_get_op_params_i32(qs[0], 1)) {
+            return false;
+        }
+        P.p[p].mu   = q->src[1] ? (const float *) q->src[1]->data : nullptr;
+        P.p[p].c    = q->src[2] ? (const float *) q->src[2]->data : nullptr;
+        P.p[p].mB   = mB ? (const float *) mB->data : nullptr;
+        P.p[p].dst  = (char *) q->data;
+        P.p[p].nbd1 = q->nb[1];
+        P.p[p].Kp   = ggml_get_op_params_i32(q, 0);
+        P.p[p].rank = mB ? (int) mB->ne[1] : 0;
+        rmax        = std::max(rmax, P.p[p].rank);
+    }
+    if (rmax > 0 && K * (int64_t) sizeof(float) > 48 * 1024) {
         return false;
     }
     float eps;
     memcpy(&eps, rms->op_params, sizeof(float));
-    const int64_t Kp   = ggml_get_op_params_i32(q, 0);
-    const bool    bf16 = ggml_get_op_params_i32(q, 1) != 0;
-    const float * mu   = q->src[1] ? (const float *) q->src[1]->data : nullptr;
-    const float * c    = q->src[2] ? (const float *) q->src[2]->data : nullptr;
+    const bool    bf16 = ggml_get_op_params_i32(qs[0], 1) != 0;
     const int64_t n4   = K / 4;
+    const int     xsz  = rmax > 0 ? (int) (K * sizeof(float)) : 0;
     auto go = [&](auto kern, const int bs) {
-        kern<<<(unsigned) rows, bs, 0, ctx.stream()>>>((const float *) x->data, x->nb[1] / 4, (const float *) w->data,
-                                                       eps, (int) K, mu, c, Kp, bf16, (char *) q->data, q->nb[1]);
+        const dim3 grid((unsigned) rows, 1 + (rmax + bs / WARP_SIZE - 1) / (bs / WARP_SIZE), (unsigned) np);
+        kern<<<grid, bs, xsz, ctx.stream()>>>((const float *) x->data, x->nb[1] / 4, (const float *) w->data, eps,
+                                              (int) K, bf16, P);
     };
     // rms_norm_f32_dispatch's vec choices
     if (n4 <= 32) {

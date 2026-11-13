@@ -5035,23 +5035,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (node->op == GGML_OP_RMS_NORM && !ggml_cuda_ttf_norm_quant_disabled()) {
-        // TTF: RMS_NORM, MUL (weight row), [views], TTF_QUANT of the product as one kernel; the norm and the product
-        // are not written (one use each)
+        // TTF: RMS_NORM, MUL (weight row), [views], then the TTF_QUANTs of the product (adjacent: the session groups
+        // the parts on one input) as one kernel; the norm and the product are not written (the norm has one use, the
+        // product only the quants, directly or through one-use views between)
         const int jm = ggml_cuda_next_compute(cgraph, i);
-        const int jq = jm > 0 ? ggml_cuda_next_compute(cgraph, jm) : -1;
-        if (jq > 0) {
-            ggml_tensor * mul = cgraph->nodes[jm];
-            ggml_tensor * q   = cgraph->nodes[jq];
-            bool ok = mul->op == GGML_OP_MUL && (mul->src[0] == node || mul->src[1] == node) && q->op == GGML_OP_TTF_QUANT &&
-                      ggml_cuda_strip_views(q->src[0]) == mul && ggml_node_get_use_count(cgraph, i) == 1 &&
-                      ggml_node_get_use_count(cgraph, jm) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-                      !(mul->flags & GGML_TENSOR_FLAG_OUTPUT);
-            for (int j = jm + 1; ok && j < jq; ++j) {  // the views between: one use each, of the chain
-                const ggml_tensor * v = cgraph->nodes[j];
-                ok = ggml_cuda_strip_views(v) == mul && ggml_node_get_use_count(cgraph, j) <= 1 && !(v->flags & GGML_TENSOR_FLAG_OUTPUT);
+        ggml_tensor * mul = jm > 0 ? cgraph->nodes[jm] : nullptr;
+        if (mul && mul->op == GGML_OP_MUL && (mul->src[0] == node || mul->src[1] == node) &&
+                ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                !(mul->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            ggml_tensor * qs[4];
+            int np = 0, last = -1;
+            for (int j = jm + 1; j < cgraph->n_nodes; ++j) {
+                ggml_tensor * t = cgraph->nodes[j];
+                if (ggml_cuda_is_view_or_noop(t)) {
+                    if (ggml_cuda_strip_views(t) != mul) {
+                        break;  // an unrelated view: the group ends
+                    }
+                    continue;
+                }
+                if (t->op != GGML_OP_TTF_QUANT || ggml_cuda_strip_views(t->src[0]) != mul || np == 4) {
+                    break;
+                }
+                qs[np++] = t;
+                last     = j;
             }
-            if (ok && ggml_cuda_ttf_norm_quant(*cuda_ctx, node, mul, q)) {
-                return jq - i;
+            // every use of the product and of the views of it up to the last quant comes from inside the group
+            bool ok   = np > 0;
+            int  have = ok ? ggml_node_get_use_count(cgraph, jm) : 0, seen = 0;
+            for (int j = jm + 1; ok && j <= last; ++j) {
+                const ggml_tensor * t = cgraph->nodes[j];
+                if (t->op != GGML_OP_TTF_QUANT) {
+                    ok = !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+                    have += ggml_node_get_use_count(cgraph, j);
+                }
+                for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                    const ggml_tensor * u = t->src[si];
+                    seen += u && (u == mul || (ggml_cuda_is_view_or_noop(u) && ggml_cuda_strip_views(u) == mul));
+                }
+            }
+            if (ok && have == seen && ggml_cuda_ttf_norm_quant(*cuda_ctx, node, mul, qs, np)) {
+                return last - i;
             }
         }
     }
