@@ -119,7 +119,7 @@ struct Session {
     ggml_context * sctx    = nullptr;  // state tensors
     ggml_backend_buffer_t sbuf = nullptr;
     struct Kv {
-        ggml_tensor *     k = nullptr, *v = nullptr;  // F32 [head_dim * heads_kv, max_ctx]
+        ggml_tensor *     k = nullptr, *v = nullptr;  // F32 k [head_dim * heads_kv, max_ctx], v transposed [max_ctx, C]
         int64_t           hd = 0, hkv = 0;
         std::vector<bool> filled;
     };
@@ -141,6 +141,7 @@ struct Session {
         ggml_gallocr_t                                     galloc = nullptr;
         std::vector<std::pair<std::string, ggml_tensor *>> inputs;
         ggml_tensor *                                      mask = nullptr;
+        std::vector<std::pair<int64_t, ggml_tensor *>>     vidx;  // transposed-V write indices per width
         std::vector<ggml_tensor *>                         outs;
         std::vector<int>                                   out_nd;
         int64_t                                            wbytes = 0, sbytes = 0;

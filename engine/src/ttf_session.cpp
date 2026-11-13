@@ -66,6 +66,17 @@ struct Builder {
     // ttf_quant results by (data, offset, shape, mu, c, mag_B, Kp): parts on one input (q / k / v, gate / up) share
     // the quantised activations (identical by construction: the same op on the same bytes)
     std::map<std::vector<uintptr_t>, ggml_tensor *> qcache = {};
+    std::map<int64_t, ggml_tensor *>               vidx   = {};  // per V width C: I32 [C T], c * max_ctx + pos[t]
+
+    ggml_tensor * vidx_for(int64_t C) {
+        ggml_tensor *& t = vidx[C];
+        if (!t) {
+            t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, C * T);
+            ggml_set_name(t, ("vidx" + std::to_string(C)).c_str());
+            ggml_set_input(t);
+        }
+        return t;
+    }
 
     ggml_tensor * rd(ggml_tensor * t) {  // round to D
         if (!bf16) {
@@ -278,14 +289,19 @@ struct Builder {
         ggml_tensor * k2 = ggml_reshape_2d(ctx, cont(k), kv.hd * kv.hkv, T);
         ggml_tensor * v2 = ggml_reshape_2d(ctx, cont(v), kv.hd * kv.hkv, T);
         ggml_tensor * kc = ggml_set_rows(ctx, kv.k, k2, pos);
-        ggml_tensor * vc = ggml_set_rows(ctx, kv.v, v2, pos);
+        // V is cached transposed ([max_ctx, C]: position fastest), so the second product reads it without a copy;
+        // written element-wise by set_rows on its one-float rows at c * max_ctx + pos (index input vidx, per C)
+        const int64_t C  = kv.hd * kv.hkv;
+        ggml_tensor * vi = vidx_for(C);
+        ggml_tensor * vf = ggml_reshape_2d(ctx, kv.v, 1, C * s.max_ctx);
+        ggml_tensor * vc = ggml_set_rows(ctx, vf, ggml_reshape_2d(ctx, v2, 1, C * T), vi);
+        ggml_tensor * vt = ggml_reshape_2d(ctx, vc, s.max_ctx, C);
         ggml_tensor * K  = ggml_view_3d(ctx, kc, kv.hd, kv.hkv, S, kv.hd * sizeof(float), kc->nb[1], 0);
-        ggml_tensor * V  = ggml_view_3d(ctx, vc, kv.hd, kv.hkv, S, kv.hd * sizeof(float), vc->nb[1], 0);
         ggml_tensor * Q  = ggml_permute(ctx, q, 0, 2, 1, 3);                              // [hd, T, H]
         ggml_tensor * Kp = ggml_permute(ctx, K, 0, 2, 1, 3);                              // [hd, S, Hkv]
         ggml_tensor * kq = ggml_mul_mat(ctx, Kp, Q);                                      // [S, T, H]
         kq               = ggml_soft_max_ext(ctx, kq, mask, scl, 0.0f);
-        ggml_tensor * Vt = cont(ggml_permute(ctx, V, 1, 2, 0, 3));              // [S, hd, Hkv]
+        ggml_tensor * Vt = ggml_view_3d(ctx, vt, S, kv.hd, kv.hkv, vt->nb[1], kv.hd * vt->nb[1], 0);  // [S, hd, Hkv]
         ggml_tensor * o  = ggml_mul_mat(ctx, Vt, kq);                                     // [hd, T, H]
         return cont(ggml_permute(ctx, o, 0, 2, 1, 3));                          // [hd, H, T]
         (void) H;
@@ -715,7 +731,7 @@ Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_
         kvs.hd  = e.at("head_dim");
         kvs.hkv = e.at("heads_kv");
         kvs.k   = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, kvs.hd * kvs.hkv, max_ctx);
-        kvs.v   = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, kvs.hd * kvs.hkv, max_ctx);
+        kvs.v   = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, max_ctx, kvs.hd * kvs.hkv);  // transposed (see op_attn)
         kvs.filled.assign(max_ctx, false);
         kv[e.at("id").get<std::string>()] = kvs;
     }
@@ -877,6 +893,9 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         for (const auto & n : g.at("nodes")) {
             b.node(n);
         }
+        for (auto & [C, t] : b.vidx) {
+            e.vidx.emplace_back(C, t);
+        }
         // TTF_DUMP=DIR: every IR value of this call to DIR/<name>.bin (f32 / i32 raw) + DIR/index.json (ggml ne)
         if (dump_dir) {
             for (auto & [name, t] : b.val) {
@@ -1012,6 +1031,17 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         ggml_backend_tensor_set_async(backend, t,
                                       h.type == GGML_TYPE_F32 ? (const void *) h.f.data() : (const void *) h.i.data(), 0,
                                       ggml_nbytes(t));
+    }
+    std::vector<std::vector<int32_t>> vix(e->vidx.size());
+    for (size_t i = 0; i < e->vidx.size(); ++i) {
+        const int64_t C = e->vidx[i].first;
+        vix[i].resize(C * T);
+        for (int64_t t = 0; t < T; ++t) {
+            for (int64_t c = 0; c < C; ++c) {
+                vix[i][t * C + c] = (int32_t) (c * max_ctx + pos[t]);
+            }
+        }
+        ggml_backend_tensor_set_async(backend, e->vidx[i].second, vix[i].data(), 0, vix[i].size() * sizeof(int32_t));
     }
     std::vector<float> mk;
     if (e->mask) {
