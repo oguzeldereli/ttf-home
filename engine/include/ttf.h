@@ -124,11 +124,14 @@ struct Session {
     // flash attn: the per-row vec path also for prefill (T >= 32 otherwise tiles: ~40% faster at T 1024, but a row's
     // result then differs from decode's in the last bits). Set by --check-decode / TTF_FA_EXACT=1. Before the first call.
     bool           fa_exact = false;
+    // CUDA: V cached like K; decode-sized calls (T <= 16) by ggml_flash_attn_ext on the f32 cache (ttf's flash-decoding
+    // kernel), prefill by the two mul_mats (V copied transposed). TTF_NO_CUDA_FA=1: the transposed cache and mul_mats.
+    bool           dfa = false;
     ggml_backend_t backend = nullptr;
     ggml_context * sctx    = nullptr;  // state tensors
     ggml_backend_buffer_t sbuf = nullptr;
     struct Kv {
-        ggml_tensor *     k = nullptr, *v = nullptr;  // F32 k [head_dim * heads_kv, max_ctx], v transposed [max_ctx, C]
+        ggml_tensor *     k = nullptr, *v = nullptr;  // F32 k [head_dim * heads_kv, max_ctx]; v like k (fa / dfa) or transposed [max_ctx, C]
         int64_t           hd = 0, hkv = 0;
         std::vector<bool> filled;
     };

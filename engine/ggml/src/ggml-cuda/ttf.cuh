@@ -11,3 +11,6 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 // RMS_NORM, MUL (weight row), then 1..4 TTF_QUANTs of the product (with or without adapters) as one kernel
 bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul,
                               ggml_tensor * const * qs, int np);
+// GGML_OP_FLASH_ATTN_EXT with an f32 K (and f32 / bf16 V), decode-sized Q: ttf's flash-decoding kernel
+bool ggml_cuda_ttf_attn_supported(const ggml_tensor * dst);
+void ggml_cuda_ttf_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

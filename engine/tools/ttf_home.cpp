@@ -5,7 +5,7 @@
 //   ttf-home MODEL "text" [-n N] [--temp T] [--top-k K] [--seed S]      text model: the continuation on stdout
 //   ttf-home MODEL "text" [-o out.wav] [--seed S] [--timesteps N] [--cfg F] [--max-len N]   speech model
 //   ttf-home MODEL --list FILE           speech model: one load, then each line "out.wav<TAB>text[<TAB>seed]"
-//   ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3]
+//   ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3] [--depth 16]
 //            text model: prefill tok/s at T = pp, decode tok/s at batch 1 over tg tokens, and the bytes one decode
 //            token reads (weights, state) with the bandwidth that implies; speech model: real-time factor
 //   ttf-home MODEL --tokenize [--specials] [--escapes]   stdin lines -> comma-separated ids (no weights loaded);
@@ -41,7 +41,8 @@ struct Args {
     std::string                        noise, feat;
     std::vector<int32_t>               ids;
     std::map<std::string, std::string> gin;
-    int                                n_gen = 128, threads = 4, top_k = 40, check_dec = 0, pp = 512, tg = 128, reps = 3;
+    int                                n_gen = 128, threads = 4, top_k = 40, check_dec = 0, pp = 512, tg = 128, reps = 3,
+                                       depth = 16;
     int64_t                            ctx = 0;
     float                              temp = 0.0f;
     bool                               bench = false, tokenize = false, specials = false, escapes = false, verbose = false, ids_given = false;
@@ -258,7 +259,7 @@ int run_graph(const ttf::Model & m, const Args & a) {
 // ---- lm driver
 int run_lm(const ttf::Model & m, const Args & a) {
     const std::string graph = m.ir.at("driver").at("graphs").at("step");
-    const int64_t     ctx   = a.ctx ? a.ctx : std::max<int64_t>(2048, a.pp + a.tg + 8);
+    const int64_t     ctx   = a.ctx ? a.ctx : std::max<int64_t>(2048, std::max(a.pp, a.depth) + a.tg + 8);
     ttf::Session      s(m, a.threads, ctx);
     s.fa_exact = s.fa_exact || a.check_dec > 0;  // the state path check compares bit for bit
     if (a.bench) {
@@ -282,18 +283,26 @@ int run_lm(const ttf::Model & m, const Args & a) {
         double dbest = 1e30;
         for (int r = 0; r < a.reps; ++r) {
             s.reset();
-            s.step(graph, std::vector<int32_t>(ids.begin(), ids.begin() + 16), positions(0, 16), true);
+            const int D = a.depth;  // decode after a D-token prefill (in chunks of up to pp)
+            for (int p0 = 0; p0 < D; p0 += a.pp) {
+                const int n = std::min(a.pp, D - p0);
+                std::vector<int32_t> c(n);
+                for (int i = 0; i < n; ++i) {
+                    c[i] = ids[(p0 + i) % a.pp];
+                }
+                s.step(graph, c, positions(p0, n), true);
+            }
             s.prof_build = s.prof_alloc = s.prof_compute = 0;
             const double t0 = now_ms();
             for (int i = 0; i < a.tg; ++i) {
-                s.step(graph, { ids[16 + i % (a.pp - 16)] }, { (int32_t) (16 + i) }, true);
+                s.step(graph, { ids[(D + i) % a.pp] }, { (int32_t) (D + i) }, true);
             }
             dbest = std::min(dbest, (now_ms() - t0) / a.tg);
         }
         const double gb = (double) (s.last_wbytes + s.last_sbytes) / 1e9;
         std::printf("decode   B 1  : %8.2f ms  %9.1f tok/s  (%d tokens)\n", dbest, 1000.0 / dbest, a.tg);
         std::printf("per token: weights %.1f MB, state %.1f MB at position %d; %.1f GB/s\n", s.last_wbytes / 1e6,
-                    s.last_sbytes / 1e6, 16 + a.tg - 1, gb / (dbest / 1000.0));
+                    s.last_sbytes / 1e6, a.depth + a.tg - 1, gb / (dbest / 1000.0));
         std::printf("decode split (last rep, per token): build %.2f ms, alloc %.2f ms, compute %.2f ms; %d nodes\n",
                     s.prof_build / a.tg, s.prof_alloc / a.tg, s.prof_compute / a.tg, s.prof_nodes);
         if (!s.prof_ops.empty()) {
@@ -550,7 +559,7 @@ int run_tokenize(const std::string & path, bool specials, bool escapes) {
 
 const char * USAGE =
     "usage: ttf-home MODEL \"text\" [options]     run the model (text model: continuation; speech model: -o out.wav)\n"
-    "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3]\n"
+    "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3] [--depth 16]\n"
     "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
     "options: -n N  --temp T  --top-k K  --seed S  -o FILE  --timesteps N  --cfg F  --max-len N  --retry-badcase N\n"
@@ -616,6 +625,8 @@ int main(int argc, char ** argv) {
             a.device = next();
         } else if (o == "--bench") {
             a.bench = true;
+        } else if (o == "--depth") {  // --bench: decode after a prefill of this many tokens (default 16)
+            a.depth = std::max(1, std::atoi(next().c_str()));
         } else if (o == "--pp") {
             a.pp = std::max(32, std::atoi(next().c_str()));
         } else if (o == "--tg") {

@@ -1088,3 +1088,218 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// ---- decode attention on an f32 (or bf16 V) cache: GGML_OP_FLASH_ATTN_EXT with K F32 (the session's CUDA decode
+// path; prefill keeps mul_mat + soft_max). Flash decoding: grid (Hkv, splits, T), 4 warps; a block takes one kv head's
+// G = H / Hkv query heads over one range of positions, so K and V are read once per kv head. A warp takes a position
+// per step: each lane holds HD / 32 elements of the K and V rows; scores by a shuffle tree; online softmax in fp32.
+// Splits write (m, l, o) partials that ttf_attn_combine merges (one split: written directly).
+#define TTF_ATTN_WARPS 4
+
+template <typename TV> static __device__ __forceinline__ float ttf_attn_ld(const TV * p) { return (float) *p; }
+template <> __device__ __forceinline__ float ttf_attn_ld<nv_bfloat16>(const nv_bfloat16 * p) { return __bfloat162float(*p); }
+
+template <int HD, int G, typename TV>
+static __global__ void __launch_bounds__(TTF_ATTN_WARPS * WARP_SIZE)
+ttf_attn_dec_kernel(const char * q, const int64_t q_nb1, const int64_t q_nb2,     // Q [HD, T, H]
+                    const char * k, const int64_t k_nb1, const int64_t k_nb2,     // K [HD, S, Hkv]
+                    const char * v, const int64_t v_nb1, const int64_t v_nb2,     // V [HD, S, Hkv]
+                    const half * mask, const int64_t m_nb1,                       // [S, >= T] or null
+                    const int64_t S, const int H, const float scale, const int chunk,
+                    float * dst,                                                  // [HD, H, T]
+                    float * part) {                                               // splits > 1: [T, H, splits, HD + 2]
+    constexpr int EL = HD / WARP_SIZE;
+    const int hk = blockIdx.x, sp = blockIdx.y, t = blockIdx.z;
+    const int lane = threadIdx.x % WARP_SIZE, wid = threadIdx.x / WARP_SIZE;
+    const int nsp = gridDim.y;
+    float qv[G][EL];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float * qr = (const float *) (q + t * q_nb1 + (int64_t) (hk * G + g) * q_nb2);
+#pragma unroll
+        for (int e = 0; e < EL; ++e) {
+            qv[g][e] = qr[lane * EL + e] * scale;
+        }
+    }
+    float m[G], l[G], o[G][EL];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        m[g] = -INFINITY;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int e = 0; e < EL; ++e) {
+            o[g][e] = 0.0f;
+        }
+    }
+    const int64_t s0 = (int64_t) sp * chunk, s1 = min(S, s0 + chunk);
+    const half *  mr = mask ? (const half *) ((const char *) mask + t * m_nb1) : nullptr;
+    for (int64_t s = s0 + wid; s < s1; s += TTF_ATTN_WARPS) {
+        const float mk = mr ? __half2float(mr[s]) : 0.0f;
+        if (mk == -INFINITY) {
+            continue;  // warp-uniform
+        }
+        const float * kr = (const float *) (k + s * k_nb1 + hk * k_nb2) + lane * EL;
+        const TV *    vr = (const TV *) (v + s * v_nb1 + hk * v_nb2) + lane * EL;
+        float         kk[EL], vv[EL];
+#pragma unroll
+        for (int e = 0; e < EL; ++e) {
+            kk[e] = kr[e];
+            vv[e] = ttf_attn_ld(vr + e);
+        }
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float d = 0.0f;
+#pragma unroll
+            for (int e = 0; e < EL; ++e) {
+                d = fmaf(qv[g][e], kk[e], d);
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                d += __shfl_xor_sync(0xffffffff, d, off);
+            }
+            const float sc = d + mk;
+            const float mn = fmaxf(m[g], sc);
+            const float cr = expf(m[g] - mn);  // m = -inf at first: 0
+            const float p  = expf(sc - mn);
+            l[g]           = l[g] * cr + p;
+#pragma unroll
+            for (int e = 0; e < EL; ++e) {
+                o[g][e] = fmaf(p, vv[e], o[g][e] * cr);
+            }
+            m[g] = mn;
+        }
+    }
+    // merge the block's warps
+    __shared__ float sm[TTF_ATTN_WARPS][G][2];
+    __shared__ float so[TTF_ATTN_WARPS][G][HD];
+    if (lane == 0) {
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            sm[wid][g][0] = m[g];
+            sm[wid][g][1] = l[g];
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+#pragma unroll
+        for (int e = 0; e < EL; ++e) {
+            so[wid][g][lane * EL + e] = o[g][e];
+        }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < G * HD; i += blockDim.x) {
+        const int g = i / HD, d = i % HD;
+        float     M = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < TTF_ATTN_WARPS; ++w) {
+            M = fmaxf(M, sm[w][g][0]);
+        }
+        float L = 0.0f, O = 0.0f;
+#pragma unroll
+        for (int w = 0; w < TTF_ATTN_WARPS; ++w) {
+            const float f = sm[w][g][0] == -INFINITY ? 0.0f : expf(sm[w][g][0] - M);
+            L += sm[w][g][1] * f;
+            O += so[w][g][d] * f;
+        }
+        const int h = hk * G + g;
+        if (nsp == 1) {
+            dst[((int64_t) t * H + h) * HD + d] = L > 0.0f ? O / L : 0.0f;
+        } else {
+            float * pr = part + (((int64_t) t * H + h) * nsp + sp) * (HD + 2);
+            pr[2 + d]  = O;
+            if (d == 0) {
+                pr[0] = M;
+                pr[1] = L;
+            }
+        }
+    }
+}
+
+// grid (H, T), HD threads: merge the splits' partials
+template <int HD>
+static __global__ void ttf_attn_combine(const float * part, const int nsp, const int H, float * dst) {
+    const int     h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
+    const float * pr = part + ((int64_t) t * H + h) * nsp * (HD + 2);
+    float         M  = -INFINITY;
+    for (int i = 0; i < nsp; ++i) {
+        M = fmaxf(M, pr[i * (HD + 2)]);
+    }
+    float L = 0.0f, O = 0.0f;
+    for (int i = 0; i < nsp; ++i) {
+        const float mi = pr[i * (HD + 2)];
+        const float f  = mi == -INFINITY ? 0.0f : expf(mi - M);
+        L += pr[i * (HD + 2) + 1] * f;
+        O += pr[i * (HD + 2) + 2 + d] * f;
+    }
+    dst[((int64_t) t * H + h) * HD + d] = L > 0.0f ? O / L : 0.0f;
+}
+
+bool ggml_cuda_ttf_attn_supported(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (K->type != GGML_TYPE_F32 || Q->type != GGML_TYPE_F32 || (V->type != GGML_TYPE_F32 && V->type != GGML_TYPE_BF16)) {
+        return false;
+    }
+    const int64_t HD = Q->ne[0], H = Q->ne[2], Hkv = K->ne[2];
+    float max_bias, softcap;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
+    const int64_t G = Hkv > 0 && H % Hkv == 0 ? H / Hkv : 0;
+    return (HD == 64 || HD == 128 || HD == 256) && K->ne[0] == HD && V->ne[0] == HD && V->ne[2] == Hkv &&
+           (G == 1 || G == 2 || G == 4 || G == 8) && Q->ne[3] == 1 && K->ne[3] == 1 && max_bias == 0.0f &&
+           softcap == 0.0f && dst->src[5] == nullptr && Q->ne[1] <= 16 && Q->nb[0] == 4 && K->nb[0] == 4 &&
+           V->nb[0] == ggml_type_size(V->type) && ggml_is_contiguous(dst) &&
+           (!dst->src[3] || dst->src[3]->ne[2] == 1);
+}
+
+void ggml_cuda_ttf_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const int64_t HD = Q->ne[0], T = Q->ne[1], H = Q->ne[2], S = K->ne[1], Hkv = K->ne[2];
+    const int     G  = (int) (H / Hkv);
+    float         scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    // splits: about 2 blocks per SM, at least 64 positions each
+    static const int per_sm = getenv("TTF_ATTN_BLOCKS_PER_SM") ? atoi(getenv("TTF_ATTN_BLOCKS_PER_SM")) : 2;
+    int64_t nsp = std::max<int64_t>(1, (per_sm * nsm + Hkv * T - 1) / (Hkv * T));
+    nsp         = std::min<int64_t>(nsp, std::max<int64_t>(1, S / 64));
+    const int chunk = (int) ((S + nsp - 1) / nsp);
+    nsp             = (S + chunk - 1) / chunk;
+    ggml_cuda_pool_alloc<float> part(ctx.pool(), nsp > 1 ? (size_t) (T * H * nsp * (HD + 2)) : 1);
+    const dim3 grid((unsigned) Hkv, (unsigned) nsp, (unsigned) T);
+    auto go = [&](auto kern) {
+        kern<<<grid, TTF_ATTN_WARPS * WARP_SIZE, 0, ctx.stream()>>>(
+            (const char *) Q->data, Q->nb[1], Q->nb[2], (const char *) K->data, K->nb[1], K->nb[2],
+            (const char *) V->data, V->nb[1], V->nb[2], mask ? (const half *) mask->data : nullptr,
+            mask ? mask->nb[1] : 0, S, (int) H, scale, chunk, (float *) dst->data, part.get());
+    };
+    auto pick = [&](auto hd, auto tv) {
+        constexpr int D = decltype(hd)::value;
+        using TV        = typename decltype(tv)::type;
+        switch (G) {
+            case 1: go(ttf_attn_dec_kernel<D, 1, TV>); break;
+            case 2: go(ttf_attn_dec_kernel<D, 2, TV>); break;
+            case 4: go(ttf_attn_dec_kernel<D, 4, TV>); break;
+            default: go(ttf_attn_dec_kernel<D, 8, TV>); break;
+        }
+        if (nsp > 1) {
+            ttf_attn_combine<D><<<dim3((unsigned) H, (unsigned) T), D, 0, ctx.stream()>>>(part.get(), (int) nsp, (int) H,
+                                                                                         (float *) dst->data);
+        }
+    };
+    struct f32_t { using type = float; };
+    struct bf16_t { using type = nv_bfloat16; };
+    const bool vb = V->type == GGML_TYPE_BF16;
+    if (HD == 64) {
+        vb ? pick(std::integral_constant<int, 64>{}, bf16_t{}) : pick(std::integral_constant<int, 64>{}, f32_t{});
+    } else if (HD == 128) {
+        vb ? pick(std::integral_constant<int, 128>{}, bf16_t{}) : pick(std::integral_constant<int, 128>{}, f32_t{});
+    } else {
+        vb ? pick(std::integral_constant<int, 256>{}, bf16_t{}) : pick(std::integral_constant<int, 256>{}, f32_t{});
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
