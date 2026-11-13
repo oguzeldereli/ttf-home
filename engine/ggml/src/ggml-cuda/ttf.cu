@@ -296,32 +296,34 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
         }
         const int64_t QB = Q2 ? 128 : 160;
         const int64_t nb = Kp / QB;
-        if (R == 1 && ldq % 16 == 0 && nbw1 % 16 == 0 && ((uintptr_t) qa | (uintptr_t) w) % 16 == 0) {
-            // one row per warp: lanes take the row's 16-byte chunks (a block is 32 bytes = 2 chunks; byte p of the
-            // block holds plane j's trit k = QB bi + 32 j + p), so a warp has 512 bytes of the row in flight per step
-            // instead of 128; the activations for plane j are the 16 bytes at QB bi + 32 j + p0. Integer sums: the
-            // same result in any order.
-            const int4 * wr = (const int4 *) (w + n0 * nbw1);
+        if (ldq % 16 == 0 && nbw1 % 16 == 0 && ((uintptr_t) qa | (uintptr_t) w) % 16 == 0) {
+            // lanes take the rows' 16-byte chunks (a TQ1_P / Q2P block is 32 bytes = 2 chunks; byte p of the block
+            // holds plane j's trit k = QB bi + 32 j + p): per step a warp has 512 bytes of each of its R rows in
+            // flight; the activations for plane j are the 16 bytes at QB bi + 32 j + p0, loaded once for the R rows.
+            // Integer sums: the same result in any order.
 #pragma unroll 2
             for (int64_t c = lane; c < 2 * nb; c += WARP_SIZE) {
-                const int4    v4 = wr[c];
                 const int64_t bi = c / 2;
                 const int     p0 = 16 * (int) (c & 1);
-                const int     vv[4] = { v4.x, v4.y, v4.z, v4.w };
-                int           wa4[4], wb4[4];
+                int           wa4[R][4], wb4[R][4];
 #pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    if (Q2) {
-                        wa4[i] = vv[i];
-                        wb4[i] = 0;
-                    } else {
-                        const int      v = vv[i];
-                        const uint32_t e0 = lut[(v) & 0xFF], e1 = lut[(v >> 8) & 0xFF], e2 = lut[(v >> 16) & 0xFF],
-                                       e3 = lut[(uint32_t) v >> 24];
-                        const uint32_t p01 = __byte_perm(e0, e1, 0x5140);
-                        const uint32_t p23 = __byte_perm(e2, e3, 0x5140);
-                        wa4[i]             = (int) __byte_perm(p01, p23, 0x5410);
-                        wb4[i]             = (int) __byte_perm(p01, p23, 0x7632);
+                for (int rr = 0; rr < R; ++rr) {
+                    const int4 v4 = rr < nr ? ((const int4 *) (w + (n0 + rr) * nbw1))[c] : make_int4(0, 0, 0, 0);
+                    const int  vv[4] = { v4.x, v4.y, v4.z, v4.w };
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        if (Q2) {
+                            wa4[rr][i] = vv[i];
+                            wb4[rr][i] = 0;
+                        } else {
+                            const int      v = vv[i];
+                            const uint32_t e0 = lut[(v) & 0xFF], e1 = lut[(v >> 8) & 0xFF], e2 = lut[(v >> 16) & 0xFF],
+                                           e3 = lut[(uint32_t) v >> 24];
+                            const uint32_t p01 = __byte_perm(e0, e1, 0x5140);
+                            const uint32_t p23 = __byte_perm(e2, e3, 0x5140);
+                            wa4[rr][i]         = (int) __byte_perm(p01, p23, 0x5410);
+                            wb4[rr][i]         = (int) __byte_perm(p01, p23, 0x7632);
+                        }
                     }
                 }
 #pragma unroll
@@ -332,9 +334,12 @@ static __global__ void ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, cons
                             const int4 q = *(const int4 *) (qa + (t0 + tt) * ldq + QB * bi + 32 * j + p0);
                             const int  qq[4] = { q.x, q.y, q.z, q.w };
 #pragma unroll
-                            for (int i = 0; i < 4; ++i) {
-                                const int cj = j < 4 ? (wa4[i] >> (2 * j)) & 0x03030303 : wb4[i] & 0x03030303;
-                                a[0][tt]     = __dp4a(cj, qq[i], a[0][tt]);
+                            for (int rr = 0; rr < R; ++rr) {
+#pragma unroll
+                                for (int i = 0; i < 4; ++i) {
+                                    const int cj = j < 4 ? (wa4[rr][i] >> (2 * j)) & 0x03030303 : wb4[rr][i] & 0x03030303;
+                                    a[rr][tt]    = __dp4a(cj, qq[i], a[rr][tt]);
+                                }
                             }
                         }
                     }
@@ -620,7 +625,10 @@ void ggml_cuda_op_ttf_mm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
     // grid.y: token chunks split over blocks only as far as needed to fill the GPU (~2048 blocks); each block loops
     // over its chunks
-    const int     R  = T > TTF_MM_TOK ? 4 : 1;
+    // 4 rows per warp for prefill (each activation load feeds 4 rows) and for decode on tall matrices (4 rows'
+    // loads in flight per lane, one epilogue latency per 4 rows); 1 row per warp when N is too small to fill the GPU
+    static const int64_t r4_min_n = getenv("TTF_MM_R4_N") ? atoll(getenv("TTF_MM_R4_N")) : 2048;
+    const int     R  = T > TTF_MM_TOK || N >= r4_min_n ? 4 : 1;
     const int64_t gx = (N + TTF_MM_WARPS * R - 1) / (TTF_MM_WARPS * R), nch = (T + TTF_MM_TOK - 1) / TTF_MM_TOK;
     const int64_t gy = std::max<int64_t>(1, std::min<int64_t>(nch, 2048 / gx));
     const dim3    grid((unsigned) gx, (unsigned) gy);
