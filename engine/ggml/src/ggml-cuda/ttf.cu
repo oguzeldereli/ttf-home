@@ -1346,10 +1346,12 @@ void ggml_cuda_ttf_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float         scale;
     memcpy(&scale, dst->op_params, sizeof(float));
     const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
-    // splits: about 2 blocks per SM, at least 64 positions each
-    static const int per_sm = getenv("TTF_ATTN_BLOCKS_PER_SM") ? atoi(getenv("TTF_ATTN_BLOCKS_PER_SM")) : 2;
+    // splits: about 4 blocks per SM, at least 32 positions each (TTF_ATTN_BLOCKS_PER_SM, TTF_ATTN_MIN_CHUNK). More splits
+    // won at every depth tried (the warps' position loop is latency-bound; two positions per step did not help)
+    static const int64_t min_chunk = getenv("TTF_ATTN_MIN_CHUNK") ? atoll(getenv("TTF_ATTN_MIN_CHUNK")) : 32;
+    static const int per_sm = getenv("TTF_ATTN_BLOCKS_PER_SM") ? atoi(getenv("TTF_ATTN_BLOCKS_PER_SM")) : 4;
     int64_t nsp = std::max<int64_t>(1, (per_sm * nsm + Hkv * T - 1) / (Hkv * T));
-    nsp         = std::min<int64_t>(nsp, std::max<int64_t>(1, S / 64));
+    nsp         = std::min<int64_t>(nsp, std::max<int64_t>(1, S / min_chunk));
     const int chunk = (int) ((S + nsp - 1) / nsp);
     nsp             = (S + chunk - 1) / chunk;
     ggml_cuda_pool_alloc<float> part(ctx.pool(), nsp > 1 ? (size_t) (T * H * nsp * (HD + 2)) : 1);
