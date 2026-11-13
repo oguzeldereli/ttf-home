@@ -5,8 +5,9 @@ training it, fine-tune on your own text, and run the result fast on a consumer G
 
 Training uses TTF (two-timescale threshold flips, `ttf-core`): weights stay in {-1, 0, +1} the whole time, with a
 low-rank accumulator in place of master weights and Adam states, so training needs a fraction of the usual memory.
-Inference uses llama.cpp with eleven patches (`llama.cpp/`, on llama.cpp commit 0ef6f06d5), so a TTF model is an ordinary
-GGUF file.
+Inference runs on our own engine (`engine/`: one program, `ttf-home`, on a ggml fork with ternary kernels for CUDA and
+CPU). It runs any `.ttf` model, text or speech. GGUF exports for llama.cpp (eleven patches in `llama.cpp/`, on
+llama.cpp commit 0ef6f06d5) are still there for chat / serve / score until the engine has them.
 
 ## Measured (laptop: RTX 4080 Laptop 12 GB, i9-14900HX)
 
@@ -37,9 +38,13 @@ The engine is looked for in `~/.cache/ttf/llama.cpp` (where `ttf engine build` p
 
     pip install -e ../ttf-core -e .           # plus -e ../ttf-conversion for `ttf convert`
     ttf doctor                                # what this machine can train and run
-    ttf engine build                          # llama.cpp + the TTF patches (CUDA, Metal, Vulkan or CPU)
+    ttf engine build                          # the engine, ttf-home (CUDA or CPU); --llama: llama.cpp for .gguf
 
 ## Use
+
+    ttf run model.ttf "Once upon a time" -n 64                # a text model continues the text
+    ttf run speech.ttf "Hello from a ternary model." -o hi.wav   # a speech model speaks it
+    ttf bench model.ttf                                       # prefill / decode tok/s, bytes per token
 
     ttf data my_notes/ books.jsonl --out data/mine            # text / Markdown / JSONL -> token files
     ttf train --data data/mine --out runs/mine --hours 8      # from scratch; the size is chosen by GPU memory

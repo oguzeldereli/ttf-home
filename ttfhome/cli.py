@@ -1,8 +1,9 @@
 """ttf: train, convert, fine-tune and run ternary (TTF) language models on a home computer.
 
   ttf doctor                                   what this machine has (GPU, memory, the engine, the trainer)
-  ttf engine build [--backend cuda|cpu|metal|vulkan]
-                                               build the inference engine (llama.cpp with the TTF patches)
+  ttf engine build [--backend cuda|cpu] [--llama]
+                                               build the engine (ttf-home on our ggml); --llama: the old llama.cpp
+                                               build for .gguf exports (chat / serve / score until the engine has them)
   ttf data INPUT... --out DATA [--tokenizer llama2|DIR] [--val 0.005]
                                                text / Markdown / JSONL (text or chat messages) -> token files
   ttf train --data DATA --out RUN [--size auto|tiny|small|medium|large] [--hours H] [TTF knobs]
@@ -12,7 +13,10 @@
   ttf finetune --ckpt CKPT --data DATA --out RUN [--steps 300]
                                                keep training a ternary model on your own data
   ttf export CKPT OUT.gguf [--base HF_DIR] [--wtype tq2_0|tq1_0|q2_k]
-  ttf generate MODEL.gguf "PROMPT" (base models) | ttf chat MODEL.gguf (chat models) | ttf serve MODEL.gguf [--port 8080] | ttf bench MODEL.gguf | ttf score MODEL.gguf DATA
+  ttf run MODEL.ttf "TEXT" [-n N | -o out.wav]  any .ttf model: a text model continues the text, a speech model
+                                               speaks it (more options: ttf run MODEL.ttf --help)
+  ttf bench MODEL.ttf                          prefill / decode speed and bytes per token (speech: real-time factor)
+  .gguf exports (llama.cpp, --llama build): ttf generate | chat | serve | bench | score MODEL.gguf ...
 
 TTF knobs (train / convert / finetune; the defaults are the measured best):
   --theta 16 (firing threshold, in steps)   --rank R (accumulator rank)   --lr / --min-lr   --steps / --warmup
@@ -32,6 +36,17 @@ ENGINE_URL = "https://github.com/ggml-org/llama.cpp"
 
 
 # ------------------------------------------------------------------------------------------------ environment
+
+def home_bin():
+    """our engine's binary (ttf-home): $TTF_ENGINE, else this checkout's engine build, the GPU build first"""
+    if os.environ.get("TTF_ENGINE"):
+        return Path(os.environ["TTF_ENGINE"]).expanduser()
+    for b in ("build-cuda", "build-cpu", "build"):
+        p = HOME / "engine" / b / "ttf-home"
+        if p.exists():
+            return p
+    raise SystemExit(f"ttf-home not found under {HOME / 'engine'}: run `ttf engine build` (or set TTF_ENGINE)")
+
 
 def engine_dir():
     return Path(os.environ.get("TTF_LLAMA_CPP", "~/.cache/ttf/llama.cpp")).expanduser()
@@ -94,9 +109,12 @@ def cmd_doctor(a):
         print(f"ttf-conversion: {Path(ttfconv.__file__).parent}")
     except ImportError:
         print("ttf-conversion: not importable (needed by `ttf convert`)")
+    bins = [b for b in ("build-cuda", "build-cpu", "build") if (HOME / "engine" / b / "ttf-home").exists()]
+    print(f"engine: {HOME / 'engine'} ({', '.join(bins) or 'not built: ttf engine build'})")
     d = engine_dir()
     bins = [b for b in ("build-cuda", "build-metal", "build-vulkan", "build-cpu", "build") if (d / b / "bin" / "llama-cli").exists()]
-    print(f"engine: {d} ({', '.join(bins) or 'not built: ttf engine build'})")
+    if bins:
+        print(f"llama.cpp (for .gguf exports): {d} ({', '.join(bins)})")
 
 
 def _max_params_b(gib):
@@ -107,6 +125,16 @@ def _max_params_b(gib):
 # ---------------------------------------------------------------------------------------------------- engine
 
 def cmd_engine(a):
+    if a.action == "build" and not a.llama:
+        if a.backend not in ("cuda", "cpu"):
+            raise SystemExit(f"backend {a.backend}: the engine has CUDA and CPU kernels only (yet); --llama for llama.cpp")
+        src = HOME / "engine"
+        b = src / f"build-{a.backend}"
+        flags = ["-DGGML_CUDA=ON"] if a.backend == "cuda" else ["-DGGML_CUDA=OFF"]
+        run(["cmake", "-S", src, "-B", b, "-DCMAKE_BUILD_TYPE=Release", *flags, *a.cmake])
+        run(["cmake", "--build", b, "-j", str(os.cpu_count()), "--target", "ttf-home"])
+        print(f"engine built: {b / 'ttf-home'}")
+        return
     d = engine_dir()
     if a.action == "build":
         if not (d / ".git").exists():
@@ -340,7 +368,15 @@ def cmd_chat(a, extra):
     run([engine_bin("llama-cli"), "-m", a.model, *_ngl(), "-cnv", *extra])
 
 
+def cmd_run(a, extra):
+    r = subprocess.run([str(home_bin()), a.model, *a.args, *extra])
+    raise SystemExit(r.returncode)
+
+
 def cmd_generate(a, extra):
+    if a.model.endswith(".ttf"):
+        r = subprocess.run([str(home_bin()), a.model, a.prompt, "-n", str(a.n), *extra])
+        raise SystemExit(r.returncode)
     run([engine_bin("llama-completion"), "-m", a.model, *_ngl(), "-p", a.prompt, "-n", a.n, "-no-cnv", *extra])
 
 
@@ -349,6 +385,9 @@ def cmd_serve(a, extra):
 
 
 def cmd_bench(a, extra):
+    if a.model.endswith(".ttf"):
+        r = subprocess.run([str(home_bin()), a.model, "--bench", *extra])
+        raise SystemExit(r.returncode)
     run([engine_bin("llama-bench"), "-m", a.model, *_ngl(), *extra])
 
 
@@ -379,6 +418,7 @@ def main(argv=None):
     p.add_argument("--backend", default="cuda" if gpu_info() else ("metal" if sys.platform == "darwin" else "cpu"),
                    choices=["cuda", "cpu", "metal", "vulkan"])
     p.add_argument("--cmake", nargs="*", default=[])
+    p.add_argument("--llama", action="store_true", help="build the old llama.cpp engine (for .gguf exports)")
     p = sp.add_parser("data"); p.add_argument("inputs", nargs="+"); p.add_argument("--out", required=True)
     p.add_argument("--tokenizer", default="llama2", help="llama2 (scratch models) or the base model's dir (conversions)")
     p.add_argument("--val", type=float, default=0.005)
@@ -404,6 +444,7 @@ def main(argv=None):
                    help="tq2_0: NVIDIA / CPU (fastest); tq1_0: 15%% smaller; q2_k: AMD / Intel (Vulkan), Mac (Metal)")
     p.add_argument("--emb", default=None, help="q6_k (float) / q4_1 (int-k codes, exact: the default for them) / q4_k ...")
     p.add_argument("--head", default=None)
+    p = sp.add_parser("run", add_help=False); p.add_argument("model"); p.add_argument("args", nargs=argparse.REMAINDER)
     for c in ("chat", "bench"):
         p = sp.add_parser(c); p.add_argument("model")
     p = sp.add_parser("generate"); p.add_argument("model"); p.add_argument("prompt"); p.add_argument("-n", default="128")
