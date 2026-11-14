@@ -980,6 +980,10 @@ Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_
         kvs.filled.assign(max_ctx, false);
         kv[e.at("id").get<std::string>()] = kvs;
     }
+    if (m.device != "cpu") {  // the greedy pipeline's token (see submit_greedy)
+        dev_ids = ggml_new_tensor_1d(sctx, GGML_TYPE_I32, 1);
+        ggml_set_name(dev_ids, "ttf_dev_ids");
+    }
     sbuf = ggml_backend_alloc_ctx_tensors(sctx, backend);
     if (sbuf) {
         ggml_backend_buffer_clear(sbuf, 0);
@@ -987,6 +991,17 @@ Session::Session(const Model & m_, int n_threads_, int64_t max_ctx_) : m(m_), n_
 }
 
 Session::~Session() {
+    if (!pipe_q.empty()) {
+        ggml_backend_synchronize(backend);
+    }
+    for (auto & sl : pipe) {
+        if (sl.ev) {
+            ggml_backend_event_free(sl.ev);
+        }
+        if (sl.pin) {
+            ggml_backend_buffer_free(sl.pin);
+        }
+    }
     built.clear();
     for (auto & [k, g] : gmem) {
         ggml_gallocr_free(g.galloc);
@@ -1007,6 +1022,10 @@ Session::~Session() {
 }
 
 void Session::reset() {
+    if (!pipe_q.empty()) {  // queued greedy steps finish first (they write the state being cleared)
+        ggml_backend_synchronize(backend);
+        pipe_q.clear();
+    }
     for (auto & [id, k] : kv) {
         k.filled.assign(max_ctx, false);
     }
@@ -1057,8 +1076,15 @@ void Session::truncate(int32_t n) {
     }
 }
 
-StepOut Session::step(const std::string & graph, const std::vector<int32_t> & ids, const std::vector<int32_t> & pos,
-                      bool last_only) {
+// online choice of the decode rows per warp (see ttf.h): trials of 64 steps in blocks of 8 per setting, alternating
+// (clocks ramping up at the start then weigh on both alike), at step 0, 256 (a laptop's power cap has set in by then),
+// then every 8192 (each trial builds the other setting's graphs, ~50 ms at 27B). The first 2 steps of a block are
+// untimed (graph build / capture, and the switch). Blocks, not single steps: on a power-capped GPU a step alternating
+// with the other setting runs on the power the other left (4080 Laptop 27B: single-step trial 26.6 vs 28.6 ms for
+// R = 1, fixed 28.6 vs 27.6)
+static constexpr int64_t MM_TR = 64, MM_BL = 8, MM_SKIP = 2;
+
+int64_t Session::mm_pre(const std::string & graph, bool t1) {
     if (mm_mode < 0) {
         mm_mode = 0;
         if (const char * e = std::getenv("TTF_MM_R")) {
@@ -1069,49 +1095,152 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
             }
         }
     }
-    // online choice of the decode rows per warp (see ttf.h): trials of 64 steps in blocks of 8 per setting,
-    // alternating (clocks ramping up at the start then weigh on both alike), at step 0, 256 (a laptop's power cap has
-    // set in by then), then every 8192 (each trial builds the other setting's graphs, ~50 ms at 27B). The first 2
-    // steps of a block are untimed (graph build / capture, and the switch). Blocks, not single steps: on a
-    // power-capped GPU a step alternating with the other setting runs on the power the other left (4080 Laptop 27B:
-    // single-step trial 26.6 vs 28.6 ms for R = 1, fixed 28.6 vs 27.6)
-    constexpr int64_t TR = 64, BL = 8, SKIP = 2;
-    const bool        one = mm_mode == 1 && ids.size() == 1;
-    const int64_t     ph  = mm_n < 256 ? mm_n : mm_n < 8192 ? mm_n - 256 : mm_n % 8192;
-    if (one) {
-        mm_r = ph < TR ? (int) ((ph / BL) % 2) : mm_best;
+    if (mm_mode != 1 || !t1) {
+        return -1;
     }
+    const int64_t ph = mm_n < 256 ? mm_n : mm_n < 8192 ? mm_n - 256 : mm_n % 8192;
+    mm_r             = ph < MM_TR ? (int) ((ph / MM_BL) % 2) : mm_best;
+    return ph;
+}
+
+void Session::mm_post(int64_t ph, double ms) {
+    if (ph < 0) {
+        return;
+    }
+    if (ph < MM_TR && ph % MM_BL >= MM_SKIP) {
+        mm_ms[(ph / MM_BL) % 2].push_back(ms);
+    }
+    if (ph == MM_TR - 1) {
+        double md[2];
+        for (int i = 0; i < 2; ++i) {
+            std::sort(mm_ms[i].begin(), mm_ms[i].end());
+            md[i] = mm_ms[i].empty() ? 0 : mm_ms[i][mm_ms[i].size() / 2];
+            mm_ms[i].clear();
+        }
+        // 1 only on a clear win (3%): the 27B on a 4070 Ti Super reads 16.1 vs 17.0 ms
+        mm_best = md[1] < 0.97 * md[0] ? 1 : 0;
+        if (std::getenv("TTF_MM_R_LOG")) {
+            std::fprintf(stderr, "[ttf: decode rows per warp %s (by shape: %.2f ms, 1: %.2f ms)]\n",
+                         mm_best ? "1" : "by shape", md[0], md[1]);
+        }
+    }
+    ++mm_n;
+}
+
+StepOut Session::step(const std::string & graph, const std::vector<int32_t> & ids, const std::vector<int32_t> & pos,
+                      bool last_only) {
+    if (!pipe_q.empty()) {
+        throw std::runtime_error("step: greedy steps still queued (take_greedy first)");
+    }
+    const int64_t ph = mm_pre(graph, ids.size() == 1);
     Values in;
     in["ids"] = Tensor::i32({ (int64_t) ids.size() }, ids);
     in["pos"] = Tensor::i32({ (int64_t) pos.size() }, pos);
     const auto t0 = std::chrono::steady_clock::now();
     Values  o = run(graph, in, last_only);
-    if (one) {
-        if (ph < TR && ph % BL >= SKIP) {
-            mm_ms[(ph / BL) % 2].push_back(
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-        }
-        if (ph == TR - 1) {
-            double md[2];
-            for (int i = 0; i < 2; ++i) {
-                std::sort(mm_ms[i].begin(), mm_ms[i].end());
-                md[i] = mm_ms[i].empty() ? 0 : mm_ms[i][mm_ms[i].size() / 2];
-                mm_ms[i].clear();
-            }
-            // 1 only on a clear win (3%): the 27B on a 4070 Ti Super reads 16.1 vs 17.0 ms
-            mm_best = md[1] < 0.97 * md[0] ? 1 : 0;
-            if (std::getenv("TTF_MM_R_LOG")) {
-                std::fprintf(stderr, "[ttf: decode rows per warp %s (by shape: %.2f ms, 1: %.2f ms)]\n",
-                             mm_best ? "1" : "by shape", md[0], md[1]);
-            }
-        }
-        ++mm_n;
-    }
+    mm_post(ph, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     StepOut r;
     Tensor & lo = o.begin()->second;
     r.n_vocab   = lo.shape.back();
     r.T_out     = lo.numel() / r.n_vocab;
     r.logits    = std::move(lo.f);
+    return r;
+}
+
+bool Session::can_pipeline(const std::string & graph) const {
+    static const bool off = std::getenv("TTF_NO_PIPE") || std::getenv("TTF_DUMP") || std::getenv("TTF_PROF_OPS") ||
+                            std::getenv("TTF_NO_GRAPH_CACHE");
+    if (off || m.device == "cpu" || !dev_ids) {
+        return false;
+    }
+    const json & g = m.ir.at("graphs").at(graph);
+    bool has_ids = false, has_pos = false;
+    for (const auto & inp : g.at("inputs")) {
+        const std::string n = inp.at("name");
+        has_ids             = has_ids || n == "ids";
+        has_pos             = has_pos || n == "pos";
+        if (n != "ids" && n != "pos") {
+            return false;
+        }
+    }
+    return has_ids && has_pos && g.at("outputs").size() == 1;
+}
+
+uint8_t * Session::slot_mem(int k, size_t need) {
+    PipeSlot & sl = pipe[k];
+    if (!sl.pin || sl.cap < need) {  // (the slot is free here: its last step was taken)
+        if (sl.pin) {
+            ggml_backend_buffer_free(sl.pin);
+        }
+        ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+        if (!hb) {
+            throw std::runtime_error("greedy pipeline: no pinned host buffer type");
+        }
+        sl.cap = std::max<size_t>(need, 64 << 10);
+        sl.pin = ggml_backend_buft_alloc_buffer(hb, sl.cap);
+        if (!sl.pin) {
+            throw std::runtime_error("greedy pipeline: pinned allocation failed");
+        }
+    }
+    if (!sl.ev) {
+        sl.ev = ggml_backend_event_new(ggml_backend_get_device(backend));
+        if (!sl.ev) {
+            throw std::runtime_error("greedy pipeline: no events on this backend");
+        }
+    }
+    return (uint8_t *) ggml_backend_buffer_get_base(sl.pin);
+}
+
+void Session::upload(ggml_tensor * t, const void * data, size_t nbytes) {
+    if (greedy_slot < 0) {  // async on the compute stream: no per-input synchronisation (the host data outlives the call)
+        ggml_backend_tensor_set_async(backend, t, data, 0, nbytes);
+        return;
+    }
+    // staged in the slot's pinned memory: a pageable source may make the copy wait for the stream (the queued step)
+    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(pipe[greedy_slot].pin);
+    if (stage_off + nbytes > pipe[greedy_slot].cap) {
+        throw std::runtime_error("greedy pipeline: staging overflow");
+    }
+    std::memcpy(base + stage_off, data, nbytes);
+    ggml_backend_tensor_set_async(backend, t, base + stage_off, 0, nbytes);
+    stage_off = (stage_off + nbytes + 63) / 64 * 64;
+}
+
+void Session::submit_greedy(const std::string & graph, int32_t id, int32_t pos) {
+    if ((int) pipe_q.size() >= PIPE - 1) {
+        throw std::runtime_error("submit_greedy: queue full (take_greedy first)");
+    }
+    const int64_t ph = mm_pre(graph, true);
+    Values in;
+    in["pos"] = Tensor::i32({ 1 }, { pos });
+    const int k = pipe_next;
+    pipe_next   = (pipe_next + 1) % PIPE;
+    greedy_slot = k;
+    greedy_id   = id;
+    const auto t0 = std::chrono::steady_clock::now();
+    try {
+        run(graph, in, true);
+    } catch (...) {
+        greedy_slot = -1;
+        throw;
+    }
+    greedy_slot = -1;
+    pipe_q.push_back(k);
+    if (ph >= 0 && ph < MM_TR) {  // a timed trial step: waited for here (the trials compare whole step times)
+        ggml_backend_event_synchronize(pipe[k].ev);
+    }
+    mm_post(ph, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+}
+
+int32_t Session::take_greedy() {
+    if (pipe_q.empty()) {
+        throw std::runtime_error("take_greedy: nothing queued");
+    }
+    const int k = pipe_q.front();
+    pipe_q.erase(pipe_q.begin());
+    ggml_backend_event_synchronize(pipe[k].ev);
+    int32_t r;
+    std::memcpy(&r, ggml_backend_buffer_get_base(pipe[k].pin), 4);
     return r;
 }
 
@@ -1181,9 +1310,12 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     static const bool no_cache = std::getenv("TTF_NO_GRAPH_CACHE") != nullptr;
     const bool   cacheable  = !dump_dir && !prof_by_op && !no_cache && T <= 64;
     std::string  key = "r" + std::to_string(mm_r) + "|" + graph + "|" + std::to_string(T) + "|" + std::to_string(S) + "|" +
-                      (last_only ? "1" : "0");
+                      (last_only ? "1" : "0") + (greedy_slot >= 0 ? "|g" : "");
     for (const auto & inp : g.at("inputs")) {
         const std::string name = inp.at("name");
+        if (greedy_slot >= 0 && name == "ids") {  // greedy: the token is dev_ids (on the device), not an input
+            continue;
+        }
         auto              it   = in.find(name);
         if (it == in.end()) {
             throw std::runtime_error("graph " + graph + ": missing input " + name);
@@ -1205,6 +1337,11 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         Builder b{ m, *this, ctx, {}, {}, {}, nullptr, nullptr, S, T, last_only, m.d_bf16 };
         for (const auto & inp : g.at("inputs")) {
             const std::string name = inp.at("name");
+            if (greedy_slot >= 0 && name == "ids") {
+                b.val[name] = dev_ids;
+                b.nd[name]  = 1;
+                continue;
+            }
             const Tensor &    h    = in.at(name);
             int64_t           ne[4] = { 1, 1, 1, 1 };
             const int         r     = (int) h.shape.size();
@@ -1254,6 +1391,14 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             ggml_tensor * t = b.val.at(o.at("of").get<std::string>());
             if (!ggml_is_contiguous(t)) {
                 t = ggml_cont(ctx, t);
+            }
+            if (greedy_slot >= 0) {  // greedy: the logits stay on the device; their argmax becomes the next token
+                if (t->type != GGML_TYPE_F32 || ggml_nrows(t) != 1) {
+                    throw std::runtime_error("greedy step: the output is not one f32 row");
+                }
+                ggml_tensor * am = ggml_argmax(ctx, ggml_reshape_2d(ctx, t, t->ne[0], 1));
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, am, dev_ids));
+                continue;
             }
             ggml_set_output(t);
             e.outs.push_back(t);
@@ -1374,15 +1519,30 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         }
     }
     prof_galloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    if (greedy_slot >= 0) {  // the slot's pinned memory: id out (0), id in (4), the inputs staged (64 on), sized first
+        size_t need = 64;
+        for (auto & [name, t] : e->inputs) {
+            need += (ggml_nbytes(t) + 63) / 64 * 64;
+        }
+        for (auto & [C, t] : e->vidx) {
+            need += (ggml_nbytes(t) + 63) / 64 * 64;
+        }
+        if (e->mask) {
+            need += (ggml_nbytes(e->mask) + 63) / 64 * 64;
+        }
+        uint8_t * base = slot_mem(greedy_slot, need);
+        stage_off      = 64;
+        if (greedy_id >= 0) {  // the host's token, queued after the previous step's write of dev_ids
+            std::memcpy(base + 4, &greedy_id, 4);
+            ggml_backend_tensor_set_async(backend, dev_ids, base + 4, 0, 4);
+        }
+    }
     for (auto & [name, t] : e->inputs) {
         const Tensor & h = in.at(name);
         if (h.numel() != ggml_nelements(t) || (h.type == GGML_TYPE_F32 ? h.f.size() : h.i.size()) != (size_t) h.numel()) {
             throw std::runtime_error(std::string("input ") + t->name + ": size");
         }
-        // async on the compute stream: no per-input synchronisation (the host data outlives the call)
-        ggml_backend_tensor_set_async(backend, t,
-                                      h.type == GGML_TYPE_F32 ? (const void *) h.f.data() : (const void *) h.i.data(), 0,
-                                      ggml_nbytes(t));
+        upload(t, h.type == GGML_TYPE_F32 ? (const void *) h.f.data() : (const void *) h.i.data(), ggml_nbytes(t));
     }
     std::vector<std::vector<int32_t>> vix(e->vidx.size());
     for (size_t i = 0; i < e->vidx.size(); ++i) {
@@ -1393,7 +1553,7 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
                 vix[i][t * C + c] = (int32_t) (c * max_ctx + pos[t]);
             }
         }
-        ggml_backend_tensor_set_async(backend, e->vidx[i].second, vix[i].data(), 0, vix[i].size() * sizeof(int32_t));
+        upload(e->vidx[i].second, vix[i].data(), vix[i].size() * sizeof(int32_t));
     }
     std::vector<float>       mk;
     std::vector<ggml_fp16_t> mk16;
@@ -1408,9 +1568,9 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         if (e->mask->type == GGML_TYPE_F16) {
             mk16.resize(mk.size());
             ggml_fp32_to_fp16_row(mk.data(), mk16.data(), (int64_t) mk.size());
-            ggml_backend_tensor_set_async(backend, e->mask, mk16.data(), 0, mk16.size() * sizeof(ggml_fp16_t));
+            upload(e->mask, mk16.data(), mk16.size() * sizeof(ggml_fp16_t));
         } else {
-            ggml_backend_tensor_set_async(backend, e->mask, mk.data(), 0, mk.size() * sizeof(float));
+            upload(e->mask, mk.data(), mk.size() * sizeof(float));
         }
     }
     if (fresh) {  // bytes read per call (the roofline numerator)
@@ -1480,6 +1640,19 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             prof_ops[k].first += ms;
             prof_ops[k].second += 1;
         }
+    } else if (greedy_slot >= 0) {  // queued, not waited for: the id copied out behind it, then the slot's event
+        if (ggml_backend_graph_compute_async(backend, gf) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("graph compute failed");
+        }
+        ggml_backend_tensor_get_async(backend, dev_ids, ggml_backend_buffer_get_base(pipe[greedy_slot].pin), 0, 4);
+        ggml_backend_event_record(pipe[greedy_slot].ev, backend);
+        const auto t3 = std::chrono::steady_clock::now();
+        last_ms       = std::chrono::duration<double, std::milli>(t3 - t0).count();
+        prof_build += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        prof_alloc += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        prof_compute += std::chrono::duration<double, std::milli>(t3 - t2).count();
+        prof_nodes = ggml_graph_n_nodes(gf);
+        return Values();
     } else if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("graph compute failed");
     }

@@ -226,6 +226,57 @@ int test_i4(ggml_backend_t cpu, ggml_backend_t gpu) {
 
 }  // namespace
 
+// ARGMAX on CUDA vs the first index of the max (the host's argmax_first, the greedy pick): rows with planted ties
+// (within a block, across the many-block kernel's chunks, at the ends), all equal, all negative; one-block and
+// many-block paths (ncols < / >= 16384). Returns the failures.
+int test_argmax(ggml_backend_t gpu) {
+    if (!gpu) {
+        return 0;
+    }
+    int          fails = 0;
+    std::mt19937 rng(7);
+    for (int64_t n : { 1000, 5000, 16384, 32000, 131072, 151936, 248320 }) {
+        for (int kind = 0; kind < 6; ++kind) {
+            std::vector<float> x(n);
+            std::normal_distribution<float> nd(0.0f, 3.0f);
+            for (auto & v : x) {
+                v = kind == 4 ? 1.5f : kind == 5 ? -std::fabs(nd(rng)) - 1.0f : bf16r(nd(rng));
+            }
+            const float M = 40.0f;
+            if (kind == 1) {  // ties far apart: the later one in an earlier-scanned lane / chunk
+                x[n - 1] = M; x[n / 2] = M; x[n / 3 + 7] = M;
+            } else if (kind == 2) {  // ties next to each other (same warp) and at a chunk edge
+                x[2049] = M; x[2048] = M; x[2047 + (n > 4096 ? 2048 : 0)] = M;
+            } else if (kind == 3) {  // the first element ties a late one
+                x[0] = M; x[n - 2] = M;
+            }
+            int64_t ref = 0;
+            for (int64_t j = 1; j < n; ++j) {
+                ref = x[j] > x[ref] ? j : ref;
+            }
+            ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+            ggml_context *   ctx = ggml_init(ip);
+            ggml_tensor *    tx  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, 1);
+            ggml_tensor *    am  = ggml_argmax(ctx, tx);
+            ggml_cgraph *    gf  = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, am);
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+            ggml_backend_tensor_set(tx, x.data(), 0, n * 4);
+            ggml_backend_graph_compute(gpu, gf);
+            int32_t got = -2;
+            ggml_backend_tensor_get(am, &got, 0, 4);
+            if (got != ref) {
+                std::printf("argmax n %lld kind %d: cuda %d, first max %lld\n", (long long) n, kind, got, (long long) ref);
+                ++fails;
+            }
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+        }
+    }
+    std::printf("argmax (ties to the first index): %d failures\n", fails);
+    return fails;
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench-cpu") {  // decode-shaped, Q2P, weights past the L3 (~70 MB)
         ggml_backend_t cpu = ggml_backend_cpu_init();
@@ -442,6 +493,7 @@ int main(int argc, char ** argv) {
         }
     }
 #ifdef TTF_CUDA
+    fails += test_argmax(gpu);
     fails += test_i4(cpu, gpu);
 #else
     fails += test_i4(cpu, nullptr);

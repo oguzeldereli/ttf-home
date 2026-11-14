@@ -117,6 +117,20 @@ struct Session {
 
     void reset();
 
+    // Greedy decode with no host round trip between steps (GPU; the GPU otherwise idles while the host reads the
+    // logits, picks, uploads the next inputs and launches: ~0.3-0.5 ms a token). The next id is the argmax of the
+    // step's logits (the first index of the largest, as argmax_first), kept on the device, where the next submitted
+    // step reads it. submit_greedy: queue one T = 1 step of graph at pos, on token id (id >= 0, from the host) or on the
+    // previous step's argmax (id < 0); returns at once. take_greedy: wait for the oldest queued step, its argmax. At
+    // most PIPE - 1 steps queued. Same tokens as step + argmax_first (same graph and kernels; argmax ties to the first
+    // index). can_pipeline: the device is not the CPU, the graph has inputs ids + pos and one output, no TTF_DUMP /
+    // TTF_PROF_OPS / TTF_NO_PIPE. A step queued past the end (a speculative step after EOS) has run when it is taken:
+    // its token is in the kv cache / recurrent state (callers that continue the session must not queue past an end).
+    bool    can_pipeline(const std::string & graph) const;
+    void    submit_greedy(const std::string & graph, int32_t id, int32_t pos);
+    int32_t take_greedy();
+    int     pipe_queued() const { return (int) pipe_q.size(); }
+
     // prefix reuse: the recurrent state (conv + delta-rule) copied out / back, and the kv cache cut to positions < n
     // (later positions are masked; their stale values get probability exactly 0)
     std::vector<uint8_t> save_recurrent() const;
@@ -128,6 +142,26 @@ struct Session {
     int64_t             mm_n    = 0;   // one-token steps so far
     int                 mm_best = 0;
     std::vector<double> mm_ms[2];      // this trial's step times (by shape, 1)
+    int64_t             mm_pre(const std::string & graph, bool t1);  // before a step: a one-token step's trial phase, else -1
+    void                mm_post(int64_t ph, double ms);              // after it: the trial bookkeeping
+
+    // the greedy pipeline: per slot pinned host memory (the next id from the device at 0, the host's id at 4, the
+    // step's inputs staged for an async upload from 64) and an event after the step's id copy; slots queued in pipe_q
+    static constexpr int PIPE = 4;
+    struct PipeSlot {
+        ggml_backend_buffer_t pin = nullptr;
+        size_t                cap = 0;
+        ggml_backend_event_t  ev  = nullptr;
+    };
+    PipeSlot         pipe[PIPE];
+    std::vector<int> pipe_q;
+    int              pipe_next   = 0;
+    int              greedy_slot = -1;       // run(): >= 0 while a greedy step is being queued (its slot)
+    int32_t          greedy_id   = -1;       // run(): that step's token from the host (< 0: the device's)
+    size_t           stage_off   = 0;        // run(): bytes of the slot's staging used so far
+    ggml_tensor *    dev_ids     = nullptr;  // [1] I32 in the state buffer: the token the next greedy step reads
+    void             upload(ggml_tensor * t, const void * data, size_t nbytes);  // async; staged when greedy
+    uint8_t *        slot_mem(int k, size_t need);                               // slot k's pinned memory, >= need
 
   public:
 

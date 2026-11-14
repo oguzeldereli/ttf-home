@@ -341,8 +341,10 @@ int run_lm(const ttf::Model & m, const Args & a) {
             best = std::min(best, now_ms() - t0);
         }
         std::printf("prefill  T %5d: %8.1f ms  %9.1f tok/s\n", a.pp, best, 1000.0 * a.pp / best);
-        // decode: after a 16-token prompt, tg single-token steps (greedy on random ids is irrelevant: fixed ids)
-        double dbest = 1e30;
+        // decode: after a 16-token prompt, tg single-token steps. GPU: greedy through the pipeline (submit_greedy), as
+        // generation runs; TTF_BENCH_SYNC=1 (and the CPU): step on fixed random ids, the logits read back each token
+        const bool pipe  = s.can_pipeline(graph) && !std::getenv("TTF_BENCH_SYNC");
+        double     dbest = 1e30;
         for (int r = 0; r < a.reps; ++r) {
             s.reset();
             const int D = a.depth;  // decode after a D-token prefill (in chunks of up to pp)
@@ -356,13 +358,23 @@ int run_lm(const ttf::Model & m, const Args & a) {
             }
             s.prof_build = s.prof_alloc = s.prof_compute = 0;
             const double t0 = now_ms();
-            for (int i = 0; i < a.tg; ++i) {
-                s.step(graph, { ids[(D + i) % a.pp] }, { (int32_t) (D + i) }, true);
+            if (pipe) {  // as greedy generation runs (the next token's step queued before this one's id is read)
+                s.submit_greedy(graph, ids[D % a.pp], D);
+                for (int i = 1; i < a.tg; ++i) {
+                    s.submit_greedy(graph, -1, D + i);
+                    s.take_greedy();
+                }
+                s.take_greedy();
+            } else {
+                for (int i = 0; i < a.tg; ++i) {
+                    s.step(graph, { ids[(D + i) % a.pp] }, { (int32_t) (D + i) }, true);
+                }
             }
             dbest = std::min(dbest, (now_ms() - t0) / a.tg);
         }
         const double gb = (double) (s.last_wbytes + s.last_sbytes) / 1e9;
-        std::printf("decode   B 1  : %8.2f ms  %9.1f tok/s  (%d tokens)\n", dbest, 1000.0 / dbest, a.tg);
+        std::printf("decode   B 1  : %8.2f ms  %9.1f tok/s  (%d tokens%s)\n", dbest, 1000.0 / dbest, a.tg,
+                    pipe ? ", greedy pipeline" : "");
         std::printf("per token: weights %.1f MB, state %.1f MB at position %d; %.1f GB/s\n", s.last_wbytes / 1e6,
                     s.last_sbytes / 1e6, a.depth + a.tg - 1, gb / (dbest / 1000.0));
         std::printf("decode split (last rep, per token): build %.2f ms, alloc %.2f ms, compute %.2f ms; %d nodes\n",
@@ -439,11 +451,24 @@ int run_lm(const ttf::Model & m, const Args & a) {
     if (txt && !a.ids_given) {
         std::printf("%s", a.text.c_str());
     }
+    // greedy on the GPU: the step of token i + 1 is queued before token i is printed and before token i + 1's id is
+    // read (submit_greedy), so the GPU never waits on the host. Same tokens; a step queued after an EOS runs unused
+    // (the session ends here). TTF_NO_PIPE=1: step + pick every token
+    const bool pipe   = a.temp <= 0.0f && s.can_pipeline(graph);
+    const double tg0  = now_ms();
     for (int i = 0; i < a.n_gen; ++i) {
         if (txt && std::find(txt->eos.begin(), txt->eos.end(), next) != txt->eos.end()) {
             break;
         }
         gen.push_back(next);
+        if (pipe && i + 1 < a.n_gen) {
+            if (i == 0) {
+                s.submit_greedy(graph, next, p++);  // the step on token 0 (from the prefill's pick)
+            }
+            if (i + 2 < a.n_gen) {
+                s.submit_greedy(graph, -1, p++);  // the step on token i + 1, still on the device
+            }
+        }
         if (txt) {  // stream: print what the decoded continuation added (no BOS-style strip mid-text)
             const std::string all = txt->tok->decode(gen, false);
             if (all.size() > shown.size() && all.compare(0, shown.size(), shown) == 0) {
@@ -455,9 +480,19 @@ int run_lm(const ttf::Model & m, const Args & a) {
         if (i + 1 == a.n_gen) {
             break;
         }
+        if (pipe) {
+            next = s.take_greedy();
+            continue;
+        }
         ttf::StepOut o = s.step(graph, { next }, { p++ }, true);
         ms += s.last_ms;
         next = pick(o.logits.data(), o.n_vocab, a.temp, a.top_k, rng);
+    }
+    while (s.pipe_queued() > 0) {
+        s.take_greedy();
+    }
+    if (pipe) {
+        ms = now_ms() - tg0;  // wall clock, the first token's printing included
     }
     if (txt) {
         std::printf("\n");
