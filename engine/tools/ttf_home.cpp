@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -163,18 +164,63 @@ std::vector<int32_t> encode(const Text & t, const std::string & s, bool specials
     return ids;
 }
 
+// the first index of the largest logit (as std::max_element): 16 independent lanes, then the first match (~10x faster
+// than the one-chain scan: 205 vs ~20 us a 248k vocab)
+int64_t argmax_first(const float * l, int64_t n) {
+    constexpr int L = 16;
+    float         m[L];
+    for (int k = 0; k < L; ++k) {
+        m[k] = -std::numeric_limits<float>::infinity();
+    }
+    int64_t i = 0;
+    for (; i + L <= n; i += L) {
+        for (int k = 0; k < L; ++k) {
+            m[k] = l[i + k] > m[k] ? l[i + k] : m[k];
+        }
+    }
+    float M = m[0];
+    for (int k = 1; k < L; ++k) {
+        M = m[k] > M ? m[k] : M;
+    }
+    for (; i < n; ++i) {
+        M = l[i] > M ? l[i] : M;
+    }
+    for (int64_t j = 0; j < n; ++j) {
+        if (l[j] == M) {
+            return j;
+        }
+    }
+    return 0;  // all NaN / -inf: as max_element, the first
+}
+
 int32_t pick(const float * l, int64_t n, float temp, int top_k, std::mt19937 & rng) {
     if (temp <= 0.0f) {
-        return (int32_t) (std::max_element(l, l + n) - l);
+        return (int32_t) argmax_first(l, n);
     }
-    std::vector<std::pair<float, int32_t>> c(n);
-    for (int64_t j = 0; j < n; ++j) {
-        c[j] = { l[j], (int32_t) j };
+    // the top k in one pass (value descending, ties by index): a small sorted list, entered only above its last
+    std::vector<std::pair<float, int32_t>> c;
+    if (top_k > 0 && top_k < n) {
+        c.reserve(top_k + 1);
+        for (int64_t j = 0; j < n; ++j) {
+            if ((int) c.size() == top_k && !(l[j] > c.back().first)) {
+                continue;
+            }
+            auto at = std::upper_bound(c.begin(), c.end(), l[j], [](float v, const auto & e) { return v > e.first; });
+            c.insert(at, { l[j], (int32_t) j });
+            if ((int) c.size() > top_k) {
+                c.pop_back();
+            }
+        }
+    } else {  // every token: no order needed, the largest only for the exp's offset
+        c.resize(n);
+        for (int64_t j = 0; j < n; ++j) {
+            c[j] = { l[j], (int32_t) j };
+        }
+        const int64_t a = argmax_first(l, n);
+        std::swap(c[0], c[a]);
     }
-    const int k = top_k > 0 ? std::min<int64_t>(top_k, n) : n;
-    std::partial_sort(c.begin(), c.begin() + k, c.end(), [](auto & a, auto & b) { return a.first > b.first; });
-    std::vector<double> p(k);
-    for (int i = 0; i < k; ++i) {
+    std::vector<double> p(c.size());
+    for (size_t i = 0; i < c.size(); ++i) {
         p[i] = std::exp((c[i].first - c[0].first) / temp);
     }
     std::discrete_distribution<int> d(p.begin(), p.end());

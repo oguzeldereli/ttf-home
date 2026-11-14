@@ -188,6 +188,8 @@ struct Session {
     std::map<std::string, std::unique_ptr<Built>> built;
     uint64_t                                      use_clock = 0;
     std::set<std::string>                         seen_keys;  // keys called once (a second call keeps the graph)
+    std::map<std::string, std::vector<Kv *>>      used_kv;    // per graph: the causal kv states its attn nodes use
+    ggml_backend_buffer_t                         out_pin = nullptr;  // pinned host staging for outputs (GPU): DMA, not staged
     struct Const {
         ggml_context *        ctx = nullptr;
         ggml_tensor *         t   = nullptr;

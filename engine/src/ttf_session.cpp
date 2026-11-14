@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <set>
@@ -984,6 +985,9 @@ Session::~Session() {
     if (sbuf) {
         ggml_backend_buffer_free(sbuf);
     }
+    if (out_pin) {
+        ggml_backend_buffer_free(out_pin);
+    }
     if (sctx) {
         ggml_free(sctx);
     }
@@ -1112,12 +1116,17 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         T                 = f0.shape.empty() ? 1 : f0.shape[0];
     }
     // the causal kv states this graph uses; filled first: a token sees itself and the earlier tokens of its call
-    std::vector<Kv *> used;
-    for (const auto & n : g.at("nodes")) {
-        if (n.at("op") == "attn" && n.value("attr", json::object()).value("causal", true)) {
-            used.push_back(&kv.at(n.at("attr").at("state").get<std::string>()));
+    auto uit = used_kv.find(graph);  // once per graph: a scan of every IR node is ~0.1-0.3 ms a 27B step
+    if (uit == used_kv.end()) {
+        std::vector<Kv *> u;
+        for (const auto & n : g.at("nodes")) {
+            if (n.at("op") == "attn" && n.value("attr", json::object()).value("causal", true)) {
+                u.push_back(&kv.at(n.at("attr").at("state").get<std::string>()));
+            }
         }
+        uit = used_kv.emplace(graph, std::move(u)).first;
     }
+    const std::vector<Kv *> & used = uit->second;
     const std::vector<int32_t> pos = pin ? pin->i : std::vector<int32_t>();
     if (!used.empty() && !pin) {
         throw std::runtime_error("graph " + graph + ": causal attn needs a pos input");
@@ -1305,6 +1314,12 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         ggml_init_params ip = { ne->gbuf.size(), ne->gbuf.data(), true };
         ne->ctx = ggml_init(ip);
         build(ne->ctx, gsize, *ne);
+        // a kept graph never changes (fixed state, consts and compute buffers; inputs change only data), so a uid
+        // lets the CUDA backend skip comparing every node's properties on each call (~0.7 ms a 27B decode step).
+        // TTF_NO_GRAPH_UID=1: compare every call.
+        if (!std::getenv("TTF_NO_GRAPH_UID")) {
+            ne->gf->uid = ggml_graph_next_uid();
+        }
         ne->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         e          = ne.get();
         built[key] = std::move(ne);
@@ -1485,7 +1500,26 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         }
         h.f.resize(ggml_nelements(t));
         if (ggml_is_contiguous(t)) {
-            ggml_backend_tensor_get(t, h.f.data(), 0, ggml_nbytes(t));
+            // GPU: through a pinned buffer (a 1 MB logits row: 160-250 us pageable, ~50 us pinned + the host copy); up to
+            // 16 MB (all-position prefill logits go straight). TTF_NO_OUT_PIN=1: always straight into the vector.
+            static const bool no_pin = std::getenv("TTF_NO_OUT_PIN") != nullptr;
+            const size_t      nb     = ggml_nbytes(t);
+            const bool        pin    = !no_pin && m.device != "cpu" && nb >= (64u << 10) && nb <= (16u << 20);
+            if (pin && (!out_pin || ggml_backend_buffer_get_size(out_pin) < nb)) {
+                if (out_pin) {
+                    ggml_backend_buffer_free(out_pin);
+                    out_pin = nullptr;
+                }
+                ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
+                out_pin = hb ? ggml_backend_buft_alloc_buffer(hb, nb) : nullptr;
+            }
+            if (pin && out_pin) {
+                void * hp = ggml_backend_buffer_get_base(out_pin);
+                ggml_backend_tensor_get(t, hp, 0, nb);
+                std::memcpy(h.f.data(), hp, nb);
+            } else {
+                ggml_backend_tensor_get(t, h.f.data(), 0, nb);
+            }
         } else {
             throw std::runtime_error("output " + o.at("name").get<std::string>() + ": not contiguous");
         }
