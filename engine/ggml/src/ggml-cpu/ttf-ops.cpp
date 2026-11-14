@@ -232,3 +232,33 @@ extern "C" void ggml_vec_dot_ttf_i4_bf16(int n, float * GGML_RESTRICT s, size_t 
     }
     ggml_vec_dot_bf16(n, s, bs, w.data(), bx, const_cast<ggml_bf16_t *>((const ggml_bf16_t *) vy), by, nrc);
 }
+
+// GGML_OP_TTF_TOPK: the k largest, value descending then the lower index first (the host sampler's top-k order);
+// -0 as +0
+void ggml_compute_forward_ttf_top_k(const ggml_compute_params * params, ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * a = dst->src[0];
+    const int64_t       n = a->ne[0];
+    const int           k = ggml_get_op_params_i32(dst, 0);
+    const float *       x = (const float *) a->data;
+    std::vector<std::pair<float, int32_t>> c;
+    c.reserve(k + 1);
+    for (int64_t j = 0; j < n; ++j) {
+        const float v = x[j] == 0.0f ? 0.0f : x[j];
+        if ((int) c.size() == k && !(v > c.back().first)) {
+            continue;
+        }
+        auto at = std::upper_bound(c.begin(), c.end(), v, [](float u, const std::pair<float, int32_t> & e) { return u > e.first; });
+        c.insert(at, { v, (int32_t) j });
+        if ((int) c.size() > k) {
+            c.pop_back();
+        }
+    }
+    float * o = (float *) dst->data;
+    for (int i = 0; i < k; ++i) {
+        o[i]     = c[i].first;
+        o[k + i] = (float) c[i].second;
+    }
+}

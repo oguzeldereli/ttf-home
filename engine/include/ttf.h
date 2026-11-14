@@ -129,7 +129,13 @@ struct Session {
     bool    can_pipeline(const std::string & graph) const;
     void    submit_greedy(const std::string & graph, int32_t id, int32_t pos);
     int32_t take_greedy();
+    // Sampled decode (same queue, host token id >= 0): the step's output is the top k of its logits (0 < k <= 256,
+    // k < vocab), value descending and ties by the lower index, as the host sampler's list; take_top_k fills c with
+    // the oldest queued step's (value, index) pairs. The step after can be queued as soon as the host has picked.
+    void    submit_top_k(const std::string & graph, int32_t id, int32_t pos, int k);
+    void    take_top_k(std::vector<std::pair<float, int32_t>> & c);
     int     pipe_queued() const { return (int) pipe_q.size(); }
+    void    pipe_drain();  // wait for every queued step, results dropped
 
     // prefix reuse: the recurrent state (conv + delta-rule) copied out / back, and the kv cache cut to positions < n
     // (later positions are masked; their stale values get probability exactly 0)
@@ -152,12 +158,15 @@ struct Session {
         ggml_backend_buffer_t pin = nullptr;
         size_t                cap = 0;
         ggml_backend_event_t  ev  = nullptr;
+        int                   k   = 0;  // the queued step's kind: 0 argmax (id at 0), k top k (2k floats at 64)
     };
     PipeSlot         pipe[PIPE];
     std::vector<int> pipe_q;
     int              pipe_next   = 0;
     int              greedy_slot = -1;       // run(): >= 0 while a greedy step is being queued (its slot)
     int32_t          greedy_id   = -1;       // run(): that step's token from the host (< 0: the device's)
+    int              greedy_k    = 0;        // run(): 0 argmax, else the top k
+    void             submit_pipe(const std::string & graph, int32_t id, int32_t pos, int k);
     size_t           stage_off   = 0;        // run(): bytes of the slot's staging used so far
     ggml_tensor *    dev_ids     = nullptr;  // [1] I32 in the state buffer: the token the next greedy step reads
     void             upload(ggml_tensor * t, const void * data, size_t nbytes);  // async; staged when greedy

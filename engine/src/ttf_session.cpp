@@ -1207,6 +1207,32 @@ void Session::upload(ggml_tensor * t, const void * data, size_t nbytes) {
 }
 
 void Session::submit_greedy(const std::string & graph, int32_t id, int32_t pos) {
+    submit_pipe(graph, id, pos, 0);
+}
+
+void Session::submit_top_k(const std::string & graph, int32_t id, int32_t pos, int k) {
+    if (id < 0 || k <= 0 || k > 256) {
+        throw std::runtime_error("submit_top_k: needs the host's token and 0 < k <= 256");
+    }
+    submit_pipe(graph, id, pos, k);
+}
+
+void Session::take_top_k(std::vector<std::pair<float, int32_t>> & c) {
+    if (pipe_q.empty() || pipe[pipe_q.front()].k == 0) {
+        throw std::runtime_error("take_top_k: no top-k step queued first");
+    }
+    const int k = pipe_q.front();
+    pipe_q.erase(pipe_q.begin());
+    ggml_backend_event_synchronize(pipe[k].ev);
+    const float * o = (const float *) ((const uint8_t *) ggml_backend_buffer_get_base(pipe[k].pin) + 64);
+    const int     n = pipe[k].k;
+    c.resize(n);
+    for (int i = 0; i < n; ++i) {
+        c[i] = { o[i], (int32_t) o[n + i] };
+    }
+}
+
+void Session::submit_pipe(const std::string & graph, int32_t id, int32_t pos, int kk) {
     if ((int) pipe_q.size() >= PIPE - 1) {
         throw std::runtime_error("submit_greedy: queue full (take_greedy first)");
     }
@@ -1217,6 +1243,8 @@ void Session::submit_greedy(const std::string & graph, int32_t id, int32_t pos) 
     pipe_next   = (pipe_next + 1) % PIPE;
     greedy_slot = k;
     greedy_id   = id;
+    greedy_k    = kk;
+    pipe[k].k   = kk;
     const auto t0 = std::chrono::steady_clock::now();
     try {
         run(graph, in, true);
@@ -1232,9 +1260,16 @@ void Session::submit_greedy(const std::string & graph, int32_t id, int32_t pos) 
     mm_post(ph, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 }
 
+void Session::pipe_drain() {
+    if (!pipe_q.empty()) {
+        ggml_backend_synchronize(backend);
+        pipe_q.clear();
+    }
+}
+
 int32_t Session::take_greedy() {
-    if (pipe_q.empty()) {
-        throw std::runtime_error("take_greedy: nothing queued");
+    if (pipe_q.empty() || pipe[pipe_q.front()].k != 0) {
+        throw std::runtime_error("take_greedy: no greedy step queued first");
     }
     const int k = pipe_q.front();
     pipe_q.erase(pipe_q.begin());
@@ -1310,7 +1345,7 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     static const bool no_cache = std::getenv("TTF_NO_GRAPH_CACHE") != nullptr;
     const bool   cacheable  = !dump_dir && !prof_by_op && !no_cache && T <= 64;
     std::string  key = "r" + std::to_string(mm_r) + "|" + graph + "|" + std::to_string(T) + "|" + std::to_string(S) + "|" +
-                      (last_only ? "1" : "0") + (greedy_slot >= 0 ? "|g" : "");
+                      (last_only ? "1" : "0") + (greedy_slot < 0 ? "" : greedy_k ? "|k" + std::to_string(greedy_k) : "|g");
     for (const auto & inp : g.at("inputs")) {
         const std::string name = inp.at("name");
         if (greedy_slot >= 0 && name == "ids") {  // greedy: the token is dev_ids (on the device), not an input
@@ -1395,6 +1430,13 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             if (greedy_slot >= 0) {  // greedy: the logits stay on the device; their argmax becomes the next token
                 if (t->type != GGML_TYPE_F32 || ggml_nrows(t) != 1) {
                     throw std::runtime_error("greedy step: the output is not one f32 row");
+                }
+                if (greedy_k) {  // sampled: the top k leave the device (the host draws)
+                    ggml_tensor * tk = ggml_ttf_top_k(ctx, t, greedy_k);
+                    ggml_set_output(tk);
+                    ggml_build_forward_expand(gf, tk);
+                    e.outs.push_back(tk);
+                    continue;
                 }
                 ggml_tensor * am = ggml_argmax(ctx, ggml_reshape_2d(ctx, t, t->ne[0], 1));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx, am, dev_ids));
@@ -1519,8 +1561,8 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         }
     }
     prof_galloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
-    if (greedy_slot >= 0) {  // the slot's pinned memory: id out (0), id in (4), the inputs staged (64 on), sized first
-        size_t need = 64;
+    if (greedy_slot >= 0) {  // the slot's pinned memory: id out (0), id in (4), top k out (64), the inputs staged (4160 on)
+        size_t need = 4160;
         for (auto & [name, t] : e->inputs) {
             need += (ggml_nbytes(t) + 63) / 64 * 64;
         }
@@ -1531,7 +1573,7 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
             need += (ggml_nbytes(e->mask) + 63) / 64 * 64;
         }
         uint8_t * base = slot_mem(greedy_slot, need);
-        stage_off      = 64;
+        stage_off      = 4160;
         if (greedy_id >= 0) {  // the host's token, queued after the previous step's write of dev_ids
             std::memcpy(base + 4, &greedy_id, 4);
             ggml_backend_tensor_set_async(backend, dev_ids, base + 4, 0, 4);
@@ -1644,7 +1686,12 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
         if (ggml_backend_graph_compute_async(backend, gf) != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("graph compute failed");
         }
-        ggml_backend_tensor_get_async(backend, dev_ids, ggml_backend_buffer_get_base(pipe[greedy_slot].pin), 0, 4);
+        uint8_t * pb = (uint8_t *) ggml_backend_buffer_get_base(pipe[greedy_slot].pin);
+        if (greedy_k) {
+            ggml_backend_tensor_get_async(backend, e->outs.at(0), pb + 64, 0, ggml_nbytes(e->outs.at(0)));
+        } else {
+            ggml_backend_tensor_get_async(backend, dev_ids, pb, 0, 4);
+        }
         ggml_backend_event_record(pipe[greedy_slot].ev, backend);
         const auto t3 = std::chrono::steady_clock::now();
         last_ms       = std::chrono::duration<double, std::milli>(t3 - t0).count();

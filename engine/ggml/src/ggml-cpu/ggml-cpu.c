@@ -2188,6 +2188,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_ttf_mm(params, tensor);
             }
             break;
+        case GGML_OP_TTF_TOPK:
+            {
+                ggml_compute_forward_ttf_top_k(params, tensor);
+            }
+            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2540,6 +2545,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_NONE:
+        case GGML_OP_TTF_TOPK:
             {
                 n_tasks = 1;
             } break;

@@ -193,6 +193,23 @@ int64_t argmax_first(const float * l, int64_t n) {
     return 0;  // all NaN / -inf: as max_element, the first
 }
 
+// sampled decode through the device's top k (Session::submit_top_k): the same draws as pick, whose list it is; only k
+// pairs leave the GPU. For 0 < top_k <= 256 below the vocabulary; else (and TTF_NO_DEV_TOPK=1) pick on all the logits
+bool dev_topk(const ttf::Session & s, const std::string & graph, float temp, int top_k, int64_t n_vocab) {
+    static const bool off = std::getenv("TTF_NO_DEV_TOPK") != nullptr;
+    return !off && temp > 0.0f && top_k > 0 && top_k <= 256 && top_k < n_vocab && s.can_pipeline(graph);
+}
+
+// a draw from candidates c (value, index), c[0] the largest: p ~ exp((v - v0) / temp)
+int32_t pick_list(const std::vector<std::pair<float, int32_t>> & c, float temp, std::mt19937 & rng) {
+    std::vector<double> p(c.size());
+    for (size_t i = 0; i < c.size(); ++i) {
+        p[i] = std::exp((c[i].first - c[0].first) / temp);
+    }
+    std::discrete_distribution<int> d(p.begin(), p.end());
+    return c[d(rng)].second;
+}
+
 int32_t pick(const float * l, int64_t n, float temp, int top_k, std::mt19937 & rng) {
     if (temp <= 0.0f) {
         return (int32_t) argmax_first(l, n);
@@ -219,13 +236,46 @@ int32_t pick(const float * l, int64_t n, float temp, int top_k, std::mt19937 & r
         const int64_t a = argmax_first(l, n);
         std::swap(c[0], c[a]);
     }
-    std::vector<double> p(c.size());
-    for (size_t i = 0; i < c.size(); ++i) {
-        p[i] = std::exp((c[i].first - c[0].first) / temp);
-    }
-    std::discrete_distribution<int> d(p.begin(), p.end());
-    return c[d(rng)].second;
+    return pick_list(c, temp, rng);
 }
+
+// one decode step at a time, queued before the caller prints the token it is on and fetched after (chat, serve):
+// on the GPU the logits stay there, their argmax (greedy) or top k (dev_topk) comes back; else step + pick. The same
+// tokens and the same steps as step + pick (nothing is queued past the caller's decision)
+struct Decoder {
+    ttf::Session &                         s;
+    const std::string &                    graph;
+    float                                  temp;
+    int                                    top_k;
+    std::mt19937 &                         rng;
+    bool                                   greedy = false, topk = false;
+    std::vector<std::pair<float, int32_t>> c;
+    ttf::StepOut                           o;
+    Decoder(ttf::Session & s_, const std::string & g, float t, int k, std::mt19937 & r, int64_t n_vocab) :
+        s(s_), graph(g), temp(t), top_k(k), rng(r) {
+        greedy = temp <= 0.0f && s.can_pipeline(graph);
+        topk   = !greedy && dev_topk(s, graph, temp, top_k, n_vocab);
+    }
+    void submit(int32_t id, int32_t pos) {
+        if (greedy) {
+            s.submit_greedy(graph, id, pos);
+        } else if (topk) {
+            s.submit_top_k(graph, id, pos, top_k);
+        } else {
+            o = s.step(graph, { id }, { pos }, true);
+        }
+    }
+    int32_t next() {
+        if (greedy) {
+            return s.take_greedy();
+        }
+        if (topk) {
+            s.take_top_k(c);
+            return pick_list(c, temp, rng);
+        }
+        return pick(o.logits.data(), o.n_vocab, temp, top_k, rng);
+    }
+};
 
 std::vector<int32_t> positions(int64_t from, int64_t n) {
     std::vector<int32_t> p(n);
@@ -454,7 +504,10 @@ int run_lm(const ttf::Model & m, const Args & a) {
     // greedy on the GPU: the step of token i + 1 is queued before token i is printed and before token i + 1's id is
     // read (submit_greedy), so the GPU never waits on the host. Same tokens; a step queued after an EOS runs unused
     // (the session ends here). TTF_NO_PIPE=1: step + pick every token
+    // sampled (dev_topk): the step on token i queued before token i is printed; the host draws from its top k
     const bool pipe   = a.temp <= 0.0f && s.can_pipeline(graph);
+    const bool samp   = dev_topk(s, graph, a.temp, a.top_k, r.n_vocab);
+    std::vector<std::pair<float, int32_t>> cand;
     const double tg0  = now_ms();
     for (int i = 0; i < a.n_gen; ++i) {
         if (txt && std::find(txt->eos.begin(), txt->eos.end(), next) != txt->eos.end()) {
@@ -468,6 +521,9 @@ int run_lm(const ttf::Model & m, const Args & a) {
             if (i + 2 < a.n_gen) {
                 s.submit_greedy(graph, -1, p++);  // the step on token i + 1, still on the device
             }
+        }
+        if (samp && i + 1 < a.n_gen) {
+            s.submit_top_k(graph, next, p++, a.top_k);
         }
         if (txt) {  // stream: print what the decoded continuation added (no BOS-style strip mid-text)
             const std::string all = txt->tok->decode(gen, false);
@@ -484,14 +540,17 @@ int run_lm(const ttf::Model & m, const Args & a) {
             next = s.take_greedy();
             continue;
         }
+        if (samp) {
+            s.take_top_k(cand);
+            next = pick_list(cand, a.temp, rng);
+            continue;
+        }
         ttf::StepOut o = s.step(graph, { next }, { p++ }, true);
         ms += s.last_ms;
         next = pick(o.logits.data(), o.n_vocab, a.temp, a.top_k, rng);
     }
-    while (s.pipe_queued() > 0) {
-        s.take_greedy();
-    }
-    if (pipe) {
+    s.pipe_drain();
+    if (pipe || samp) {
         ms = now_ms() - tg0;  // wall clock, the first token's printing included
     }
     if (txt) {
@@ -680,23 +739,27 @@ int run_chat(const ttf::Model & m, const Args & a) {
             std::printf("<think>\n");
         }
         pending                 = -1;
+        Decoder dec(s, graph, temp, top_k, rng, r.n_vocab);
         for (int i = 0; i < n_max; ++i) {
             if (std::find(f.stop.begin(), f.stop.end(), next) != f.stop.end()) {
                 pending = next;
                 break;
             }
             gen.push_back(next);
+            const bool more = pos + 2 <= ctx;
+            if (more) {
+                dec.submit(next, pos++);  // the step on this token runs while it is printed
+            }
             const std::string all = txt.tok->decode(gen, false);
             if (all.size() > shown.size() && all.compare(0, shown.size(), shown) == 0) {
                 std::printf("%s", all.c_str() + shown.size());
                 std::fflush(stdout);
                 shown = all;
             }
-            if (pos + 2 > ctx) {
+            if (!more) {
                 break;
             }
-            ttf::StepOut o = s.step(graph, { next }, { pos++ }, true);
-            next           = pick(o.logits.data(), o.n_vocab, temp, top_k, rng);
+            next = dec.next();
         }
         if (show_ids) {
             std::fprintf(stderr, "[gen");
@@ -1019,12 +1082,17 @@ int run_serve(const ttf::Model & m, const Args & a) {
                     }
                     rsent = std::max(rsent, upto);
                 };
+                Decoder dec(s, graph, temp, top_k, rng, r.n_vocab);
                 for (int i = 0; i < n_max && alive; ++i) {
                     if (std::find(f.stop.begin(), f.stop.end(), next) != f.stop.end()) {
                         finish = "stop";
                         break;
                     }
                     gen.push_back(next);
+                    const bool more = pos + 2 <= ctx;
+                    if (more) {
+                        dec.submit(next, pos++);  // the step on this token runs while it is sent
+                    }
                     const std::string all = txt.tok->decode(gen, false);
                     if (all.size() > shown.size() && all.compare(0, shown.size(), shown) == 0) {  // whole UTF-8 only
                         const std::string piece = all.substr(shown.size());
@@ -1051,11 +1119,10 @@ int run_serve(const ttf::Model & m, const Args & a) {
                             add_content(piece);
                         }
                     }
-                    if (pos + 2 > ctx) {
+                    if (!more) {
                         break;
                     }
-                    ttf::StepOut o = s.step(graph, { next }, { pos++ }, true);
-                    next           = pick(o.logits.data(), o.n_vocab, temp, top_k, rng);
+                    next = dec.next();
                 }
                 if (in_think) {
                     send_reasoning(reasoning.size());

@@ -1133,9 +1133,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "TTF_QUANT",
     "TTF_MM",
+    "TTF_TOPK",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1252,9 +1253,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "ttf_quant(x)",
     "ttf_mm(w,x)",
+    "ttf_top_k(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6459,6 +6461,22 @@ struct ggml_tensor * ggml_opt_step_sgd(
     result->src[1] = grad;
     result->src[2] = params;
 
+    return result;
+}
+
+// ttf_top_k
+
+struct ggml_tensor * ggml_ttf_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_nrows(a) == 1);
+    GGML_ASSERT(k > 0 && k <= 256 && k < a->ne[0]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 2);
+    const int32_t params[1] = { k };
+    ggml_set_op_params(result, params, sizeof(params));
+    result->op     = GGML_OP_TTF_TOPK;
+    result->src[0] = a;
     return result;
 }
 

@@ -610,6 +610,7 @@ extern "C" {
 
         GGML_OP_TTF_QUANT,
         GGML_OP_TTF_MM,
+        GGML_OP_TTF_TOPK,
 
         GGML_OP_COUNT,
     };
@@ -2918,6 +2919,14 @@ extern "C" {
         struct ggml_tensor  * mag_B,
         int64_t               Kp,
         bool                  d_bf16);
+
+    // ttf_top_k: the k largest of a one-row a (F32 [n] / [n, 1], k < n, k <= 256) -> F32 [k, 2]: row 0 the values, value
+    //   descending and ties by the lower index (the ttf host sampler's order), row 1 their indices (exact in F32 below
+    //   2^24). -0 counts as +0 (and comes out as +0). Deterministic.
+    GGML_API struct ggml_tensor * ggml_ttf_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k);
 
     // ttf_mm: w TQ1_P [Kp, N] (or Q2P: I8 [Kp / 4, N], 128 trits per 32 bytes, element 32 n + b = bits 2n of byte b,
     //   code = trit + 1) times qa (ttf_quant's output) -> F32 [N, ...]:

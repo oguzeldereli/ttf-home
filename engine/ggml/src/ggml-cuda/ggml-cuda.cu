@@ -9,6 +9,7 @@
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
+#include "ggml-cuda/ttf-topk.cuh"
 #include "ggml-cuda/argsort.cuh"
 #include "ggml-cuda/batch-get.cuh"
 #include "ggml-cuda/binbcast.cuh"
@@ -2907,6 +2908,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TTF_QUANT:
             ggml_cuda_op_ttf_quant(ctx, dst);
+            break;
+        case GGML_OP_TTF_TOPK:
+            ggml_cuda_ttf_top_k(ctx, dst);
             break;
         case GGML_OP_TTF_MM:
             ggml_cuda_op_ttf_mm(ctx, dst);
@@ -7663,6 +7667,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_OPT_STEP_SGD:
         case GGML_OP_TTF_QUANT:
         case GGML_OP_TTF_MM:
+        case GGML_OP_TTF_TOPK:
         case GGML_OP_FILL:
         case GGML_OP_CUMSUM:
         case GGML_OP_TRI:

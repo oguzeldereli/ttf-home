@@ -277,6 +277,66 @@ int test_argmax(ggml_backend_t gpu) {
     return fails;
 }
 
+// TTF_TOPK on CUDA vs the CPU op (the host sampler's list: value descending, ties by the lower index), bit for bit:
+// random rows, planted ties across blocks, many equal values, -0 / +0, k 1 / 20 / 40 / 256. Returns the failures.
+int test_topk(ggml_backend_t cpu, ggml_backend_t gpu) {
+    if (!gpu) {
+        return 0;
+    }
+    int          fails = 0;
+    std::mt19937 rng(11);
+    auto run1 = [](ggml_backend_t be, const std::vector<float> & x, int k) {
+        ggml_init_params ip = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ggml_context *   ctx = ggml_init(ip);
+        ggml_tensor *    tx  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) x.size());
+        ggml_tensor *    tk  = ggml_ttf_top_k(ctx, tx, k);
+        ggml_cgraph *    gf  = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, tk);
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, be);
+        ggml_backend_tensor_set(tx, x.data(), 0, x.size() * 4);
+        ggml_backend_graph_compute(be, gf);
+        std::vector<float> o(2 * k);
+        ggml_backend_tensor_get(tk, o.data(), 0, o.size() * 4);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        return o;
+    };
+    for (int64_t n : { 300, 2048, 5000, 32000, 131072, 151936, 248320 }) {
+        for (int kind = 0; kind < 4; ++kind) {
+            for (int k : { 1, 20, 40, 256 }) {
+                if (k >= n) {
+                    continue;
+                }
+                std::vector<float> x(n);
+                std::normal_distribution<float> nd(0.0f, 3.0f);
+                for (auto & v : x) {
+                    v = kind == 2 ? (float) (rng() % 7) : bf16r(nd(rng));  // kind 2: 7 values only (ties everywhere)
+                }
+                if (kind == 1) {  // equal top values far apart, in different blocks
+                    for (int64_t j = 0; j < n; j += n / 37 + 1) {
+                        x[j] = 30.0f;
+                    }
+                } else if (kind == 3) {  // -0 / +0 at the top
+                    for (auto & v : x) {
+                        v = -std::fabs(v) - 1.0f;
+                    }
+                    for (int64_t j = 0; j < n; j += n / 50 + 1) {
+                        x[j] = (j / (n / 50 + 1)) % 2 ? 0.0f : -0.0f;
+                    }
+                }
+                const auto a = run1(cpu, x, k), b = run1(gpu, x, k);
+                if (std::memcmp(a.data(), b.data(), a.size() * 4) != 0) {
+                    std::printf("top_k n %lld kind %d k %d: cuda != cpu (first: %g @%g vs %g @%g)\n", (long long) n, kind, k, b[0],
+                                b[k], a[0], a[k]);
+                    ++fails;
+                }
+            }
+        }
+    }
+    std::printf("ttf_top_k cuda vs cpu: %d failures\n", fails);
+    return fails;
+}
+
 int main(int argc, char ** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench-cpu") {  // decode-shaped, Q2P, weights past the L3 (~70 MB)
         ggml_backend_t cpu = ggml_backend_cpu_init();
@@ -494,6 +554,7 @@ int main(int argc, char ** argv) {
     }
 #ifdef TTF_CUDA
     fails += test_argmax(gpu);
+    fails += test_topk(cpu, gpu);
     fails += test_i4(cpu, gpu);
 #else
     fails += test_i4(cpu, nullptr);
