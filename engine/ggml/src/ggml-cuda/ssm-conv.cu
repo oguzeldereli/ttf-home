@@ -210,7 +210,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 // allocator reused) at any offset. PER == 1: a thread per channel over many blocks (dst apart from x, or at its base)
 template <int KC, int T, int PER>
 static __global__ void __launch_bounds__(T) k_conv_state(const ggml_cuda_conv_state p) {
-    const float * rows = p.rows + (int64_t) p.ids[0] * p.row_stride;
+    const float * rows = p.rows + (p.ids ? (int64_t) p.ids[0] * p.row_stride : 0);  // ids null: the state itself
     float x[PER][KC];
 #pragma unroll
     for (int r = 0; r < PER; ++r) {

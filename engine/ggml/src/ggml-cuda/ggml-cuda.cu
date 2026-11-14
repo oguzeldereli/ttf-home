@@ -3345,9 +3345,12 @@ static int ggml_cuda_try_gdn_cache_fusion(
     // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel
     // assumes). ggml_cpy pins src to the same element count.
     const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
-    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+    // TTF: one snapshot slot written into a flat contiguous state (the session's reshape of its state tensor)
+    const bool flat = K <= 1 && n_written == 1 && dst->type == GGML_TYPE_F32 && dst->data != nullptr &&
+                      ggml_is_contiguous(dst) && ggml_nelements(dst) == D * n_seqs;
+    if (!flat && (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
         !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D))) {
         return 0;
     }
 
@@ -3581,15 +3584,25 @@ static int ggml_cuda_conv_state_match(const ggml_cgraph * cgraph, int ci, ggml_c
     }
     const ggml_tensor * a = cc->src[0], * b = cc->src[1];
     const ggml_tensor * gr = ggml_cuda_strip_views(a);
-    if (!gr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-            a->ne[0] != KC - 1 || a->ne[1] != C || !ggml_is_contiguous(a) || gr->ne[0] != (KC - 1) * C ||
-            ggml_nelements(gr) != (KC - 1) * C) {
-        return 0;
-    }
-    const ggml_tensor * rows = gr->src[0], * ids = gr->src[1];
-    if (rows->type != GGML_TYPE_F32 || rows->nb[0] != sizeof(float) || rows->ne[0] != gr->ne[0] || rows->data == nullptr ||
-            ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || rows->nb[1] % sizeof(float) != 0) {
-        return 0;
+    const ggml_tensor * rows = nullptr, * ids = nullptr;
+    if (gr && gr->op == GGML_OP_NONE && a == gr && gr->type == GGML_TYPE_F32 && gr->ne[0] == KC - 1 && gr->ne[1] == C &&
+            ggml_nelements(gr) == (KC - 1) * C && ggml_is_contiguous(gr) && gr->data != nullptr) {
+        // TTF: the state tensor itself (no cache rows): read as row 0, written back in place by the same thread
+        rows = gr;
+        gr   = nullptr;
+    } else {
+        if (!gr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                a->ne[0] != KC - 1 || a->ne[1] != C || !ggml_is_contiguous(a) || gr->ne[0] != (KC - 1) * C ||
+                ggml_nelements(gr) != (KC - 1) * C) {
+            return 0;
+        }
+        rows = gr->src[0];
+        ids  = gr->src[1];
+        if (rows->type != GGML_TYPE_F32 || rows->nb[0] != sizeof(float) || rows->ne[0] != gr->ne[0] ||
+                rows->data == nullptr || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 ||
+                rows->nb[1] % sizeof(float) != 0) {
+            return 0;
+        }
     }
     if (b->type != GGML_TYPE_F32 || b->ne[0] != 1 || b->ne[1] != C || b->ne[2] != 1 || b->nb[1] != sizeof(float) ||
             b->data == nullptr) {
@@ -3612,7 +3625,7 @@ static int ggml_cuda_conv_state_match(const ggml_cgraph * cgraph, int ci, ggml_c
     constexpr int SCAN = 96;
     int si = -1;
     for (int k = pi + 1; k < cgraph->n_nodes && k < pi + SCAN; ++k) {
-        if (cgraph->nodes[k]->op == GGML_OP_SSM_CONV && cgraph->nodes[k]->src[0] == cc) {
+        if (cgraph->nodes[k]->op == GGML_OP_SSM_CONV && ggml_cuda_strip_views(cgraph->nodes[k]->src[0]) == cc) {
             si = k;
             break;
         }
@@ -3621,7 +3634,7 @@ static int ggml_cuda_conv_state_match(const ggml_cgraph * cgraph, int ci, ggml_c
         return 0;
     }
     const ggml_tensor * sc = cgraph->nodes[si], * u = cgraph->nodes[si + 1];
-    if (sc->op != GGML_OP_SSM_CONV || sc->src[0] != cc || (sc->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+    if (sc->op != GGML_OP_SSM_CONV || ggml_cuda_strip_views(sc->src[0]) != cc || (sc->flags & GGML_TENSOR_FLAG_OUTPUT) ||
             u->op != GGML_OP_UNARY || ggml_get_unary_op(u) != GGML_UNARY_OP_SILU || u->src[0] != sc ||
             u->type != GGML_TYPE_F32 || !ggml_is_contiguous(u) || ggml_nelements(u) != C) {
         return 0;
@@ -3632,9 +3645,9 @@ static int ggml_cuda_conv_state_match(const ggml_cgraph * cgraph, int ci, ggml_c
     }
     // no other reader of the gathered rows, the concat or the raw conv
     {
-        const ggml_tensor * mids[3] = { gr, cc, sc };
+        const ggml_tensor * mids[3] = { cc, sc, gr };
         const ggml_tensor * inside[4] = { cc, cp, sc, u };
-        if (!ggml_cuda_only_inside_readers(cgraph, mids, 3, inside, 4)) {
+        if (!ggml_cuda_only_inside_readers(cgraph, mids, gr ? 3 : 2, inside, 4)) {
             return 0;
         }
     }
@@ -3654,7 +3667,8 @@ static int ggml_cuda_conv_state_match(const ggml_cgraph * cgraph, int ci, ggml_c
             return 0;
         }
     }
-    p.rows = (const float *) rows->data; p.ids = (const int32_t *) ids->data; p.row_stride = rows->nb[1] / sizeof(float);
+    p.rows = (const float *) rows->data; p.ids = ids ? (const int32_t *) ids->data : nullptr;
+    p.row_stride = ids ? rows->nb[1] / sizeof(float) : 0;
     p.x = (const float *) b->data; p.w = (const float *) w->data; p.cell = (float *) cp->src[1]->data;
     p.dst = (float *) u->data; p.C = (int) C; p.KC = (int) KC;
     p.one_block = overlap(u->data, nu, b->data, nu) && u->data != b->data;
@@ -3669,9 +3683,9 @@ static bool ggml_cuda_conv_state_skip(const ggml_cgraph * cgraph, int i) {
     }
     const ggml_tensor * cc = nullptr;
     if (gr->op == GGML_OP_SSM_CONV) {
-        cc = gr->src[0];
+        cc = ggml_cuda_strip_views(gr->src[0]);
     } else if (gr->op == GGML_OP_UNARY && ggml_get_unary_op(gr) == GGML_UNARY_OP_SILU && gr->src[0]->op == GGML_OP_SSM_CONV) {
-        cc = gr->src[0]->src[0];
+        cc = ggml_cuda_strip_views(gr->src[0]->src[0]);
     }
     if (cc) {
         if (cc->op != GGML_OP_CONCAT) {
