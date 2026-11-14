@@ -32,14 +32,20 @@ void ggml_compute_forward_ttf_quant(const ggml_compute_params * params, ggml_ten
     const bool          bf16 = ggml_get_op_params_i32(dst, 1) != 0;
     const int64_t       K    = x->ne[0];
     const int64_t       rank = mB ? mB->ne[1] : 0;
-    const float *       mBv  = mB ? (const float *) mB->data : nullptr;
+    // mag_B F32, or BF16 (a bf16 D; rows widened to floats here, the same values)
+    GGML_ASSERT(!mB || mB->type == GGML_TYPE_F32 || mB->type == GGML_TYPE_BF16);
+    const bool          mBh  = mB && mB->type == GGML_TYPE_BF16;
+    const float *       mBv  = mB && !mBh ? (const float *) mB->data : nullptr;
     GGML_ASSERT(x->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I8 && dst->ne[0] == Kp + QROW_TAIL + 4 * rank);
     GGML_ASSERT(x->nb[0] == sizeof(float));
     const float floor_ = rd(1e-5f, bf16);
     const float * muv  = mu ? (const float *) mu->data : nullptr;
     const float * cv   = c ? (const float *) c->data : nullptr;
-    thread_local std::vector<float> v;
+    thread_local std::vector<float> v, brow;
     v.resize(Kp);
+    if (mBh) {
+        brow.resize(K);
+    }
     const int64_t      nr = x->ne[1] * x->ne[2] * x->ne[3];
     for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
         const int64_t i3 = ir / (x->ne[1] * x->ne[2]);
@@ -53,7 +59,11 @@ void ggml_compute_forward_ttf_quant(const ggml_compute_params * params, ggml_ten
         std::memcpy(o + Kp + 4, &qs, 4);
         // step 6, first half: u = rD(xc @ mag_B), xc = v (in D)
         for (int64_t j = 0; j < rank; ++j) {
-            const float u = rd(ttf_kern::dot_f32_64(v.data(), mBv + j * K, K), bf16);
+            const float * bj = mBv ? mBv + j * K : brow.data();
+            if (mBh) {
+                ggml_bf16_to_fp32_row((const ggml_bf16_t *) mB->data + j * K, brow.data(), K);
+            }
+            const float u = rd(ttf_kern::dot_f32_64(v.data(), bj, K), bf16);
             std::memcpy(o + Kp + QROW_TAIL + 4 * j, &u, 4);
         }
     }
@@ -68,6 +78,7 @@ struct MmNode {
     const ggml_tensor * w;
     const int8_t *      q;
     const float *       rv, *bv, *mAv, *av;
+    const ggml_bf16_t * mAh;  // mag_A in BF16 (a bf16 D), else null
     float *             out;
     bool                bf16, q2;
     int64_t             Kp, N, T, ldq, rank, CH, nc;
@@ -97,7 +108,9 @@ struct MmNode {
         bt  = ((const float *) be->data)[0];
         rv  = r ? (const float *) r->data : nullptr;
         bv  = b ? (const float *) b->data : nullptr;
-        mAv = mA ? (const float *) mA->data : nullptr;
+        GGML_ASSERT(!mA || mA->type == GGML_TYPE_F32 || mA->type == GGML_TYPE_BF16);
+        mAv = mA && mA->type == GGML_TYPE_F32 ? (const float *) mA->data : nullptr;
+        mAh = mA && mA->type == GGML_TYPE_BF16 ? (const ggml_bf16_t *) mA->data : nullptr;
         av  = acc ? (const float *) acc->data : nullptr;
         out = (float *) dst->data;
         q   = (const int8_t *) qa->data;
@@ -132,6 +145,14 @@ struct MmNode {
                 ttf_kern::tq1p_decode_row(wr, Kp / ttf_kern::QK_TQ1P, codes.data());
             }
             const float rn = rv ? rd(rv[n], bf16) : 0.0f;
+            // the adapter row of n as floats (BF16 storage widened, the same values)
+            thread_local std::vector<float> arow;
+            const float * ar = mAv ? mAv + n * rank : nullptr;
+            if (mAh) {
+                arow.resize(rank);
+                ggml_bf16_to_fp32_row(mAh + n * rank, arow.data(), rank);
+                ar = arow.data();
+            }
             const float bn = bv ? rd(bv[n], bf16) : 0.0f;
             for (int64_t t = 0; t < T; t += 4) {
                 const int nt = (int) std::min<int64_t>(4, T - t);
@@ -150,9 +171,9 @@ struct MmNode {
                     // step 5: the trainer's int8 GEMM returns bf16 for any D
                     float y = ttf_kern::bf16_round((s[t + j] * (float) (a[j] - qsum[t + j])) * bt);
                     y       = rd(y, bf16);
-                    if (mAv) {  // step 6, second half: y = rD(y + rD(u @ mag_A^T))
+                    if (ar) {  // step 6, second half: y = rD(y + rD(u @ mag_A^T))
                         const float * u = (const float *) (q + (t + j) * ldq + Kp + QROW_TAIL);
-                        y = rd(y + rd(ttf_kern::dot_f32(u, mAv + n * rank, rank), bf16), bf16);
+                        y = rd(y + rd(ttf_kern::dot_f32(u, ar, rank), bf16), bf16);
                     }
                     if (rv) {  // step 7
                         y = rd(y * rn, bf16);

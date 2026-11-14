@@ -325,9 +325,10 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             const ggml_tensor * mB    = no_ad ? nullptr : m->get(pe.part + ".mag_B");
             if (mA && mB) {
                 // file: mag_A torch [N, rank] = ggml [rank, N]; mag_B torch [K, rank] = ggml [rank, K]
-                // F32 holding D values: the fused ops read them as floats
-                P.mag_A = ggml_new_tensor_2d(m->wctx, GGML_TYPE_F32, mA->ne[0], mA->ne[1]);
-                P.mag_B = ggml_new_tensor_2d(m->wctx, GGML_TYPE_F32, mB->ne[1], mB->ne[0]);  // transposed: [K, rank]
+                // in D's type (BF16 for a bf16 D: the values the fused ops compute with are bf16 anyway, so the
+                // floats they read are the same and half the bytes move); F32 otherwise
+                P.mag_A = ggml_new_tensor_2d(m->wctx, dt, mA->ne[0], mA->ne[1]);
+                P.mag_B = ggml_new_tensor_2d(m->wctx, dt, mB->ne[1], mB->ne[0]);  // transposed: [K, rank]
                 ggml_set_name(P.mag_A, (pe.part + ".mag_A.D").c_str());
                 ggml_set_name(P.mag_B, (pe.part + ".mag_B.DT").c_str());
                 dmat.emplace_back(P.mag_A, mA);

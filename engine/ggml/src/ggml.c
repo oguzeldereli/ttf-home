@@ -6476,7 +6476,8 @@ struct ggml_tensor * ggml_ttf_quant(
     GGML_ASSERT(Kp >= x->ne[0] && Kp % 32 == 0);
     GGML_ASSERT(!mu || (mu->type == GGML_TYPE_F32 && mu->ne[0] >= x->ne[0] && ggml_is_contiguous(mu)));
     GGML_ASSERT(!c  || (c->type  == GGML_TYPE_F32 && c->ne[0]  >= x->ne[0] && ggml_is_contiguous(c)));
-    GGML_ASSERT(!mag_B || (mag_B->type == GGML_TYPE_F32 && mag_B->ne[0] == x->ne[0] && ggml_is_contiguous(mag_B)));
+    GGML_ASSERT(!mag_B || ((mag_B->type == GGML_TYPE_F32 || (d_bf16 && mag_B->type == GGML_TYPE_BF16)) &&
+                         mag_B->ne[0] == x->ne[0] && ggml_is_contiguous(mag_B)));
     const int64_t rank = mag_B ? mag_B->ne[1] : 0;
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I8, Kp + 32 + 4*rank, x->ne[1], x->ne[2], x->ne[3]);
     const int32_t params[2] = { (int32_t) Kp, d_bf16 ? 1 : 0 };
@@ -6505,7 +6506,8 @@ struct ggml_tensor * ggml_ttf_mm(
     GGML_ASSERT(w->type == GGML_TYPE_TQ1_P || Kp % 128 == 0);
     const int64_t rank = mag_A ? mag_A->ne[0] : 0;
     GGML_ASSERT(qa->ne[0] == Kp + 32 + 4*rank);
-    GGML_ASSERT(!mag_A || (mag_A->type == GGML_TYPE_F32 && mag_A->ne[1] == w->ne[1] && ggml_is_contiguous(mag_A)));
+    GGML_ASSERT(!mag_A || ((mag_A->type == GGML_TYPE_F32 || (d_bf16 && mag_A->type == GGML_TYPE_BF16)) &&
+                         mag_A->ne[1] == w->ne[1] && ggml_is_contiguous(mag_A)));
     GGML_ASSERT(beta && beta->type == GGML_TYPE_F32 && ggml_nelements(beta) == 1);
     const int64_t N = w->ne[1];
     GGML_ASSERT(!r || (r->type == GGML_TYPE_F32 && r->ne[0] == N));

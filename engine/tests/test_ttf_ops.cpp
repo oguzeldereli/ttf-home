@@ -1,5 +1,5 @@
 // test-ttf-ops: GGML_OP_TTF_QUANT + GGML_OP_TTF_MM on random data, CPU (Q2P and TQ1_P) vs CUDA (TQ1_P and Q2P):
-// every output must be bit-identical. Also TTF_I4 (int-k) GET_ROWS / MUL_MAT against a BF16 copy of the weight. Cases cover T 1 / 3 / 17, K with padding, adapter ranks 0 / 24 / 104, acc / r / b.
+// every output must be bit-identical. Also TTF_I4 (int-k) GET_ROWS / MUL_MAT against a BF16 copy of the weight. Cases cover T 1 / 3 / 17, K with padding, adapter ranks 0 / 16 / 24 / 104 (F32, and BF16 for bf16 D), acc / r / b.
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -32,6 +32,9 @@ float bf16r(float v) {
     return v;
 }
 
+// adapters stored as BF16 (bf16 cases: their values are bf16, so the outputs must not change)
+bool g_adp_bf16 = false;
+
 // runs the case on one backend with one trit layout; returns the output
 std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::vector<int8_t> & trits,
                        const std::vector<float> & x, const std::vector<float> & mu, const std::vector<float> & c,
@@ -44,8 +47,9 @@ std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::
     ggml_tensor * tx = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cs.K, cs.T);
     ggml_tensor * tmu = cs.side ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cs.K) : nullptr;
     ggml_tensor * tc  = cs.side ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cs.K) : nullptr;
-    ggml_tensor * tB  = cs.rank ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cs.K, cs.rank) : nullptr;
-    ggml_tensor * tA  = cs.rank ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cs.rank, cs.N) : nullptr;
+    const ggml_type at = g_adp_bf16 && cs.bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+    ggml_tensor * tB  = cs.rank ? ggml_new_tensor_2d(ctx, at, cs.K, cs.rank) : nullptr;
+    ggml_tensor * tA  = cs.rank ? ggml_new_tensor_2d(ctx, at, cs.rank, cs.N) : nullptr;
     ggml_tensor * tr  = cs.side ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cs.N) : nullptr;
     ggml_tensor * tb  = cs.side ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, cs.N) : nullptr;
     ggml_tensor * tac = cs.side ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cs.N, cs.T) : nullptr;
@@ -85,7 +89,13 @@ std::vector<float> run(ggml_backend_t be, bool q2p, const Case & cs, const std::
         ggml_backend_tensor_set(tb, b.data(), 0, ggml_nbytes(tb));
         ggml_backend_tensor_set(tac, acc.data(), 0, ggml_nbytes(tac));
     }
-    if (cs.rank) {
+    if (cs.rank && at == GGML_TYPE_BF16) {
+        std::vector<ggml_bf16_t> hB(mB.size()), hA(mA.size());
+        ggml_fp32_to_bf16_row_ref(mB.data(), hB.data(), (int64_t) hB.size());
+        ggml_fp32_to_bf16_row_ref(mA.data(), hA.data(), (int64_t) hA.size());
+        ggml_backend_tensor_set(tB, hB.data(), 0, ggml_nbytes(tB));
+        ggml_backend_tensor_set(tA, hA.data(), 0, ggml_nbytes(tA));
+    } else if (cs.rank) {
         ggml_backend_tensor_set(tB, mB.data(), 0, ggml_nbytes(tB));
         ggml_backend_tensor_set(tA, mA.data(), 0, ggml_nbytes(tA));
     }
@@ -346,6 +356,9 @@ int main(int argc, char ** argv) {
         { 1000, 130, 17, 64, true, true },  { 2048, 64, 5, 104, true, false }, { 4096, 96, 1, 104, true, true },
         { 1024, 300, 40, 24, true, true },  { 2816, 257, 33, 0, true, true },  { 1000, 130, 64, 64, false, false },
         { 2048, 70, 8, 104, true, true },
+        // rank 16 (the 27B's): preloaded adapter rows; decode split quant (K > 1024), odd K, the MMA path
+        { 5120, 600, 1, 16, true, true },   { 17408, 300, 1, 16, true, true }, { 2050, 100, 1, 16, true, true },
+        { 1024, 4096, 64, 16, true, true },
     };
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, 4);
@@ -380,19 +393,29 @@ int main(int argc, char ** argv) {
             const char *   name;
             ggml_backend_t be;
             bool           q2p;
+            bool           ah;  // BF16 adapters
         };
-        std::vector<V> vs = { { "cpu tq1p", cpu, false } };
+        std::vector<V> vs = { { "cpu tq1p", cpu, false, false } };
 #ifdef TTF_CUDA
-        vs.push_back({ "cuda tq1p", gpu, false });
-        vs.push_back({ "cuda q2p", gpu, true });
+        vs.push_back({ "cuda tq1p", gpu, false, false });
+        vs.push_back({ "cuda q2p", gpu, true, false });
 #endif
+        if (cs.bf16 && cs.rank) {
+            vs.push_back({ "cpu q2p ah", cpu, true, true });
+#ifdef TTF_CUDA
+            vs.push_back({ "cuda tq1p ah", gpu, false, true });
+            vs.push_back({ "cuda q2p ah", gpu, true, true });
+#endif
+        }
         for (const V & v : vs) {
+            g_adp_bf16   = v.ah;
             auto    o    = run(v.be, v.q2p, cs, trits, x, mu, c, mB, mA, r, b, acc, beta);
+            g_adp_bf16   = false;
             int64_t diff = 0;
             for (size_t i = 0; i < o.size(); ++i) {
                 diff += std::memcmp(&o[i], &ref[i], 4) != 0;
             }
-            std::printf("K %5lld N %4lld T %2lld rank %3d side %d bf16 %d  %-9s vs cpu q2p: %lld / %zu differ\n", (long long) cs.K,
+            std::printf("K %5lld N %4lld T %2lld rank %3d side %d bf16 %d  %-12s vs cpu q2p: %lld / %zu differ\n", (long long) cs.K,
                         (long long) cs.N, (long long) cs.T, cs.rank, cs.side, cs.bf16, v.name, (long long) diff, o.size());
             fails += diff != 0;
         }

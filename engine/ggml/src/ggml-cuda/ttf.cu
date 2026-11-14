@@ -67,14 +67,31 @@ static __device__ __forceinline__ float ttf_xc(const float * x, const float * mu
     return t;
 }
 
+// adapter factors (mag_A / mag_B): F32, or BF16 (a bf16-D model's values are bf16: the same floats, half the bytes).
+// Kernels take the type as a template flag (BH; a runtime select in the loops cost registers and load batching) and
+// read element i with ttf_ad_ld<BH>
+struct ttf_adp {
+    const void * p;
+    bool         bh;
+    __host__ __device__ explicit operator bool() const { return p != nullptr; }
+};
+template <bool BH> static __device__ __forceinline__ float ttf_ad_ld(const void * p, const int64_t i) {
+    return BH ? __bfloat162float(((const nv_bfloat16 *) p)[i]) : ((const float *) p)[i];
+}
+static ttf_adp ttf_adp_of(const ggml_tensor * t) {
+    GGML_ASSERT(!t || t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_BF16);
+    return { t ? t->data : nullptr, t && t->type == GGML_TYPE_BF16 };
+}
+
 // dot_f32's order for n floats a . b (a, b contiguous): 8 lanes by fma, lanes summed in order, then the tail
-static __device__ __forceinline__ float ttf_dot8(const float * a, const float * b, const int64_t n) {
+template <bool BH>
+static __device__ __forceinline__ float ttf_dot8(const float * a, const void * b, const int64_t bo, const int64_t n) {
     float         l[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
     const int64_t n8   = n / 8 * 8;
     for (int64_t k = 0; k < n8; k += 8) {
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            l[i] = __fmaf_rn(a[k + i], b[k + i], l[i]);
+            l[i] = __fmaf_rn(a[k + i], ttf_ad_ld<BH>(b, bo + k + i), l[i]);
         }
     }
     float r = 0.0f;
@@ -83,7 +100,7 @@ static __device__ __forceinline__ float ttf_dot8(const float * a, const float * 
         r = __fadd_rn(r, l[i]);
     }
     for (int64_t k = n8; k < n; ++k) {
-        r = __fadd_rn(r, __fmul_rn(a[k], b[k]));
+        r = __fadd_rn(r, __fmul_rn(a[k], ttf_ad_ld<BH>(b, bo + k)));
     }
     return r;
 }
@@ -141,8 +158,9 @@ static __device__ __forceinline__ int ttf_block_sum_i(int v, int * sh) {
 // the adapter's down projections u_j = rD(xc . mB_j), one warp each, in dot_f32_64's order
 // the adapter's down projection u_j = xc . bj by one warp (lane-strided, two chains, then a shuffle tree; lane 0
 // holds the sum); xk(k) gives xc[k]. One order for every kernel that makes u (bit-identical results)
-template <class XK>
-static __device__ __forceinline__ float ttf_adapter_dot(XK xk, const float * bj, const int64_t K, const int lane) {
+template <bool BH, class XK>
+static __device__ __forceinline__ float ttf_adapter_dot_t(XK xk, const void * mB, const int64_t bo, const int64_t K,
+                                                         const int lane) {
     float         a0 = 0.0f, a1 = 0.0f;
     const int64_t K64 = K / 64 * 64;
     int64_t       k0  = 0;
@@ -154,7 +172,7 @@ static __device__ __forceinline__ float ttf_adapter_dot(XK xk, const float * bj,
         for (int u = 0; u < 8; ++u) {
             const int64_t k = k0 + 32 * u + lane;
             xa[u]           = xk(k);
-            wa[u]           = bj[k];
+            wa[u]           = ttf_ad_ld<BH>(mB, bo + k);
         }
 #pragma unroll
         for (int u = 0; u < 8; u += 2) {
@@ -165,10 +183,10 @@ static __device__ __forceinline__ float ttf_adapter_dot(XK xk, const float * bj,
     for (; k0 < K; k0 += 64) {
         const int64_t k = k0 + lane;
         if (k < K) {
-            a0 = __fmaf_rn(xk(k), bj[k], a0);
+            a0 = __fmaf_rn(xk(k), ttf_ad_ld<BH>(mB, bo + k), a0);
         }
         if (k + 32 < K) {
-            a1 = __fmaf_rn(xk(k + 32), bj[k + 32], a1);
+            a1 = __fmaf_rn(xk(k + 32), ttf_ad_ld<BH>(mB, bo + k + 32), a1);
         }
     }
     float s = __fadd_rn(a0, a1);
@@ -178,16 +196,22 @@ static __device__ __forceinline__ float ttf_adapter_dot(XK xk, const float * bj,
     }
     return s;
 }
+template <class XK>
+static __device__ __forceinline__ float ttf_adapter_dot(XK xk, const ttf_adp mB, const int64_t bo, const int64_t K,
+                                                       const int lane) {
+    return mB.bh ? ttf_adapter_dot_t<true>(xk, mB.p, bo, K, lane) : ttf_adapter_dot_t<false>(xk, mB.p, bo, K, lane);
+}
 
 // up to TTF_QMAX quantisations of one input in one launch (parts on one input: own mu / c / adapter), blockIdx.z
 struct ttf_qpart {
     const float * mu;
     const float * c;
-    const float * mB;
+    const void *  mB;  // F32, or BF16 when mbh (ttf_adp)
     char *        dst;
     int64_t       nbd1;
     int64_t       Kp;
     int           rank;
+    int           mbh;
 };
 #define TTF_QMAX 4
 struct ttf_qparts {
@@ -204,7 +228,7 @@ static __global__ void __launch_bounds__(1024) ttf_quant_kernel(const char * x, 
     const ttf_qpart  q    = z == 0 ? P.p[0] : z == 1 ? P.p[1] : z == 2 ? P.p[2] : P.p[3];
     const float *    mu   = q.mu;
     const float *    c    = q.c;
-    const float *    mB   = q.mB;
+    const ttf_adp    mB   = { q.mB, q.mbh != 0 };
     char *           dst  = q.dst;
     const int64_t    nbd1 = q.nbd1;
     const int64_t    Kp   = q.Kp;
@@ -223,14 +247,14 @@ static __global__ void __launch_bounds__(1024) ttf_quant_kernel(const char * x, 
             return;
         }
         const int     lane = threadIdx.x % WARP_SIZE;
-        const float * bj   = mB + (int64_t) j * K;
+        const int64_t bo   = (int64_t) j * K;
         float *       ws   = xs + TTF_QCH;
         float         a0 = 0.0f, a1 = 0.0f;
         for (int64_t c0 = 0; c0 < K; c0 += TTF_QCH) {
             const int n = (int) min((int64_t) TTF_QCH, K - c0);
             for (int k = threadIdx.x; k < n; k += blockDim.x) {
                 xs[k] = ttf_xc_v(ttf_xin(xr, ur, act, c0 + k), mu, c, c0 + k, bf16);
-                ws[k] = bj[c0 + k];
+                ws[k] = mB.bh ? ttf_ad_ld<true>(mB.p, bo + c0 + k) : ttf_ad_ld<false>(mB.p, bo + c0 + k);
             }
             __syncthreads();
             if (threadIdx.x < WARP_SIZE) {
@@ -284,8 +308,7 @@ static __global__ void __launch_bounds__(1024) ttf_quant_kernel(const char * x, 
         if (j >= rank) {
             return;
         }
-        const float * bj = mB + (int64_t) j * K;
-        const float   s  = ttf_adapter_dot([&](int64_t k) { return staged ? xs[k] : ttf_xc_v(ttf_xin(xr, ur, act, k), mu, c, k, bf16); }, bj, K, lane);
+        const float   s  = ttf_adapter_dot([&](int64_t k) { return staged ? xs[k] : ttf_xc_v(ttf_xin(xr, ur, act, k), mu, c, k, bf16); }, mB, (int64_t) j * K, K, lane);
         if (lane == 0) {
             *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(s, bf16);
         }
@@ -396,10 +419,10 @@ static __global__ void __launch_bounds__(TTF_QSPLIT_TH) ttf_quant_q_kernel(const
             return;
         }
         const int     lane = threadIdx.x % WARP_SIZE;
-        const float * bj   = q.mB + (int64_t) j * K;
+        const int64_t bo   = (int64_t) j * K;
         float *       ws   = xs + TTF_QSPLIT_CH;
         float         a0 = 0.0f, a1 = 0.0f;
-        const bool    v4 = (K % 4) == 0 && ((uintptr_t) bj % 16) == 0 && ((uintptr_t) xc % 16) == 0;
+        const bool    v4 = (K % 4) == 0 && ((uintptr_t) q.mB % 16) == 0 && ((uintptr_t) xc % 16) == 0;
         for (int64_t c0 = 0; c0 < K; c0 += TTF_QSPLIT_CH) {
             const int n = (int) min((int64_t) TTF_QSPLIT_CH, K - c0);
             if (v4) {  // float4 copies, 4 + 4 per thread in flight
@@ -407,12 +430,18 @@ static __global__ void __launch_bounds__(TTF_QSPLIT_TH) ttf_quant_q_kernel(const
 #pragma unroll 4
                 for (int k = threadIdx.x; k < n4; k += blockDim.x) {
                     ((float4 *) xs)[k] = ((const float4 *) (xc + c0))[k];
-                    ((float4 *) ws)[k] = ((const float4 *) (bj + c0))[k];
+                    if (q.mbh) {  // 4 bf16 (8 bytes): a bf16's float is its bits shifted up
+                        const uint2 h = ((const uint2 *) ((const nv_bfloat16 *) q.mB + bo + c0))[k];
+                        ((float4 *) ws)[k] = make_float4(__uint_as_float(h.x << 16), __uint_as_float(h.x & 0xffff0000u),
+                                                         __uint_as_float(h.y << 16), __uint_as_float(h.y & 0xffff0000u));
+                    } else {
+                        ((float4 *) ws)[k] = ((const float4 *) ((const float *) q.mB + bo + c0))[k];
+                    }
                 }
             } else {
                 for (int k = threadIdx.x; k < n; k += blockDim.x) {
                     xs[k] = xc[c0 + k];
-                    ws[k] = bj[c0 + k];
+                    ws[k] = q.mbh ? ttf_ad_ld<true>(q.mB, bo + c0 + k) : ttf_ad_ld<false>(q.mB, bo + c0 + k);
                 }
             }
             __syncthreads();
@@ -512,7 +541,8 @@ static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * cons
         GGML_ASSERT(ggml_is_contiguous(d));
         P.p[p].mu   = d->src[1] ? (const float *) d->src[1]->data : nullptr;
         P.p[p].c    = d->src[2] ? (const float *) d->src[2]->data : nullptr;
-        P.p[p].mB   = mB ? (const float *) mB->data : nullptr;
+        P.p[p].mB   = ttf_adp_of(mB).p;
+        P.p[p].mbh  = ttf_adp_of(mB).bh;
         P.p[p].dst  = (char *) d->data;
         P.p[p].nbd1 = d->nb[1];
         P.p[p].Kp   = ggml_get_op_params_i32(d, 0);
@@ -675,7 +705,7 @@ static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, 
         const int lane = tid % WARP_SIZE;
         const int j    = (blockIdx.y - 1) * (BS / WARP_SIZE) + tid / WARP_SIZE;
         if (j < qp.rank) {
-            const float s = ttf_adapter_dot([&](int64_t k) { return xsh[k]; }, qp.mB + (int64_t) j * K, K, lane);
+            const float s = ttf_adapter_dot([&](int64_t k) { return xsh[k]; }, ttf_adp{ qp.mB, qp.mbh != 0 }, (int64_t) j * K, K, lane);
             if (lane == 0) {
                 *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(s, bf16);
             }
@@ -742,7 +772,8 @@ bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor
         }
         P.p[p].mu   = q->src[1] ? (const float *) q->src[1]->data : nullptr;
         P.p[p].c    = q->src[2] ? (const float *) q->src[2]->data : nullptr;
-        P.p[p].mB   = mB ? (const float *) mB->data : nullptr;
+        P.p[p].mB   = ttf_adp_of(mB).p;
+        P.p[p].mbh  = ttf_adp_of(mB).bh;
         P.p[p].dst  = (char *) q->data;
         P.p[p].nbd1 = q->nb[1];
         P.p[p].Kp   = ggml_get_op_params_i32(q, 0);
@@ -794,9 +825,10 @@ static __device__ __forceinline__ uint32_t ttf_tq1p_lut_entry(const uint32_t b) 
 
 // grid (ceil(N / (WARPS R)), <= ceil(T / TOK)); block WARPS warps, R rows each (R = 4 when T > TOK: each activation load
 // then feeds 4 rows), TOK tokens per pass; the block strides over its token chunks
-template <bool Q2, int R, bool H, int TK = TTF_MM_TOK>  // TK: tokens per warp pass (1: the decode build)
+// TK: tokens per warp pass (1: the decode build); BH: mag_A in BF16 (else F32)
+template <bool Q2, int R, bool H, int TK = TTF_MM_TOK, bool BH = false>
 static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int64_t nbw1, const char * qa,
-                                                   const int64_t ldq, const float * beta, const float * mA,
+                                                   const int64_t ldq, const float * beta, const void * mA,
                                                    const int rank, const float * r, const float * b, const float * acc,
                                                    const bool bf16, float * out, const int64_t N, const int64_t T,
                                                    const int64_t Kp, const int64_t bx, const float * res) {
@@ -826,7 +858,7 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
 #pragma unroll
         for (int i = 0; i < TTF_MM_AP; ++i) {
             const int64_t k = m + 8 * i;
-            av[rr][i]       = mA && live && k < n8a ? mA[(n0 + rr) * rank + k] : 0.0f;
+            av[rr][i]       = mA && live && k < n8a ? ttf_ad_ld<BH>(mA, (n0 + rr) * rank + k) : 0.0f;
         }
     }
     for (int64_t t0 = (int64_t) blockIdx.y * TK; t0 < T; t0 += (int64_t) gridDim.y * TK) {
@@ -1018,7 +1050,7 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
             if (mA && rr < nr) {
                 const int     tt = lane / 8, l = lane % 8;
                 const int64_t n8 = rank / 8 * 8;
-                const float * ar = mA + (n0 + rr) * rank;
+                const int64_t ao = (n0 + rr) * rank;
                 float         pl = 0.0f;
                 if (tt < nt) {
                     const float * u = (const float *) (qa + (t0 + tt) * ldq + Kp + TTF_QROW_TAIL);
@@ -1031,7 +1063,7 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
                         }
                     } else {
                         for (int64_t k = l; k < n8; k += 8) {
-                            pl = __fmaf_rn(u[k], ar[k], pl);
+                            pl = __fmaf_rn(u[k], ttf_ad_ld<BH>(mA, ao + k), pl);
                         }
                     }
                 }
@@ -1043,7 +1075,7 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
                 if (lane < nt) {
                     const float * u = (const float *) (qa + (t0 + lane) * ldq + Kp + TTF_QROW_TAIL);
                     for (int64_t k = n8; k < rank; ++k) {
-                        rs = __fadd_rn(rs, __fmul_rn(u[k], ar[k]));
+                        rs = __fadd_rn(rs, __fmul_rn(u[k], ttf_ad_ld<BH>(mA, ao + k)));
                     }
                 }
                 ad[rr] = ttf_rd(rs, bf16);
@@ -1093,12 +1125,12 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
     }
 }
 
-template <bool Q2, int R, bool H = false, int TK = TTF_MM_TOK>
+template <bool Q2, int R, bool H = false, int TK = TTF_MM_TOK, bool BH = false>
 static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, TK == 1 ? (R == 1 ? 10 : 5) : (R == 1 ? 8 : 4)) ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
-                                     const float * beta, const float * mA, const int rank, const float * r,
+                                     const float * beta, const void * mA, const int rank, const float * r,
                                      const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
                                      const int64_t T, const int64_t Kp, const float * res = nullptr) {
-    ttf_mm_body<Q2, R, H, TK>(w, nbw1, qa, ldq, beta, mA, rank, r, b, acc, bf16, out, N, T, Kp, blockIdx.x, res);
+    ttf_mm_body<Q2, R, H, TK, BH>(w, nbw1, qa, ldq, beta, mA, rank, r, b, acc, bf16, out, N, T, Kp, blockIdx.x, res);
 }
 
 // up to TTF_MMMAX parts (each its own weights, activations, epilogue) in one launch: part z owns blocks
@@ -1109,7 +1141,7 @@ struct ttf_mmpart {
     const char *    qa;
     int64_t         ldq;
     const float *   beta;
-    const float *   mA;
+    const void *    mA;  // F32, or BF16 (the kernel's BH; one type for all parts)
     const float *   r;
     const float *   b;
     const float *   acc;
@@ -1125,12 +1157,12 @@ struct ttf_mmparts {
 };
 
 // register cap as the single-part kernel gets: the part selection otherwise costs occupancy
-template <bool Q2, int R, bool H = false, int TK = TTF_MM_TOK>
+template <bool Q2, int R, bool H = false, int TK = TTF_MM_TOK, bool BH = false>
 static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, TK == 1 ? (R == 1 ? 10 : 5) : (R == 1 ? 8 : 4)) ttf_mm_multi_kernel(const ttf_mmparts P, const bool bf16, const int64_t T) {
     const int        bx = blockIdx.x;
     const int        z  = bx >= P.p[2].bx0 ? 2 : bx >= P.p[1].bx0 ? 1 : 0;  // unused parts: bx0 = INT_MAX
     const ttf_mmpart q  = z == 0 ? P.p[0] : z == 1 ? P.p[1] : P.p[2];
-    ttf_mm_body<Q2, R, H, TK>(q.w, q.nbw1, q.qa, q.ldq, q.beta, q.mA, q.rank, q.r, q.b, q.acc, bf16, q.out, q.N, T, q.Kp,
+    ttf_mm_body<Q2, R, H, TK, BH>(q.w, q.nbw1, q.qa, q.ldq, q.beta, q.mA, q.rank, q.r, q.b, q.acc, bf16, q.out, q.N, T, q.Kp,
                           bx - q.bx0, nullptr);
 }
 
@@ -1154,9 +1186,9 @@ static __device__ __forceinline__ void ttf_mma_s8(int (&c)[4], const int a0, con
 #endif
 }
 
-template <bool Q2, int NT>
+template <bool Q2, int NT, bool BH>  // BH: mag_A in BF16 (else F32)
 static __global__ void ttf_mma_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
-                                      const float * beta, const float * mA, const int rank, const float * r,
+                                      const float * beta, const void * mA, const int rank, const float * r,
                                       const float * b, const float * acc, const bool bf16, float * out,
                                       const int64_t N, const int64_t T, const int64_t Kp) {
     constexpr int QB = Q2 ? 128 : 160, NP = Q2 ? 4 : 5, LDB = QB / 4 + 4, TB = 8 * NT;
@@ -1238,7 +1270,7 @@ static __global__ void ttf_mma_kernel(const uint8_t * w, const int64_t nbw1, con
             y                = ttf_rd(y, bf16);
             if (mA) {
                 const float * u = (const float *) (row + Kp + TTF_QROW_TAIL);
-                y               = ttf_rd(__fadd_rn(y, ttf_rd(ttf_dot8(u, mA + n * rank, rank), bf16)), bf16);
+                y               = ttf_rd(__fadd_rn(y, ttf_rd(ttf_dot8<BH>(u, mA, n * rank, rank), bf16)), bf16);
             }
             if (r) {
                 y = ttf_rd(__fmul_rn(y, ttf_rd(r[n], bf16)), bf16);
@@ -1290,16 +1322,18 @@ static void ttf_mm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, co
             const dim3 grid((unsigned) gx, (unsigned) ((T + tb - 1) / tb));
             kern<<<grid, TTF_MM_WARPS * WARP_SIZE, 0, ctx.stream()>>>(
                 (const uint8_t *) w->data, w->nb[1], (const char *) qa->data, qa->nb[1], (const float *) be->data,
-                mA ? (const float *) mA->data : nullptr, rank, r ? (const float *) r->data : nullptr,
+                mA ? mA->data : nullptr, rank, r ? (const float *) r->data : nullptr,
                 b ? (const float *) b->data : nullptr, acc ? (const float *) acc->data : nullptr, bf16,
                 (float *) dst->data, N, T, Kp);
         };
+        const bool bh  = ttf_adp_of(mA).bh;
+        auto       gob = [&](auto kf, auto kb, const int tb) { bh ? go(kb, tb) : go(kf, tb); };
         // widest token tile that still gives >= 1 block per SM (wider tiles reuse each A fragment more)
         const int nt = gx * ((T + 31) / 32) >= nsm ? 4 : gx * ((T + 15) / 16) >= nsm ? 2 : 1;
         if (q2) {
-            nt == 4 ? go(ttf_mma_kernel<true, 4>, 32) : nt == 2 ? go(ttf_mma_kernel<true, 2>, 16) : go(ttf_mma_kernel<true, 1>, 8);
+            nt == 4 ? gob(ttf_mma_kernel<true, 4, false>, ttf_mma_kernel<true, 4, true>, 32) : nt == 2 ? gob(ttf_mma_kernel<true, 2, false>, ttf_mma_kernel<true, 2, true>, 16) : gob(ttf_mma_kernel<true, 1, false>, ttf_mma_kernel<true, 1, true>, 8);
         } else {
-            nt == 4 ? go(ttf_mma_kernel<false, 4>, 32) : nt == 2 ? go(ttf_mma_kernel<false, 2>, 16) : go(ttf_mma_kernel<false, 1>, 8);
+            nt == 4 ? gob(ttf_mma_kernel<false, 4, false>, ttf_mma_kernel<false, 4, true>, 32) : nt == 2 ? gob(ttf_mma_kernel<false, 2, false>, ttf_mma_kernel<false, 2, true>, 16) : gob(ttf_mma_kernel<false, 1, false>, ttf_mma_kernel<false, 1, true>, 8);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -1322,19 +1356,21 @@ static void ttf_mm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, co
     auto       go = [&](auto kern) {
         kern<<<grid, block, 0, ctx.stream()>>>(
             (const uint8_t *) w->data, w->nb[1], (const char *) qa->data, qa->nb[1], (const float *) be->data,
-            mA ? (const float *) mA->data : nullptr, rank, r ? (const float *) r->data : nullptr,
+            mA ? mA->data : nullptr, rank, r ? (const float *) r->data : nullptr,
             b ? (const float *) b->data : nullptr, acc ? (const float *) acc->data : nullptr, bf16,
             out_o ? out_o : (float *) dst->data, N, T, Kp, res);
     };
+    const bool bh  = ttf_adp_of(mA).bh;
+    auto       gob = [&](auto kf, auto kb) { bh ? go(kb) : go(kf); };
     if (q2) {
-        H ? go(ttf_mm_kernel<true, 4, true>)
-          : (R == 4 ? go(ttf_mm_kernel<true, 4>) : go(ttf_mm_kernel<true, 1>));
+        H ? gob(ttf_mm_kernel<true, 4, true, TTF_MM_TOK, false>, ttf_mm_kernel<true, 4, true, TTF_MM_TOK, true>)
+          : (R == 4 ? gob(ttf_mm_kernel<true, 4, false, TTF_MM_TOK, false>, ttf_mm_kernel<true, 4, false, TTF_MM_TOK, true>) : gob(ttf_mm_kernel<true, 1, false, TTF_MM_TOK, false>, ttf_mm_kernel<true, 1, false, TTF_MM_TOK, true>));
     } else if (T == 1) {  // one token: the kernel built for one (fewer registers, no token selection)
-        H ? go(ttf_mm_kernel<false, 4, true, 1>)
-          : (R == 4 ? go(ttf_mm_kernel<false, 4, false, 1>) : go(ttf_mm_kernel<false, 1, false, 1>));
+        H ? gob(ttf_mm_kernel<false, 4, true, 1, false>, ttf_mm_kernel<false, 4, true, 1, true>)
+          : (R == 4 ? gob(ttf_mm_kernel<false, 4, false, 1, false>, ttf_mm_kernel<false, 4, false, 1, true>) : gob(ttf_mm_kernel<false, 1, false, 1, false>, ttf_mm_kernel<false, 1, false, 1, true>));
     } else {
-        H ? go(ttf_mm_kernel<false, 4, true>)
-          : (R == 4 ? go(ttf_mm_kernel<false, 4>) : go(ttf_mm_kernel<false, 1>));
+        H ? gob(ttf_mm_kernel<false, 4, true, TTF_MM_TOK, false>, ttf_mm_kernel<false, 4, true, TTF_MM_TOK, true>)
+          : (R == 4 ? gob(ttf_mm_kernel<false, 4, false, TTF_MM_TOK, false>, ttf_mm_kernel<false, 4, false, TTF_MM_TOK, true>) : gob(ttf_mm_kernel<false, 1, false, TTF_MM_TOK, false>, ttf_mm_kernel<false, 1, false, TTF_MM_TOK, true>));
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1370,13 +1406,20 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
     for (int p = 0; p < TTF_MMMAX; ++p) {
         P.p[p].bx0 = INT_MAX;
     }
+    bool bh = false;  // the parts' adapters in BF16 (one type for all: the kernel's BH)
+    for (int p = 0; p < np; ++p) {
+        if (ds[p]->src[3]) {
+            bh = ttf_adp_of(ds[p]->src[3]).bh;
+        }
+    }
     for (int p = 0; p < np; ++p) {
         const ggml_tensor * d   = ds[p];
         const ggml_tensor * w   = d->src[0];
         const ggml_tensor * qa  = d->src[1];
         const ggml_tensor * acc = d->src[6];
         if (w->type != wt || ggml_nrows(qa) != T || ggml_get_op_params_i32(d, 0) != bf16 || !ggml_is_contiguous(qa) ||
-                !ggml_is_contiguous(d) || (acc && !ggml_is_contiguous(acc))) {
+                !ggml_is_contiguous(d) || (acc && !ggml_is_contiguous(acc)) ||
+                (d->src[3] && ttf_adp_of(d->src[3]).bh != bh)) {
             return false;
         }
         Ntot += w->ne[1];
@@ -1413,7 +1456,7 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
         q.qa   = (const char *) qa->data;
         q.ldq  = qa->nb[1];
         q.beta = (const float *) d->src[2]->data;
-        q.mA   = mA ? (const float *) mA->data : nullptr;
+        q.mA   = mA ? mA->data : nullptr;
         q.rank = mA ? (int) mA->ne[0] : 0;
         q.r    = d->src[4] ? (const float *) d->src[4]->data : nullptr;
         q.b    = d->src[5] ? (const float *) d->src[5]->data : nullptr;
@@ -1427,15 +1470,16 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
     const dim3 grid((unsigned) bx, 1);
     const dim3 block(TTF_MM_WARPS * WARP_SIZE);
     auto       go = [&](auto kern) { kern<<<grid, block, 0, ctx.stream()>>>(P, bf16 != 0, T); };
+    auto       gob = [&](auto kf, auto kb) { bh ? go(kb) : go(kf); };
     if (q2) {
-        H ? go(ttf_mm_multi_kernel<true, 4, true>)
-          : (R == 4 ? go(ttf_mm_multi_kernel<true, 4>) : go(ttf_mm_multi_kernel<true, 1>));
+        H ? gob(ttf_mm_multi_kernel<true, 4, true, TTF_MM_TOK, false>, ttf_mm_multi_kernel<true, 4, true, TTF_MM_TOK, true>)
+          : (R == 4 ? gob(ttf_mm_multi_kernel<true, 4, false, TTF_MM_TOK, false>, ttf_mm_multi_kernel<true, 4, false, TTF_MM_TOK, true>) : gob(ttf_mm_multi_kernel<true, 1, false, TTF_MM_TOK, false>, ttf_mm_multi_kernel<true, 1, false, TTF_MM_TOK, true>));
     } else if (T == 1) {
-        H ? go(ttf_mm_multi_kernel<false, 4, true, 1>)
-          : (R == 4 ? go(ttf_mm_multi_kernel<false, 4, false, 1>) : go(ttf_mm_multi_kernel<false, 1, false, 1>));
+        H ? gob(ttf_mm_multi_kernel<false, 4, true, 1, false>, ttf_mm_multi_kernel<false, 4, true, 1, true>)
+          : (R == 4 ? gob(ttf_mm_multi_kernel<false, 4, false, 1, false>, ttf_mm_multi_kernel<false, 4, false, 1, true>) : gob(ttf_mm_multi_kernel<false, 1, false, 1, false>, ttf_mm_multi_kernel<false, 1, false, 1, true>));
     } else {
-        H ? go(ttf_mm_multi_kernel<false, 4, true>)
-          : (R == 4 ? go(ttf_mm_multi_kernel<false, 4>) : go(ttf_mm_multi_kernel<false, 1>));
+        H ? gob(ttf_mm_multi_kernel<false, 4, true, TTF_MM_TOK, false>, ttf_mm_multi_kernel<false, 4, true, TTF_MM_TOK, true>)
+          : (R == 4 ? gob(ttf_mm_multi_kernel<false, 4, false, TTF_MM_TOK, false>, ttf_mm_multi_kernel<false, 4, false, TTF_MM_TOK, true>) : gob(ttf_mm_multi_kernel<false, 1, false, TTF_MM_TOK, false>, ttf_mm_multi_kernel<false, 1, false, TTF_MM_TOK, true>));
     }
     CUDA_CHECK(cudaGetLastError());
     return true;

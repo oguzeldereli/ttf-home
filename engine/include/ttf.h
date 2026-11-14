@@ -33,8 +33,8 @@ struct Part {
     ggml_tensor * c     = nullptr;  // F32 [K] in D (col_scale)
     ggml_tensor * r     = nullptr;  // F32 [N] in D (row_scale)
     ggml_tensor * b     = nullptr;  // F32 [N] in D (out_bias)
-    ggml_tensor * mag_B = nullptr;  // F32 [K, rank] in D (transposed at load: rank rows of K)
-    ggml_tensor * mag_A = nullptr;  // F32 [rank, N] in D
+    ggml_tensor * mag_B = nullptr;  // [K, rank] in D: BF16 for a bf16 D, else F32 (transposed at load: rank rows of K)
+    ggml_tensor * mag_A = nullptr;  // [rank, N] in D: BF16 for a bf16 D, else F32
 };
 
 struct Model {
