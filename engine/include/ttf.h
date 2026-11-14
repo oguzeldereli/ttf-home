@@ -144,10 +144,10 @@ struct Session {
     // kernel), prefill by the two mul_mats (V copied transposed). TTF_NO_CUDA_FA=1: the transposed cache and mul_mats.
     bool           dfa = false;
     // CUDA decode: rows per warp of the ternary products (TTF_MM op param 1): 0 = by shape (1 below N 2048, else 4), or
-    // 1 / 4 for all (the same results, bit for bit). Chosen online from the one-token steps themselves: trials of 32
-    // steps alternating by shape / 1 (at step 0, 256, then every 8192), the steps between with 1 when its median step time is
-    // over 5% faster. 1 wins where the GPU has power to spare (4070 Ti Super 27B: 55.9 vs 49.9 tok/s), the shape rule under a
-    // power cap (4080 Laptop 27B: 33.0 vs 31.7), which a short trial at start cannot see. TTF_MM_R=0|1|4 fixes it.
+    // 1 / 4 for all (the same results, bit for bit). Chosen online from the one-token steps themselves: trials of 64
+    // steps in blocks of 8 alternating by shape / 1 (at step 0, 256, then every 8192), the steps between with 1 when its
+    // median step time is over 3% faster. 1 wins where the GPU has power to spare (4070 Ti Super 27B: 63.0 vs 59.9
+    // tok/s), the shape rule under a power cap (4080 Laptop 27B: 36.3 vs 35.0). TTF_MM_R=0|1|4 fixes it.
     int            mm_r = 0;
     ggml_backend_t backend = nullptr;
     ggml_context * sctx    = nullptr;  // state tensors

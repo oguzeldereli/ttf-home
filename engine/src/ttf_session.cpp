@@ -1052,15 +1052,17 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
             }
         }
     }
-    // online choice of the decode rows per warp (see ttf.h): trials of 32 steps alternating the two settings (clocks
-    // ramping up at the start then weigh on both alike) at step 0, 256 (a laptop's power cap has set in by then), then
-    // every 8192 (each trial builds the other setting's graphs, ~50 ms at 27B); the first 8 steps of a trial untimed
-    // (they build / capture the graphs)
-    constexpr int64_t TR = 32, SKIP = 8;
+    // online choice of the decode rows per warp (see ttf.h): trials of 64 steps in blocks of 8 per setting,
+    // alternating (clocks ramping up at the start then weigh on both alike), at step 0, 256 (a laptop's power cap has
+    // set in by then), then every 8192 (each trial builds the other setting's graphs, ~50 ms at 27B). The first 2
+    // steps of a block are untimed (graph build / capture, and the switch). Blocks, not single steps: on a
+    // power-capped GPU a step alternating with the other setting runs on the power the other left (4080 Laptop 27B:
+    // single-step trial 26.6 vs 28.6 ms for R = 1, fixed 28.6 vs 27.6)
+    constexpr int64_t TR = 64, BL = 8, SKIP = 2;
     const bool        one = mm_mode == 1 && ids.size() == 1;
     const int64_t     ph  = mm_n < 256 ? mm_n : mm_n < 8192 ? mm_n - 256 : mm_n % 8192;
     if (one) {
-        mm_r = ph < TR ? (ph % 2 ? 1 : 0) : mm_best;
+        mm_r = ph < TR ? (int) ((ph / BL) % 2) : mm_best;
     }
     Values in;
     in["ids"] = Tensor::i32({ (int64_t) ids.size() }, ids);
@@ -1068,8 +1070,9 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
     const auto t0 = std::chrono::steady_clock::now();
     Values  o = run(graph, in, last_only);
     if (one) {
-        if (ph < TR && ph >= SKIP) {
-            mm_ms[ph % 2].push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        if (ph < TR && ph % BL >= SKIP) {
+            mm_ms[(ph / BL) % 2].push_back(
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         }
         if (ph == TR - 1) {
             double md[2];
@@ -1078,9 +1081,8 @@ StepOut Session::step(const std::string & graph, const std::vector<int32_t> & id
                 md[i] = mm_ms[i].empty() ? 0 : mm_ms[i][mm_ms[i].size() / 2];
                 mm_ms[i].clear();
             }
-            // 1 only on a clear win: the trial reads a few percent in 1's favour where it then loses sustained (4080
-            // Laptop BitNet: trial 4.98 vs 5.03 ms, fixed 5.23 vs 5.11); the 27B on a 4070 Ti Super: 18.0 vs 20.3
-            mm_best = md[1] < 0.95 * md[0] ? 1 : 0;
+            // 1 only on a clear win (3%): the 27B on a 4070 Ti Super reads 16.1 vs 17.0 ms
+            mm_best = md[1] < 0.97 * md[0] ? 1 : 0;
             if (std::getenv("TTF_MM_R_LOG")) {
                 std::fprintf(stderr, "[ttf: decode rows per warp %s (by shape: %.2f ms, 1: %.2f ms)]\n",
                              mm_best ? "1" : "by shape", md[0], md[1]);
