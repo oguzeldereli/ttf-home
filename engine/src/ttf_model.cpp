@@ -318,8 +318,11 @@ std::unique_ptr<Model> Model::load(const std::string & path, std::string * err, 
             P.c  = side(pe.part + ".col_scale");
             P.r  = side(pe.part + ".row_scale");
             P.b  = side(pe.part + ".out_bias");
-            const ggml_tensor * mA = m->get(pe.part + ".mag_A");
-            const ggml_tensor * mB = m->get(pe.part + ".mag_B");
+            // TTF_NO_ADAPTERS=1: load without the adapters (a speed comparison against runtimes that lack them;
+            // the outputs then differ)
+            static const bool   no_ad = std::getenv("TTF_NO_ADAPTERS") != nullptr;
+            const ggml_tensor * mA    = no_ad ? nullptr : m->get(pe.part + ".mag_A");
+            const ggml_tensor * mB    = no_ad ? nullptr : m->get(pe.part + ".mag_B");
             if (mA && mB) {
                 // file: mag_A torch [N, rank] = ggml [rank, N]; mag_B torch [K, rank] = ggml [rank, K]
                 // F32 holding D values: the fused ops read them as floats
