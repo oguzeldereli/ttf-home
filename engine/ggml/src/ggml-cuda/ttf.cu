@@ -404,6 +404,84 @@ static __global__ void __launch_bounds__(256) ttf_quant_xc_kernel(const char * x
 
 #define TTF_QSPLIT_TH 512   // threads per kernel-2 block
 #define TTF_QSPLIT_CH 8192  // adapter chunk (xc and mB_j: 2 x 32 KB shared)
+// adapter block of the decode split: u_j = rD(xc . mB_j) from the row's xc in global memory, in ttf_adapter_dot's
+// order (chunks of CH, a multiple of 64, staged in xs: 2 CH floats)
+template <int CH>
+static __device__ __forceinline__ void ttf_quant_adapter_block(const ttf_qpart & q, const float * xc, const int64_t K,
+                                                               const bool bf16, const int j, char * o, float * xs) {
+    const int     lane = threadIdx.x % WARP_SIZE;
+    const int64_t bo   = (int64_t) j * K;
+    float *       ws   = xs + CH;
+    float         a0 = 0.0f, a1 = 0.0f;
+    const bool    v4 = (K % 4) == 0 && ((uintptr_t) q.mB % 16) == 0 && ((uintptr_t) xc % 16) == 0;
+    for (int64_t c0 = 0; c0 < K; c0 += CH) {
+        const int n = (int) min((int64_t) CH, K - c0);
+        if (v4) {  // float4 copies, 4 + 4 per thread in flight
+            const int n4 = n / 4;
+#pragma unroll 4
+            for (int k = threadIdx.x; k < n4; k += blockDim.x) {
+                ((float4 *) xs)[k] = ((const float4 *) (xc + c0))[k];
+                if (q.mbh) {  // 4 bf16 (8 bytes): a bf16's float is its bits shifted up
+                    const uint2 h = ((const uint2 *) ((const nv_bfloat16 *) q.mB + bo + c0))[k];
+                    ((float4 *) ws)[k] = make_float4(__uint_as_float(h.x << 16), __uint_as_float(h.x & 0xffff0000u),
+                                                     __uint_as_float(h.y << 16), __uint_as_float(h.y & 0xffff0000u));
+                } else {
+                    ((float4 *) ws)[k] = ((const float4 *) ((const float *) q.mB + bo + c0))[k];
+                }
+            }
+        } else {
+            for (int k = threadIdx.x; k < n; k += blockDim.x) {
+                xs[k] = xc[c0 + k];
+                ws[k] = q.mbh ? ttf_ad_ld<true>(q.mB, bo + c0 + k) : ttf_ad_ld<false>(q.mB, bo + c0 + k);
+            }
+        }
+        __syncthreads();
+        // the two chains of ttf_adapter_dot (a0: k = lane + 64 i, a1: k = lane + 32 + 64 i) are independent
+        // until their final sum: warp 0 runs a0, warp 1 a1
+        if (threadIdx.x < 2 * WARP_SIZE) {
+            const int w = threadIdx.x / WARP_SIZE;
+            float     a = w ? a1 : a0;
+            int       k = lane + 32 * w;
+            for (; k + 7 * 64 < n; k += 8 * 64) {
+                float xv[8], wv[8];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    xv[u] = xs[k + 64 * u];
+                    wv[u] = ws[k + 64 * u];
+                }
+#pragma unroll
+                for (int u = 0; u < 8; ++u) {
+                    a = __fmaf_rn(xv[u], wv[u], a);
+                }
+            }
+            for (; k < n; k += 64) {
+                a = __fmaf_rn(xs[k], ws[k], a);
+            }
+            if (w) {
+                a1 = a;
+            } else {
+                a0 = a;
+            }
+        }
+        __syncthreads();
+    }
+    __shared__ float sa1[WARP_SIZE];
+    if (threadIdx.x >= WARP_SIZE && threadIdx.x < 2 * WARP_SIZE) {
+        sa1[lane] = a1;
+    }
+    __syncthreads();
+    if (threadIdx.x < WARP_SIZE) {
+        float sum = __fadd_rn(a0, sa1[lane]);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, off));
+        }
+        if (lane == 0) {
+            *(float *) (o + q.Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(sum, bf16);
+        }
+    }
+}
+
 static __global__ void __launch_bounds__(TTF_QSPLIT_TH) ttf_quant_q_kernel(const int64_t K, const bool bf16, const ttf_qparts P,
                                                                  const float * xcb, const float * pm, const int B) {
     __shared__ int  si[32];
@@ -415,79 +493,8 @@ static __global__ void __launch_bounds__(TTF_QSPLIT_TH) ttf_quant_q_kernel(const
     if ((int) blockIdx.x >= B) {  // adapter: u_j, j = blockIdx.x - B
         extern __shared__ float xs[];
         const int j = blockIdx.x - B;
-        if (j >= q.rank) {
-            return;
-        }
-        const int     lane = threadIdx.x % WARP_SIZE;
-        const int64_t bo   = (int64_t) j * K;
-        float *       ws   = xs + TTF_QSPLIT_CH;
-        float         a0 = 0.0f, a1 = 0.0f;
-        const bool    v4 = (K % 4) == 0 && ((uintptr_t) q.mB % 16) == 0 && ((uintptr_t) xc % 16) == 0;
-        for (int64_t c0 = 0; c0 < K; c0 += TTF_QSPLIT_CH) {
-            const int n = (int) min((int64_t) TTF_QSPLIT_CH, K - c0);
-            if (v4) {  // float4 copies, 4 + 4 per thread in flight
-                const int n4 = n / 4;
-#pragma unroll 4
-                for (int k = threadIdx.x; k < n4; k += blockDim.x) {
-                    ((float4 *) xs)[k] = ((const float4 *) (xc + c0))[k];
-                    if (q.mbh) {  // 4 bf16 (8 bytes): a bf16's float is its bits shifted up
-                        const uint2 h = ((const uint2 *) ((const nv_bfloat16 *) q.mB + bo + c0))[k];
-                        ((float4 *) ws)[k] = make_float4(__uint_as_float(h.x << 16), __uint_as_float(h.x & 0xffff0000u),
-                                                         __uint_as_float(h.y << 16), __uint_as_float(h.y & 0xffff0000u));
-                    } else {
-                        ((float4 *) ws)[k] = ((const float4 *) ((const float *) q.mB + bo + c0))[k];
-                    }
-                }
-            } else {
-                for (int k = threadIdx.x; k < n; k += blockDim.x) {
-                    xs[k] = xc[c0 + k];
-                    ws[k] = q.mbh ? ttf_ad_ld<true>(q.mB, bo + c0 + k) : ttf_ad_ld<false>(q.mB, bo + c0 + k);
-                }
-            }
-            __syncthreads();
-            // the two chains of ttf_adapter_dot (a0: k = lane + 64 i, a1: k = lane + 32 + 64 i) are independent
-            // until their final sum: warp 0 runs a0, warp 1 a1
-            if (threadIdx.x < 2 * WARP_SIZE) {
-                const int w = threadIdx.x / WARP_SIZE;
-                float     a = w ? a1 : a0;
-                int       k = lane + 32 * w;
-                for (; k + 7 * 64 < n; k += 8 * 64) {
-                    float xv[8], wv[8];
-#pragma unroll
-                    for (int u = 0; u < 8; ++u) {
-                        xv[u] = xs[k + 64 * u];
-                        wv[u] = ws[k + 64 * u];
-                    }
-#pragma unroll
-                    for (int u = 0; u < 8; ++u) {
-                        a = __fmaf_rn(xv[u], wv[u], a);
-                    }
-                }
-                for (; k < n; k += 64) {
-                    a = __fmaf_rn(xs[k], ws[k], a);
-                }
-                if (w) {
-                    a1 = a;
-                } else {
-                    a0 = a;
-                }
-            }
-            __syncthreads();
-        }
-        __shared__ float sa1[WARP_SIZE];
-        if (threadIdx.x >= WARP_SIZE && threadIdx.x < 2 * WARP_SIZE) {
-            sa1[lane] = a1;
-        }
-        __syncthreads();
-        if (threadIdx.x < WARP_SIZE) {
-            float sum = __fadd_rn(a0, sa1[lane]);
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, off));
-            }
-            if (lane == 0) {
-                *(float *) (o + q.Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(sum, bf16);
-            }
+        if (j < q.rank) {
+            ttf_quant_adapter_block<TTF_QSPLIT_CH>(q, xc, K, bf16, j, o, xs);
         }
         return;
     }
@@ -508,6 +515,88 @@ static __global__ void __launch_bounds__(TTF_QSPLIT_TH) ttf_quant_q_kernel(const
         }
         o[k] = (char) v;
         qs += v;
+    }
+    qs = ttf_block_sum_i(qs, si);
+    if (threadIdx.x == 0) {
+        if (qs != 0) {
+            atomicAdd((int *) (o + q.Kp + 4), qs);
+        }
+        if (blockIdx.x == 0) {
+            *(float *) (o + q.Kp) = s;
+        }
+    }
+}
+
+// the decode split without adapters in one launch (TTF_QUANT_TWO_LAUNCH=1: the two kernels above). Grid (B, rows,
+// parts), TTF_QSPLIT_TH threads: slice block b makes xc of its slice (kept in registers), adds its max |xc| to the
+// row's maximum and arrives; when the row's B blocks have arrived, each quantises its slice (sums atomically, order-
+// free). Waiting needs the whole grid resident at once: the host checks the occupancy, else two launches. The row's
+// counters live in device globals (zero at load) and the grid's last block out resets them, so launches on one
+// stream reuse them; one stream per device uses this kernel (the session's). Bit-identical to the two kernels. (With
+// adapters, their blocks waiting in the same launch for xc cost more than the second launch: 27B -0.4%)
+#define TTF_QONE_SLOT 8  // rows x parts (the split's rows * np <= 8)
+__device__ unsigned int ttf_qone_arrive[TTF_QONE_SLOT];
+__device__ unsigned int ttf_qone_depart[TTF_QONE_SLOT];
+__device__ unsigned int ttf_qone_max[TTF_QONE_SLOT];  // max |xc| as float bits (>= 0: unsigned order is float order)
+
+static __global__ void __launch_bounds__(TTF_QSPLIT_TH) ttf_quant_one_kernel(const char * x, const int64_t nbx1, const int64_t K,
+                                                                   const bool bf16, const ttf_qparts P, const char * ux,
+                                                                   const int64_t nbu1, const int act, const int B) {
+    constexpr int   PT = TTF_QSPLIT_EL / TTF_QSPLIT_TH;  // slice elements held per thread
+    __shared__ float sf[32];
+    __shared__ int   si[32];
+    __shared__ float sam;
+    const int        z    = blockIdx.z;
+    const ttf_qpart  q    = z == 0 ? P.p[0] : z == 1 ? P.p[1] : z == 2 ? P.p[2] : P.p[3];
+    const int64_t    row  = blockIdx.y, rows = gridDim.y;
+    const int        slot = (int) (z * rows + row);
+    char *           o    = q.dst + row * q.nbd1;
+    const int64_t    k0   = (int64_t) blockIdx.x * TTF_QSPLIT_EL;
+    const float *    xr   = (const float *) (x + row * nbx1);
+    const float *    ur   = act != TTF_ACT_NONE ? (const float *) (ux + row * nbu1) : nullptr;
+    float            xv[PT];
+    float            am = 0.0f;
+#pragma unroll
+    for (int u = 0; u < PT; ++u) {
+        const int64_t k = k0 + threadIdx.x + u * TTF_QSPLIT_TH;
+        xv[u]           = k < K ? ttf_xc_v(ttf_xin(xr, ur, act, k), q.mu, q.c, k, bf16) : 0.0f;
+        am              = fmaxf(am, fabsf(xv[u]));
+    }
+    am = ttf_block_max(am, sf);
+    if (threadIdx.x == 0) {
+        atomicMax(&ttf_qone_max[slot], __float_as_uint(am));
+        if (blockIdx.x == 0) {
+            *(int *) (o + q.Kp + 4) = 0;
+        }
+        __threadfence();  // the max and the zeroed sum before the arrival
+        atomicAdd(&ttf_qone_arrive[slot], 1u);
+        while (*(volatile unsigned int *) &ttf_qone_arrive[slot] < (unsigned int) B) {
+        }
+        __threadfence();
+        sam = __uint_as_float(*(volatile unsigned int *) &ttf_qone_max[slot]);
+        // the last block out resets the row's counters (each has read the max by now)
+        if (atomicAdd(&ttf_qone_depart[slot], 1u) == gridDim.x - 1) {
+            ttf_qone_arrive[slot] = 0;
+            ttf_qone_max[slot]    = 0;
+            ttf_qone_depart[slot] = 0;
+        }
+    }
+    __syncthreads();
+    const float   s  = __fmul_rn(fmaxf(sam, ttf_rd(1e-5f, bf16)), 1.0f / 127.0f);
+    // slice b writes codes [b EL, (b + 1) EL), the last one also the padding up to Kp (< 160 past K)
+    const int64_t k1 = (int) blockIdx.x == B - 1 ? q.Kp : min(q.Kp, k0 + TTF_QSPLIT_EL);
+    int           qs = 0;
+#pragma unroll
+    for (int u = 0; u < PT + 1; ++u) {
+        const int64_t k = k0 + threadIdx.x + u * TTF_QSPLIT_TH;
+        if (k < k1) {
+            int v = 0;
+            if (u < PT && k < K) {
+                v = (int) fminf(127.0f, fmaxf(-128.0f, rintf(__fdiv_rn(xv[u < PT ? u : 0], s))));
+            }
+            o[k] = (char) v;
+            qs += v;
+        }
     }
     qs = ttf_block_sum_i(qs, si);
     if (threadIdx.x == 0) {
@@ -557,6 +646,20 @@ static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * cons
     if (!one_block && rows * np <= 8 && x->ne[0] > TTF_QSPLIT_EL) {
         const int64_t K = x->ne[0];
         const int     B = (int) ((K + TTF_QSPLIT_EL - 1) / TTF_QSPLIT_EL);
+        // no adapters: one launch when the whole grid fits on the GPU at once (its blocks wait for each other)
+        static const bool two = getenv("TTF_QUANT_TWO_LAUNCH") != nullptr;
+        static int        one_per_sm = -1;
+        if (one_per_sm < 0) {
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&one_per_sm, ttf_quant_one_kernel, TTF_QSPLIT_TH, 0));
+        }
+        static_assert(TTF_QSPLIT_EL % TTF_QSPLIT_TH == 0, "ttf_quant_one_kernel");
+        if (!two && rmax == 0 && rows * np <= TTF_QONE_SLOT && (int64_t) B * rows * np <= (int64_t) one_per_sm * nsm) {
+            ttf_quant_one_kernel<<<dim3((unsigned) B, (unsigned) rows, (unsigned) np), TTF_QSPLIT_TH, 0, ctx.stream()>>>(
+                (const char *) x->data, x->nb[1], K, bf16, P, act ? (const char *) u->data : nullptr, act ? u->nb[1] : 0,
+                act, B);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         ggml_cuda_pool_alloc<float> xcb(ctx.pool(), (size_t) (np * rows * K));
         ggml_cuda_pool_alloc<float> pm(ctx.pool(), (size_t) (np * rows * B));
         ttf_quant_xc_kernel<<<dim3((unsigned) B, (unsigned) rows, (unsigned) np), 256, 0, ctx.stream()>>>(

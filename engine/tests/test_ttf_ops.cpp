@@ -264,7 +264,24 @@ int main(int argc, char ** argv) {
         // TTF_BENCH_CHAIN=1: each product accumulates the previous one (a dependency chain, as a model's layers)
         const bool    chain = std::getenv("TTF_BENCH_CHAIN") != nullptr;
         ggml_tensor * prev  = nullptr;
-        for (int i = 0; i < NN; ++i) {
+        // TTF_BENCH_GGML=type name (tq1_0, tq2_0, q4_K, ...): ggml's MUL_MAT on that type instead of the TTF linear (the
+        // fork's kernels at the same shape; K a multiple of the type's block)
+        ggml_type gt = GGML_TYPE_COUNT;
+        if (const char * e = std::getenv("TTF_BENCH_GGML")) {
+            for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                if (ggml_get_type_traits((ggml_type) t)->type_name && std::string(ggml_type_name((ggml_type) t)) == e) {
+                    gt = (ggml_type) t;
+                }
+            }
+            GGML_ASSERT(gt != GGML_TYPE_COUNT && K % ggml_blck_size(gt) == 0);
+        }
+        for (int i = 0; i < NN && gt != GGML_TYPE_COUNT; ++i) {
+            if (i < NC) {
+                ws.push_back(ggml_new_tensor_2d(ctx, gt, K, N));
+            }
+            ggml_build_forward_expand(gf, ggml_mul_mat(ctx, ws[i % NC], tx));
+        }
+        for (int i = 0; i < NN && gt == GGML_TYPE_COUNT; ++i) {
             if (i < NC) {  // TTF_BENCH_Q2=1: Q2P weights (I8 [Kp / 4, N], 2-bit codes; K % 640 == 0 so Kp fits both)
                 ws.push_back(std::getenv("TTF_BENCH_Q2") ? ggml_new_tensor_2d(ctx, GGML_TYPE_I8, Kp / 4, N)
                                                          : ggml_new_tensor_2d(ctx, GGML_TYPE_TQ1_P, Kp, N));
@@ -289,7 +306,9 @@ int main(int argc, char ** argv) {
                 row[k] = p0 >= 0 ? ((rng() % 1000) < p0 * 1000 ? 0.0f : (rng() % 2 ? 1.0f : -1.0f))
                                  : (float) ((int) (rng() % 3) - 1);
             }
-            if (ws[0]->type == GGML_TYPE_I8) {
+            if (gt != GGML_TYPE_COUNT) {
+                ggml_quantize_chunk(gt, row.data(), wb.data() + n * ws[0]->nb[1], 0, 1, K, nullptr);
+            } else if (ws[0]->type == GGML_TYPE_I8) {
                 for (int64_t k = 0; k < Kp / 4; ++k) {
                     wb[n * ws[0]->nb[1] + k] = (uint8_t) (rng() % 3 | (rng() % 3) << 2 | (rng() % 3) << 4 | (rng() % 3) << 6);
                 }
@@ -359,6 +378,8 @@ int main(int argc, char ** argv) {
         // rank 16 (the 27B's): preloaded adapter rows; decode split quant (K > 1024), odd K, the MMA path
         { 5120, 600, 1, 16, true, true },   { 17408, 300, 1, 16, true, true }, { 2050, 100, 1, 16, true, true },
         { 1024, 4096, 64, 16, true, true },
+        // no adapters, decode split (one launch): K > 1024, rows x parts <= 8
+        { 5120, 600, 1, 0, true, true },    { 17408, 300, 2, 0, true, false }, { 2050, 100, 3, 0, false, true },
     };
     ggml_backend_t cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, 4);
