@@ -63,7 +63,7 @@ static __global__ void argmax_f32(const float * __restrict__ x, int32_t * __rest
     }
 
     if (warp_id == 0 && lane_id == 0) {
-        dst[row] = argmax;
+        dst[row] = argmax < 0 ? 0 : argmax;  // ttf: all -inf / NaN: the first (as argmax_first)
     }
 }
 
@@ -135,7 +135,7 @@ static __global__ void argmax_f32_final(const float * __restrict__ pm, const int
     }
     argmax_block<NT>(m, a);
     if (threadIdx.x == 0) {
-        dst[0] = a;
+        dst[0] = a < 0 ? 0 : a;  // ttf: all -inf / NaN: the first (as argmax_first; -1 would index row -1)
     }
 }
 

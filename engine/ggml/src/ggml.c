@@ -6472,6 +6472,7 @@ struct ggml_tensor * ggml_ttf_top_k(
         int                   k) {
     GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_nrows(a) == 1);
     GGML_ASSERT(k > 0 && k <= 256 && k < a->ne[0]);
+    GGML_ASSERT(a->ne[0] <= (1 << 24));  // (the indices as F32: exact up to 2^24)
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 2);
     const int32_t params[1] = { k };
     ggml_set_op_params(result, params, sizeof(params));

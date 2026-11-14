@@ -1035,6 +1035,9 @@ void Session::reset() {
 }
 
 std::vector<uint8_t> Session::save_recurrent() const {
+    if (!pipe_q.empty()) {  // (the sync copies run on another stream than the queued steps: no ordering)
+        throw std::runtime_error("save_recurrent: greedy steps still queued (take or pipe_drain first)");
+    }
     size_t n = 0;
     for (const auto * mp : { &conv, &rec }) {
         for (const auto & [id, t] : *mp) {
@@ -1053,6 +1056,9 @@ std::vector<uint8_t> Session::save_recurrent() const {
 }
 
 void Session::load_recurrent(const std::vector<uint8_t> & b) {
+    if (!pipe_q.empty()) {
+        throw std::runtime_error("load_recurrent: greedy steps still queued (take or pipe_drain first)");
+    }
     size_t o = 0;
     for (const auto * mp : { &conv, &rec }) {
         for (const auto & [id, t] : *mp) {

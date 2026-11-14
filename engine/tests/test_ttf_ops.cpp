@@ -236,11 +236,11 @@ int test_argmax(ggml_backend_t gpu) {
     int          fails = 0;
     std::mt19937 rng(7);
     for (int64_t n : { 1000, 5000, 16384, 32000, 131072, 151936, 248320 }) {
-        for (int kind = 0; kind < 6; ++kind) {
+        for (int kind = 0; kind < 7; ++kind) {  // kind 6: all -inf (the first, 0: never -1)
             std::vector<float> x(n);
             std::normal_distribution<float> nd(0.0f, 3.0f);
             for (auto & v : x) {
-                v = kind == 4 ? 1.5f : kind == 5 ? -std::fabs(nd(rng)) - 1.0f : bf16r(nd(rng));
+                v = kind == 4 ? 1.5f : kind == 5 ? -std::fabs(nd(rng)) - 1.0f : kind == 6 ? -INFINITY : bf16r(nd(rng));
             }
             const float M = 40.0f;
             if (kind == 1) {  // ties far apart: the later one in an earlier-scanned lane / chunk

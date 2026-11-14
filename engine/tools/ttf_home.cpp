@@ -251,6 +251,9 @@ struct Decoder {
     bool                                   greedy = false, topk = false;
     std::vector<std::pair<float, int32_t>> c;
     ttf::StepOut                           o;
+    Decoder(const Decoder &)             = delete;
+    Decoder & operator=(const Decoder &) = delete;
+    ~Decoder() { s.pipe_drain(); }  // a throw between submit and next (decode, json, a dropped client) leaves no step queued
     Decoder(ttf::Session & s_, const std::string & g, float t, int k, std::mt19937 & r, int64_t n_vocab) :
         s(s_), graph(g), temp(t), top_k(k), rng(r) {
         greedy = temp <= 0.0f && s.can_pipeline(graph);
@@ -565,7 +568,10 @@ int run_lm(const ttf::Model & m, const Args & a) {
     }
     const int nd = std::max<int>(1, (int) gen.size() - 1);
     if (a.verbose && gen.size() > 1) {
-        std::fprintf(stderr, "decode %d tokens: %.2f ms/token, %.1f tok/s\n", nd, ms / nd, 1000.0 * nd / ms);
+        // pipelined (greedy / device top k): wall clock with the printing (the steps overlap it); else the steps' own
+        // times. Not comparable with the step-time numbers of older builds
+        std::fprintf(stderr, "decode %d tokens: %.2f ms/token, %.1f tok/s%s\n", nd, ms / nd, 1000.0 * nd / ms,
+                     pipe || samp ? " (wall clock)" : "");
         std::fprintf(stderr, "  per token: build %.2f ms, alloc %.2f ms, compute %.2f ms; %d graph nodes\n",
                      s.prof_build / nd, s.prof_alloc / nd, s.prof_compute / nd, s.prof_nodes);
         if (!s.prof_ops.empty()) {
