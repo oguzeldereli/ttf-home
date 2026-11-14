@@ -967,3 +967,133 @@ void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx,
         GGML_ABORT("fatal error");
     }
 }
+
+// TTF: ROPE(q), ROPE(k) (NEOX, one positions tensor, the same parameters), SET_ROWS(the roped k rows into the K cache),
+// SET_ROWS(the v rows into the V cache) of one step as one launch. Blocks [0, nq) rope q's (head, token) rows into q's
+// output, [nq, nq + nk) rope k's rows straight into their cache rows, the rest copy v's token rows (2 x blockDim
+// elements per block) into theirs. The rope arithmetic is rope_neox's and the cache values ggml_cuda_cast's (same bits)
+template <bool has_ff, typename ID, typename DK, typename DV>
+static __global__ void ttf_rope_kv_kernel(const float * xq, float * dq, const float * xk, DK * kc, const float * xv, DV * vc,
+                                          const int ne00, const int hq, const int hk, const int nq, const int nk,
+                                          const int64_t sxq1, const int64_t sxq2, const int64_t sdq1, const int64_t sdq2,
+                                          const int64_t sxk1, const int64_t sxk2, const int64_t skc, const int wv,
+                                          const int nvb, const int64_t sxv, const int64_t svc, const int32_t * pos,
+                                          const ID * idx, const int n_dims, const int n_offs, const float freq_scale,
+                                          const float ext_factor, const float attn_factor, const rope_corr_dims corr_dims,
+                                          const float theta_scale, const float * freq_factors) {
+    const int b = blockIdx.x;
+    if (b >= nq + nk) {  // v
+        const int     vb = b - nq - nk, t = vb / nvb;
+        const int64_t e0 = (int64_t) (vb % nvb) * 2 * blockDim.x + threadIdx.x;
+        DV *          o  = vc + (int64_t) idx[t] * svc;
+        const float * x  = xv + t * sxv;
+        for (int64_t e = e0; e < wv && e < e0 + 2 * (int64_t) blockDim.x; e += blockDim.x) {
+            o[e] = ggml_cuda_cast<DV>(x[e]);
+        }
+        return;
+    }
+    const int i0 = 2 * threadIdx.x;
+    if (i0 >= ne00) {
+        return;
+    }
+    const bool    isq = b < nq;
+    const int     r   = isq ? b : b - nq;
+    const int     H   = isq ? hq : hk;
+    const int     h   = r % H, t = r / H;
+    const float * x   = isq ? xq + h * sxq1 + t * sxq2 : xk + h * sxk1 + t * sxk2;
+    float *       oq  = dq + h * sdq1 + t * sdq2;
+    DK *          ok  = kc + (int64_t) idx[t] * skc + (int64_t) h * ne00;
+    auto          put = [&](const int e, const float v) {
+        if (isq) {
+            oq[e] = v;
+        } else {
+            ok[e] = ggml_cuda_cast<DK>(v);
+        }
+    };
+    if (i0 < n_offs || i0 >= n_offs + n_dims) {
+        put(i0 + 0, x[i0 + 0]);
+        put(i0 + 1, x[i0 + 1]);
+        return;
+    }
+    const int   iw          = i0 - n_offs;
+    const float theta_base  = pos[t] * powf(theta_scale, iw / 2.0f);
+    const float freq_factor = has_ff ? freq_factors[iw / 2] : 1.0f;
+    float       cos_theta;
+    float       sin_theta;
+    rope_yarn<true>(theta_base / freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor, cos_theta, sin_theta);
+    const float x0 = x[i0 / 2 + n_offs / 2 + 0];
+    const float x1 = x[i0 / 2 + n_offs / 2 + n_dims / 2];
+    put(i0 / 2 + n_offs / 2 + 0, x0 * cos_theta - x1 * sin_theta);
+    put(i0 / 2 + n_offs / 2 + n_dims / 2, x0 * sin_theta + x1 * cos_theta);
+}
+
+bool ggml_cuda_ttf_rope_kv(ggml_backend_cuda_context & ctx, ggml_tensor * rq, ggml_tensor * rk, ggml_tensor * sk,
+                           ggml_tensor * sv) {
+    const ggml_tensor * xq = rq->src[0], * xk = rk->src[0], * ids = sk->src[1];
+    const ggml_tensor * vs = sv->src[0];
+    const int mode = ((const int32_t *) rq->op_params)[2];
+    if (!(mode & GGML_ROPE_TYPE_NEOX) || (mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION ||
+            memcmp(rq->op_params, rk->op_params, sizeof(rq->op_params)) != 0 || rq->src[1] != rk->src[1] ||
+            rq->src[2] != rk->src[2] || rq->src[1]->type != GGML_TYPE_I32 || sv->src[1] != ids ||
+            (ids->type != GGML_TYPE_I32 && ids->type != GGML_TYPE_I64) || !ggml_is_contiguous(ids) ||
+            xq->type != GGML_TYPE_F32 || xk->type != GGML_TYPE_F32 || rq->type != GGML_TYPE_F32 ||
+            rk->type != GGML_TYPE_F32 || vs->type != GGML_TYPE_F32 || xq->ne[3] != 1 || xk->ne[3] != 1 ||
+            xq->ne[0] != xk->ne[0] || xq->ne[2] != xk->ne[2] || rq->data == xq->data) {
+        return false;
+    }
+    const int64_t ne00 = xq->ne[0], hq = xq->ne[1], hk = xk->ne[1], T = xq->ne[2];
+    // the k rows as SET_ROWS reads them: rk contiguous, viewed [hd hk, T]; v contiguous [wv, T]; one index per token;
+    // cache rows contiguous, F32 / F16 / BF16
+    const ggml_tensor * ks = sk->src[0];
+    if (!ggml_is_contiguous(rk) || ks->ne[0] != ne00 * hk || ks->ne[1] != T || ggml_nelements(ks) != ne00 * hk * T ||
+            !ggml_is_contiguous(ks) || !ggml_is_contiguous(vs) || vs->ne[1] != T || ggml_nelements(vs) != vs->ne[0] * T ||
+            ggml_nelements(ids) != T || sk->ne[0] != ks->ne[0] || sv->ne[0] != vs->ne[0] || ne00 % 2 != 0 ||
+            ne00 / 2 > CUDA_ROPE_BLOCK_SIZE || sk->nb[0] != ggml_type_size(sk->type) ||
+            sv->nb[0] != ggml_type_size(sv->type) || (sk->type != GGML_TYPE_F32 && sk->type != GGML_TYPE_F16 &&
+            sk->type != GGML_TYPE_BF16) || (sv->type != GGML_TYPE_F32 && sv->type != GGML_TYPE_F16 &&
+            sv->type != GGML_TYPE_BF16) || xq->nb[0] != sizeof(float) || xk->nb[0] != sizeof(float) ||
+            rq->nb[0] != sizeof(float)) {
+        return false;
+    }
+    const int n_dims     = ((int32_t *) rq->op_params)[1];
+    const int n_ctx_orig = ((int32_t *) rq->op_params)[4];
+    const int n_offs     = ((int32_t *) rq->op_params)[15];
+    float     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base, (int32_t *) rq->op_params + 5, sizeof(float));
+    memcpy(&freq_scale, (int32_t *) rq->op_params + 6, sizeof(float));
+    memcpy(&ext_factor, (int32_t *) rq->op_params + 7, sizeof(float));
+    memcpy(&attn_factor, (int32_t *) rq->op_params + 8, sizeof(float));
+    memcpy(&beta_fast, (int32_t *) rq->op_params + 9, sizeof(float));
+    memcpy(&beta_slow, (int32_t *) rq->op_params + 10, sizeof(float));
+    rope_corr_dims corr_dims;
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, ggml_rope_get_truncate(rq), corr_dims.v);
+    const float   theta_scale = powf(freq_base, -2.0f / n_dims);
+    const int     nq = (int) (hq * T), nk = (int) (hk * T), wv = (int) vs->ne[0];
+    const int     nvb = (wv + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    const float * ff  = rq->src[2] ? (const float *) rq->src[2]->data : nullptr;
+    auto go = [&](auto kern, auto * kcp, auto * vcp, const auto * idp) {
+        kern<<<nq + nk + nvb * (int) T, CUDA_ROPE_BLOCK_SIZE, 0, ctx.stream()>>>(
+            (const float *) xq->data, (float *) rq->data, (const float *) xk->data, kcp, (const float *) vs->data, vcp,
+            (int) ne00, (int) hq, (int) hk, nq, nk, xq->nb[1] / 4, xq->nb[2] / 4, rq->nb[1] / 4, rq->nb[2] / 4,
+            xk->nb[1] / 4, xk->nb[2] / 4, (int64_t) (sk->nb[1] / ggml_type_size(sk->type)), wv, nvb,
+            (int64_t) (vs->nb[1] / 4), (int64_t) (sv->nb[1] / ggml_type_size(sv->type)), (const int32_t *) rq->src[1]->data,
+            idp, n_dims, n_offs, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, ff);
+    };
+    auto pick_v = [&](auto * kcp, const auto * idp) {
+        using DK = std::remove_pointer_t<decltype(kcp)>;
+        using ID = std::remove_const_t<std::remove_pointer_t<decltype(idp)>>;
+        auto with = [&](auto * vcp) {
+            using DV = std::remove_pointer_t<decltype(vcp)>;
+            ff ? go(ttf_rope_kv_kernel<true, ID, DK, DV>, kcp, vcp, idp) : go(ttf_rope_kv_kernel<false, ID, DK, DV>, kcp, vcp, idp);
+        };
+        sv->type == GGML_TYPE_F32  ? with((float *) sv->data) :
+        sv->type == GGML_TYPE_F16  ? with((half *) sv->data) : with((nv_bfloat16 *) sv->data);
+    };
+    auto pick_k = [&](const auto * idp) {
+        sk->type == GGML_TYPE_F32  ? pick_v((float *) sk->data, idp) :
+        sk->type == GGML_TYPE_F16  ? pick_v((half *) sk->data, idp) : pick_v((nv_bfloat16 *) sk->data, idp);
+    };
+    ids->type == GGML_TYPE_I32 ? pick_k((const int32_t *) ids->data) : pick_k((const int64_t *) ids->data);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}

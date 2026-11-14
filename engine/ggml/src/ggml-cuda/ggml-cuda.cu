@@ -5422,6 +5422,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // TTF: ROPE(q), ROPE(k), SET_ROWS(K cache, k), SET_ROWS(V cache, v), with only views between (the session's
+    // attention step): one launch (TTF_NO_ROPE_KV=1: off)
+    static const bool ttf_no_rope_kv = getenv("TTF_NO_ROPE_KV") != nullptr;
+    if (cgraph->nodes[i]->op == GGML_OP_ROPE && !ttf_no_rope_kv) {
+        ggml_tensor * ops[4] = { cgraph->nodes[i], nullptr, nullptr, nullptr };
+        int           n = 1, last = i;
+        for (int k = i + 1; k < cgraph->n_nodes && k < i + 24 && n < 4; ++k) {
+            if (ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
+                continue;
+            }
+            ops[n++] = cgraph->nodes[k];
+            last     = k;
+        }
+        ggml_tensor * rq = ops[0], * rk = ops[1], * sk = ops[2], * sv = ops[3];
+        if (n == 4 && rk->op == GGML_OP_ROPE && sk->op == GGML_OP_SET_ROWS && sv->op == GGML_OP_SET_ROWS &&
+                ggml_cuda_strip_views(sk->src[0]) == rk && ggml_cuda_strip_views(sv->src[0]) != rq &&
+                ggml_cuda_strip_views(sv->src[0]) != rk && ggml_cuda_root(sk) != ggml_cuda_root(sv) &&
+                !(rq->flags & GGML_TENSOR_FLAG_OUTPUT) && !(rk->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * mids[1]   = { rk };
+            const ggml_tensor * inside[1] = { sk };
+            if (ggml_cuda_only_inside_readers(cgraph, mids, 1, inside, 1) && ggml_cuda_ttf_rope_kv(*cuda_ctx, rq, rk, sk, sv)) {
+                return last - i;
+            }
+        }
+    }
+
     //RoPE + view + set-rows
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_tensor * rope     = cgraph->nodes[i];

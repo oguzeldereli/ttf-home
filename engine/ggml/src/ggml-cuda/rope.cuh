@@ -9,3 +9,7 @@ void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * set_rows);
 
 void ggml_cuda_op_rms_norm_mul_rope_fused(ggml_backend_cuda_context & ctx, ggml_tensor * rms_norm, ggml_tensor * mul, ggml_tensor * rope, ggml_tensor * set_rows);
+
+// TTF: rope q and k, k and v rows into their caches, one launch (false: unsupported shape / mode, nothing done)
+bool ggml_cuda_ttf_rope_kv(ggml_backend_cuda_context & ctx, ggml_tensor * rq, ggml_tensor * rk, ggml_tensor * sk,
+                           ggml_tensor * sv);
