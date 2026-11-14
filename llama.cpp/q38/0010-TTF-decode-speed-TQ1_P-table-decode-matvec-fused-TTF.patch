@@ -1,0 +1,899 @@
+From f0a2bef163a667207562e6dbaded9d8dca75b3da Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Tue, 10 Nov 2026 14:29:51 +0000
+Subject: [PATCH 10/12] TTF decode speed: TQ1_P table-decode matvec, fused TTF
+ linear (prologue + matvec with scale, bias, adapter epilogue), K-padded TQ1_P
+ weights
+
+- mmvq-tq1p.cuh: TQ1_P matvec for 1-4 tokens decoding trits through a 256-entry shared table; the activation sum
+  enters the dp4a accumulator, so each q8_1 block's integer sum is exact
+- fused TTF linear for TQ1_P weights: [PAD] MUL(c) ADD(m) MUL_MAT MUL(r) [ADD(b)] [MUL_MAT(D) MUL_MAT(U) ADD] in two
+  kernels (prologue: centring + q8_1 quantization + adapter down product, finalized by the last block in a fixed
+  order; matvec with row scale, bias and adapter up product in the epilogue)
+- loader accepts TQ1_P weights whose K is rounded up to a multiple of 160; build_lora_mm zero-pads the input
+- the adapter that reads the main weight's centred input shares it (computed once)
+- MUL_MAT + row scale + bias fused into the generic MMVQ epilogue; c * x + m in one kernel
+---
+ ggml/src/ggml-cuda/common.cuh    |   2 +
+ ggml/src/ggml-cuda/ggml-cuda.cu  | 189 ++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq-tq1p.cuh | 332 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu       |  75 ++++++-
+ ggml/src/ggml-cuda/mmvq.cuh      |   8 +
+ src/llama-graph.cpp              |  38 +++-
+ src/llama-model-loader.cpp       |   6 +-
+ src/llama-model.cpp              |  30 +++
+ 8 files changed, 673 insertions(+), 7 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/mmvq-tq1p.cuh
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 4a5cd7c71..33c82959e 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1604,6 +1604,7 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * gate_bias = nullptr;
+     const ggml_tensor * x_scale = nullptr;
+     const ggml_tensor * gate_scale = nullptr;
++    const ggml_tensor * x_rscale = nullptr; // TTF: per-row scale [N] after the product, before x_bias (MMVQ, ncols_dst 1)
+     ggml_glu_op glu_op;
+     float glu_limit = 0.0f;
+     ggml_prec prec_src1 = GGML_PREC_UNDEFINED; // src1 precision requested by the fused MUL_MATs (MMQ)
+@@ -1617,6 +1618,7 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * gate_bias = nullptr;
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
++    const void * x_rscale = nullptr;
+     ggml_glu_op glu_op;
+     float glu_limit = 0.0f;
+     const void * shared_up = nullptr;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 77f0fb0ad..e04f797a4 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4134,6 +4134,142 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++// GGML_CUDA_TTF_LINEAR_OFF=1: no fused TTF linear (A/B)
++static bool ggml_cuda_ttf_linear_disabled() {
++    static const bool v = getenv("GGML_CUDA_TTF_LINEAR_OFF") != nullptr;
++    return v;
++}
++
++// TTF centred input: y = x * c + m with c, m [K] vectors broadcast over the rows of x (contiguous F32)
++static __global__ void k_ttf_scale_shift(const float * __restrict__ x, const float * __restrict__ c,
++        const float * __restrict__ m, float * __restrict__ y, const int64_t K, const int64_t n) {
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    const int64_t k = i % K;
++    y[i] = __fadd_rn(__fmul_rn(x[i], c[k]), m[k]); // two roundings: the same bits as the MUL and ADD nodes
++}
++
++static bool ggml_cuda_ttf_scale_shift_match(const ggml_cgraph * cgraph, int i) {
++    const ggml_op ops[2] = { GGML_OP_MUL, GGML_OP_ADD };
++    const int out_nodes[] = { i + 1 };
++    if (!ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) ||
++            !ggml_cuda_check_fusion_memory_ranges(const_cast<ggml_cgraph *>(cgraph), i, 2, out_nodes, 1)) {
++        return false;
++    }
++    const ggml_tensor * mul = cgraph->nodes[i];
++    const ggml_tensor * add = cgraph->nodes[i + 1];
++    const ggml_tensor * x = mul->src[0];
++    const ggml_tensor * c = mul->src[1];
++    const ggml_tensor * m = add->src[0] == mul ? add->src[1] : (add->src[1] == mul ? add->src[0] : nullptr);
++    const auto is_vec = [&](const ggml_tensor * v) {
++        return v && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v) && v->ne[0] == x->ne[0] && ggml_nelements(v) == x->ne[0];
++    };
++    return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && is_vec(c) && is_vec(m) &&
++           mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
++           ggml_are_same_shape(mul, x) && ggml_are_same_shape(add, mul) && x->ne[0] > 1;
++}
++
++static void ggml_cuda_ttf_scale_shift(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    const ggml_tensor * mul = cgraph->nodes[i];
++    ggml_tensor * add = cgraph->nodes[i + 1];
++    const ggml_tensor * m = add->src[0] == mul ? add->src[1] : add->src[0];
++    const int64_t n = ggml_nelements(add);
++    const int nth = 256;
++    k_ttf_scale_shift<<<(n + nth - 1) / nth, nth, 0, ctx.stream()>>>((const float *) mul->src[0]->data,
++        (const float *) mul->src[1]->data, (const float *) m->data, (float *) add->data, mul->src[0]->ne[0], n);
++}
++
++// TTF linear on a TQ1_P weight, 1..4 tokens, nodes in graph order:
++//   [PAD x] MUL(c) ADD(m) MUL_MAT(W, xc) MUL(r) [ADD(b)] [MUL_MAT(D, xc) MUL_MAT(U, .) ADD(res, .)]
++// -> ggml_cuda_ttf_linear_tq1p (two kernels). Returns the number of nodes consumed, 0 if no match.
++static int ggml_cuda_try_fuse_ttf_linear(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
++    const int n_nodes = cgraph->n_nodes;
++    const auto nd = [&](int k) -> ggml_tensor * { return k < n_nodes ? cgraph->nodes[k] : nullptr; };
++    const auto other = [](const ggml_tensor * t, const ggml_tensor * s) -> const ggml_tensor * {
++        return t->src[0] == s ? t->src[1] : (t->src[1] == s ? t->src[0] : nullptr);
++    };
++    ggml_op ops[10];
++    int n = 0;
++    int j = i;
++    const ggml_tensor * x = nullptr;
++    ggml_tensor * t = nd(j);
++    if (t->op == GGML_OP_PAD) {
++        for (int p = 0; p < 9; ++p) {
++            if (p != 1 && ggml_get_op_params_i32(t, p) != 0) {
++                return 0;
++            }
++        }
++        x = t->src[0];
++        ops[n++] = GGML_OP_PAD;
++        t = nd(++j);
++    }
++    if (!t || t->op != GGML_OP_MUL) {
++        return 0;
++    }
++    ggml_tensor * mul_c = t;
++    if (x == nullptr) {
++        x = mul_c->src[0];
++    } else if (mul_c->src[0] != nd(j - 1)) {
++        return 0;
++    }
++    const ggml_tensor * c = mul_c->src[1];
++    ops[n++] = GGML_OP_MUL;
++    ggml_tensor * add_m = nd(++j);
++    if (!add_m || add_m->op != GGML_OP_ADD || add_m->src[0] != mul_c) {
++        return 0;
++    }
++    const ggml_tensor * m = add_m->src[1];
++    ops[n++] = GGML_OP_ADD;
++    ggml_tensor * mm = nd(++j);
++    if (!mm || mm->op != GGML_OP_MUL_MAT || mm->src[1] != add_m || mm->src[0]->type != GGML_TYPE_TQ1_P) {
++        return 0;
++    }
++    const ggml_tensor * W = mm->src[0];
++    ops[n++] = GGML_OP_MUL_MAT;
++    ggml_tensor * mul_r = nd(++j);
++    if (!mul_r || mul_r->op != GGML_OP_MUL || mul_r->src[0] != mm) {
++        return 0;
++    }
++    const ggml_tensor * r = mul_r->src[1];
++    ops[n++] = GGML_OP_MUL;
++    ggml_tensor * res = mul_r;
++    const ggml_tensor * b = nullptr;
++    ggml_tensor * nx = nd(j + 1);
++    if (nx && nx->op == GGML_OP_ADD && nx->src[0] == mul_r && nx->src[1]->op == GGML_OP_NONE && ggml_n_dims(nx->src[1]) == 1) {
++        b = nx->src[1];
++        res = nx;
++        ops[n++] = GGML_OP_ADD;
++        ++j;
++    }
++    const ggml_tensor * D = nullptr;
++    const ggml_tensor * U = nullptr;
++    ggml_tensor * md = nd(j + 1);
++    ggml_tensor * mu = nd(j + 2);
++    ggml_tensor * ad = nd(j + 3);
++    if (md && mu && ad && md->op == GGML_OP_MUL_MAT && md->src[1] == add_m && md->src[0]->type == GGML_TYPE_F16 &&
++            mu->op == GGML_OP_MUL_MAT && mu->src[1] == md && mu->src[0]->type == GGML_TYPE_F16 &&
++            ad->op == GGML_OP_ADD && other(ad, res) == mu) {
++        D = md->src[0];
++        U = mu->src[0];
++        ops[n++] = GGML_OP_MUL_MAT;
++        ops[n++] = GGML_OP_MUL_MAT;
++        ops[n++] = GGML_OP_ADD;
++        res = ad;
++        j += 3;
++    }
++    const int out_nodes[] = { j };
++    if (!ggml_can_fuse_subgraph(cgraph, i, n, ops, out_nodes, 1) ||
++            !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n, out_nodes, 1)) {
++        return 0;
++    }
++    if (!ggml_cuda_ttf_linear_tq1p(*ctx, x, c, m, W, r, b, D, U, res, i)) {
++        return 0;
++    }
++    return n;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     if (ggml_cuda_fusion_disabled()) {
+@@ -4142,6 +4278,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    if ((node->op == GGML_OP_PAD || node->op == GGML_OP_MUL) && !ggml_cuda_ttf_linear_disabled()) {
++        const int n = ggml_cuda_try_fuse_ttf_linear(cuda_ctx, cgraph, i);
++        if (n > 0) {
++            return n - 1;
++        }
++    }
++
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {
+@@ -4162,6 +4305,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // TTF: the centred input c * x + m (MUL by a [K] vector, then ADD of a [K] vector) in one kernel, same bits
++    if (node->op == GGML_OP_MUL && ggml_cuda_ttf_scale_shift_match(cgraph, i)) {
++        ggml_cuda_ttf_scale_shift(*cuda_ctx, cgraph, i);
++        return 1;
++    }
++
+     if (node->op == GGML_OP_MUL) {
+         ggml_cuda_moe_weighted_reduction_match match;
+         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+@@ -4715,6 +4864,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     fused_mul_mat_vec = false;
+     fused_node_count  = 0;
+ 
++    // TTF: a quantized one-token mul_mat + per-row scale [N] (MUL) + optional bias [N] (ADD), in the MMVQ epilogue
++    if (node->op == GGML_OP_MUL_MAT) {
++        for (const bool with_bias : { true, false }) {
++            const int n_ops = with_bias ? 3 : 2;
++            const ggml_op ops[3] = { GGML_OP_MUL_MAT, GGML_OP_MUL, GGML_OP_ADD };
++            const int out_nodes[] = { i + n_ops - 1 };
++            if (!ggml_can_fuse_subgraph(cgraph, i, n_ops, ops, out_nodes, 1) ||
++                    !ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ops, out_nodes, 1)) {
++                continue;
++            }
++            ggml_tensor * mm  = cgraph->nodes[i];
++            ggml_tensor * mul = cgraph->nodes[i + 1];
++            ggml_tensor * out = cgraph->nodes[i + n_ops - 1];
++            const ggml_tensor * rs = mul->src[0] == mm ? mul->src[1] : (mul->src[1] == mm ? mul->src[0] : nullptr);
++            const auto is_row_vec = [&](const ggml_tensor * v) {
++                return v && v->type == GGML_TYPE_F32 && ggml_is_contiguous(v) && v->ne[0] == mm->ne[0] &&
++                       ggml_nelements(v) == mm->ne[0];
++            };
++            if (!is_row_vec(rs) || mm->ne[1] != 1 || ggml_nelements(mm) != mm->ne[0] || !ggml_are_same_shape(mul, mm) ||
++                    mm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
++                continue;
++            }
++            const ggml_tensor * b = nullptr;
++            if (with_bias) {
++                b = out->src[0] == mul ? out->src[1] : (out->src[1] == mul ? out->src[0] : nullptr);
++                if (!is_row_vec(b) || !ggml_are_same_shape(out, mul) || out->type != GGML_TYPE_F32) {
++                    continue;
++                }
++            }
++            if (!ggml_is_quantized(mm->src[0]->type) || !ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
++                continue;
++            }
++            ggml_cuda_mm_fusion_args_host fusion_data{};
++            fusion_data.x_rscale = rs;
++            fusion_data.x_bias   = b;
++            ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm->src[0], mm->src[1], nullptr, out, &fusion_data);
++            return n_ops - 1;
++        }
++    }
++
+     // mul_mat + scale + optional bias
+     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
+diff --git a/ggml/src/ggml-cuda/mmvq-tq1p.cuh b/ggml/src/ggml-cuda/mmvq-tq1p.cuh
+new file mode 100644
+index 000000000..1d3615aa1
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmvq-tq1p.cuh
+@@ -0,0 +1,332 @@
++#pragma once
++
++// TQ1_P matrix-vector product for a few tokens (ncols_dst <= 4), table decoded.
++//
++// A TQ1_P block holds 160 trits in 32 bytes: digit n (0..4) of byte b is element 32n + b, digit n of byte b being
++// ((b * 3^n mod 256) * 3) >> 8 in {0, 1, 2} (trit = digit - 1). Digit plane n of a block is q8_1 block n of the five
++// under it. The arithmetic decode costs ~14 integer ops per digit and makes the generic kernel compute-bound at about
++// half the memory bandwidth; here a 256-entry shared table gives each byte's five digits as 2-bit codes, and byte
++// permutes gather the codes of four bytes into the int8x4 lanes of dp4a.
++//
++// lut[b]: byte 0 = digits 0..3 (2 bits each, digit n at bits 2n), byte 1 = digit 4.
++// For four code bytes b0..b3 (one int of the block), with T_k = lut[b_k]:
++//   W_a = [T0.B0, T1.B0, T2.B0, T3.B0]   ->  digit n codes (n < 4): (W_a >> 2n) & 0x03030303
++//   W_b = [T0.B1, T1.B1, T2.B1, T3.B1]   ->  digit 4 codes
++// sum_k (code_k - 1) * u_k = dp4a(codes, u) - dp4a(1, u). The second term does not depend on the row: it is computed
++// once per step for the TQ1P_ROWS rows of the warp and enters as the dp4a accumulator's start value, so each q8_1
++// block's sum is the exact integer the generic kernel forms (the same rounding, only the float summation order differs).
++//
++// Each warp handles TQ1P_ROWS rows; each thread reads two ints (8 bytes) of one block per step, 4 threads per block,
++// 8 blocks per warp step. The epilogue applies the TTF row scale and bias, and with R > 0 a float low-rank adapter's
++// up layer: + sum_j U[row, j] h[j], h = the sum over the prologue's chunks of its partial down products (see
++// ggml_cuda_ttf_linear_tq1p).
++
++#define TQ1P_ROWS  4
++#define TQ1P_WARPS 4
++
++static __device__ __forceinline__ uint32_t tq1p_lut_entry(const uint32_t b) {
++    uint32_t lo = 0;
++    uint32_t p  = 1;
++#pragma unroll
++    for (int n = 0; n < 4; ++n, p *= 3) {
++        lo |= ((((b * p) & 0xFF) * 3) >> 8) << (2*n);
++    }
++    const uint32_t hi = ((((b * 81) & 0xFF) * 3) >> 8);
++    return lo | (hi << 8);
++}
++
++// the digit-4 code vector and the packed digit 0..3 code vector of one int of codes
++static __device__ __forceinline__ void tq1p_decode(const uint32_t * lut, const int v, int & wa, int & wb) {
++    const uint32_t t0 = lut[(v      ) & 0xFF];
++    const uint32_t t1 = lut[(v >>  8) & 0xFF];
++    const uint32_t t2 = lut[(v >> 16) & 0xFF];
++    const uint32_t t3 = lut[(uint32_t) v >> 24];
++    const uint32_t p01 = __byte_perm(t0, t1, 0x5140);
++    const uint32_t p23 = __byte_perm(t2, t3, 0x5140);
++    wa = (int) __byte_perm(p01, p23, 0x5410);
++    wb = (int) __byte_perm(p01, p23, 0x7632);
++}
++
++template <int ncols_dst, int R>
++__launch_bounds__(TQ1P_WARPS*WARP_SIZE, 1)
++static __global__ void mul_mat_vec_tq1_p(
++        const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
++        const float * __restrict__ rscale, const float * __restrict__ bias,
++        const float * __restrict__ hfin, const half * __restrict__ U,
++        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
++    __shared__ uint32_t lut[256];
++    const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
++    for (int t = tid; t < 256; t += TQ1P_WARPS*WARP_SIZE) {
++        lut[t] = tq1p_lut_entry(t);
++    }
++    __syncthreads();
++
++    const int row0 = (blockIdx.x*TQ1P_WARPS + threadIdx.y)*TQ1P_ROWS;
++
++    // the epilogue's operands, loaded now so that their latency hides behind the weight stream: lane q < R holds
++    // h[j][q]; lane < TQ1P_ROWS holds its row's scale, bias and U row (as half2)
++    const bool own = threadIdx.x < TQ1P_ROWS && row0 + (int) threadIdx.x < nrows_x;
++    const int  orow = own ? row0 + threadIdx.x : 0;
++    const float rs_own = own && rscale ? rscale[orow] : 1.0f;
++    const float b_own  = own && bias   ? bias[orow]   : 0.0f;
++    float hreg[ncols_dst];
++    uint4 ureg[R > 0 ? R/8 : 1];
++    if constexpr (R > 0) {
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++            hreg[j] = threadIdx.x < R ? hfin[j*R + threadIdx.x] : 0.0f;
++        }
++#pragma unroll
++        for (int q = 0; q < R/8; ++q) {
++            ureg[q] = own ? ((const uint4 *) (U + (int64_t) orow*R))[q] : make_uint4(0, 0, 0, 0);
++        }
++    }
++    const int nb   = ncols_x / QK_TQ1_P;
++    const int lane = threadIdx.x;
++    const int sub  = lane % 4;              // ints 2*sub, 2*sub + 1 of the block
++
++    const block_tq1_p * x = (const block_tq1_p *) vx;
++    const block_q8_1  * y = (const block_q8_1  *) vy;
++
++    float acc[ncols_dst][TQ1P_ROWS];
++#pragma unroll
++    for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++        for (int r = 0; r < TQ1P_ROWS; ++r) {
++            acc[j][r] = 0.0f;
++        }
++    }
++
++    for (int kb = lane / 4; row0 < nrows_x && kb < nb; kb += WARP_SIZE / 4) {
++        int   u0[ncols_dst][5];
++        int   u1[ncols_dst][5];
++        float d [ncols_dst][5];
++        int   su[ncols_dst][5];   // -sum of the 8 activations this thread holds in q8_1 block n
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++            for (int n = 0; n < 5; ++n) {
++                const block_q8_1 * yb = y + j*stride_col_y + kb*5 + n;
++                u0[j][n] = get_int_b4(yb->qs, 2*sub);     // q8_1 qs sits at byte 4 of a 36-byte block: 4-byte loads
++                u1[j][n] = get_int_b4(yb->qs, 2*sub + 1);
++                d [j][n] = __low2float(yb->ds);
++                su[j][n] = -ggml_cuda_dp4a(0x01010101, u0[j][n], ggml_cuda_dp4a(0x01010101, u1[j][n], 0));
++            }
++        }
++
++        // all rows' loads first (several in flight per thread); a row past the end re-reads the last row, unused
++        int2 v[TQ1P_ROWS];
++#pragma unroll
++        for (int r = 0; r < TQ1P_ROWS; ++r) {
++            const int row = min(row0 + r, nrows_x - 1);
++            v[r] = *((const int2 *) x[(int64_t) row*stride_row_x + kb].qs + sub);
++        }
++#pragma unroll
++        for (int r = 0; r < TQ1P_ROWS; ++r) {
++            int wa0, wb0, wa1, wb1;
++            tq1p_decode(lut, v[r].x, wa0, wb0);
++            tq1p_decode(lut, v[r].y, wa1, wb1);
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                float s = 0.0f;
++#pragma unroll
++                for (int n = 0; n < 4; ++n) {
++                    const int c0 = (wa0 >> (2*n)) & 0x03030303;
++                    const int c1 = (wa1 >> (2*n)) & 0x03030303;
++                    s += d[j][n] * (float) ggml_cuda_dp4a(c0, u0[j][n], ggml_cuda_dp4a(c1, u1[j][n], su[j][n]));
++                }
++                s += d[j][4] * (float) ggml_cuda_dp4a(wb0, u0[j][4], ggml_cuda_dp4a(wb1, u1[j][4], su[j][4]));
++                acc[j][r] += s;
++            }
++        }
++    }
++
++#pragma unroll
++    for (int j = 0; j < ncols_dst; ++j) {
++#pragma unroll
++        for (int r = 0; r < TQ1P_ROWS; ++r) {
++            acc[j][r] = warp_reduce_sum<WARP_SIZE>(acc[j][r]);
++        }
++    }
++
++    // adapter up layer: ad[j] = sum_q U[row, q] h[j][q] for the row of lane (< TQ1P_ROWS), all lanes shuffling
++    float ad[ncols_dst];
++#pragma unroll
++    for (int j = 0; j < ncols_dst; ++j) {
++        ad[j] = 0.0f;
++    }
++    if constexpr (R > 0) {
++        const half2 * u = (const half2 *) ureg;
++#pragma unroll
++        for (int q = 0; q < R/2; ++q) {
++            const float2 uq = __half22float2(u[q]);
++#pragma unroll
++            for (int j = 0; j < ncols_dst; ++j) {
++                ad[j] += uq.x*__shfl_sync(0xFFFFFFFF, hreg[j], 2*q,     WARP_SIZE) +
++                         uq.y*__shfl_sync(0xFFFFFFFF, hreg[j], 2*q + 1, WARP_SIZE);
++            }
++        }
++    }
++
++    if (lane < TQ1P_ROWS && row0 + lane < nrows_x) {
++        const int row = row0 + lane;
++#pragma unroll
++        for (int j = 0; j < ncols_dst; ++j) {
++            float a = 0.0f;
++#pragma unroll
++            for (int r = 0; r < TQ1P_ROWS; ++r) {
++                a = r == lane ? acc[j][r] : a;
++            }
++            float res = a;
++            if (rscale) {
++                res = __fmul_rn(res, rs_own);
++            }
++            if (bias) {
++                res = __fadd_rn(res, b_own);
++            }
++            if constexpr (R > 0) {
++                res = __fadd_rn(res, ad[j]);
++            }
++            dst[j*stride_col_dst + row] = res;
++        }
++    }
++}
++
++// true if the table kernel handled the product
++static bool mul_mat_vec_tq1_p_cuda(
++        const void * vx, const void * vy, float * dst, const ggml_cuda_mm_fusion_args_device & fusion,
++        const int ncols_x, const int nrows_x, const int ncols_dst,
++        const int stride_row_x, const int stride_col_y, const int stride_col_dst, cudaStream_t stream) {
++    if (ncols_dst < 1 || ncols_dst > 4 || fusion.gate != nullptr || fusion.gate_bias != nullptr ||
++            fusion.x_scale != nullptr || fusion.shared_up != nullptr || (ncols_x % QK_TQ1_P) != 0) {
++        return false;
++    }
++    const dim3 block(WARP_SIZE, TQ1P_WARPS, 1);
++    const dim3 grid((nrows_x + TQ1P_WARPS*TQ1P_ROWS - 1) / (TQ1P_WARPS*TQ1P_ROWS), 1, 1);
++    const float * rs = (const float *) fusion.x_rscale;
++    const float * b  = (const float *) fusion.x_bias;
++    switch (ncols_dst) {
++        case 1: mul_mat_vec_tq1_p<1, 0><<<grid, block, 0, stream>>>(vx, vy, dst, rs, b, nullptr, nullptr, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); break;
++        case 2: mul_mat_vec_tq1_p<2, 0><<<grid, block, 0, stream>>>(vx, vy, dst, rs, b, nullptr, nullptr, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); break;
++        case 3: mul_mat_vec_tq1_p<3, 0><<<grid, block, 0, stream>>>(vx, vy, dst, rs, b, nullptr, nullptr, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); break;
++        case 4: mul_mat_vec_tq1_p<4, 0><<<grid, block, 0, stream>>>(vx, vy, dst, rs, b, nullptr, nullptr, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_col_dst); break;
++    }
++    return true;
++}
++
++// TTF prologue for TQ1_P linears, a few tokens: the centred input xc = c * x + m (x zero beyond K_in: a K-padded
++// weight), quantized to q8_1 exactly as quantize_q8_1 does (zeros beyond K up to K_q), and with R > 0 a float low-rank
++// adapter's down product h = D xc (D F16 [R, K]): each block writes its chunk's partial sums hp[tok][chunk][j], and
++// the last block of a token to finish adds them up in chunk order (deterministic) into hfin[tok][j]. The arrival
++// counters (one per graph node slot and token) reset themselves.
++#define TTF_LIN_SLOTS 8192
++static __device__ unsigned int ttf_lin_counters[TTF_LIN_SLOTS*4];
++
++template <int R>
++__launch_bounds__(256, 1)
++static __global__ void k_ttf_prologue(
++        const float * __restrict__ x, const int64_t sx, const int K_in, const float * __restrict__ c,
++        const float * __restrict__ m, const int K, const half * __restrict__ D, block_q8_1 * __restrict__ y,
++        const int K_q, float * __restrict__ hp, float * __restrict__ hfin, const int slot) {
++    const int tok = blockIdx.y;
++    const int k   = blockIdx.x*256 + threadIdx.x;
++    float xi = 0.0f;
++    if (k < K) {
++        xi = __fadd_rn(__fmul_rn(k < K_in ? x[tok*sx + k] : 0.0f, c[k]), m[k]);
++    }
++    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
++    const float d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++    const int sum = warp_reduce_sum<QK8_1>((int) q);
++    block_q8_1 * yt = y + (int64_t) tok*(K_q/QK8_1);
++    yt[k / QK8_1].qs[k % QK8_1] = q;
++    if (k % QK8_1 == 0) {
++        yt[k / QK8_1].ds = make_half2(d, d * sum);
++    }
++    if constexpr (R > 0) {
++        __shared__ float part[256/WARP_SIZE][R];
++        const int warp = threadIdx.x / WARP_SIZE;
++        const int lane = threadIdx.x % WARP_SIZE;
++#pragma unroll
++        for (int j = 0; j < R; ++j) {
++            float v = k < K ? xi * __half2float(D[(int64_t) j*K + k]) : 0.0f;
++            v = warp_reduce_sum<WARP_SIZE>(v);
++            if (lane == 0) {
++                part[warp][j] = v;
++            }
++        }
++        __syncthreads();
++        if (threadIdx.x < R) {
++            float s = 0.0f;
++#pragma unroll
++            for (int w = 0; w < 256/WARP_SIZE; ++w) {
++                s += part[w][threadIdx.x];
++            }
++            hp[((int64_t) tok*gridDim.x + blockIdx.x)*R + threadIdx.x] = s;
++            __threadfence();
++        }
++        __shared__ bool last;
++        __syncthreads();
++        unsigned int * cnt = ttf_lin_counters + slot*4 + tok;
++        if (threadIdx.x == 0) {
++            last = atomicAdd(cnt, 1u) == gridDim.x - 1;
++        }
++        __syncthreads();
++        if (last) {
++            // 256/R groups of R threads: group p sums chunks p, p + 256/R, ...; then the groups in order
++            constexpr int NP = 256/R;
++            const int qq = threadIdx.x % R;
++            const int p  = threadIdx.x / R;
++            float s = 0.0f;
++            for (int ch = p; ch < (int) gridDim.x; ch += NP) {
++                s += __ldcg(hp + ((int64_t) tok*gridDim.x + ch)*R + qq);
++            }
++            __shared__ float red[NP][R];
++            red[p][qq] = s;
++            __syncthreads();
++            if (threadIdx.x < R) {
++                float t = 0.0f;
++#pragma unroll
++                for (int pp = 0; pp < NP; ++pp) {
++                    t += red[pp][threadIdx.x];
++                }
++                hfin[tok*R + threadIdx.x] = t;
++            }
++            if (threadIdx.x == 0) {
++                *cnt = 0;
++            }
++        }
++    }
++}
++
++// y [N, ntok] = r * (W Q8(c x + m)) + b [+ U (D (c x + m))], W TQ1_P [K, N] (K >= K_in: zero columns beyond),
++// D F16 [K, R], U F16 [R, N], R = 16 or none. ntok <= 4. Two kernels.
++static void ttf_linear_tq1p_cuda(
++        const float * x, const int64_t sx, const int K_in, const float * c, const float * m, const void * W,
++        const int K, const int N, const int64_t stride_row_w, const float * r, const float * b, const half * D,
++        const half * U, const int R, float * dst, const int64_t stride_col_dst, const int ntok,
++        block_q8_1 * yq, const int K_q, float * hp, float * hfin, const int slot, cudaStream_t stream) {
++    const dim3 pgrid(K_q / 256, ntok, 1);
++    if (R == 16) {
++        k_ttf_prologue<16><<<pgrid, 256, 0, stream>>>(x, sx, K_in, c, m, K, D, yq, K_q, hp, hfin, slot % TTF_LIN_SLOTS);
++    } else {
++        k_ttf_prologue<0><<<pgrid, 256, 0, stream>>>(x, sx, K_in, c, m, K, nullptr, yq, K_q, nullptr, nullptr, 0);
++    }
++    const dim3 block(WARP_SIZE, TQ1P_WARPS, 1);
++    const dim3 grid((N + TQ1P_WARPS*TQ1P_ROWS - 1) / (TQ1P_WARPS*TQ1P_ROWS), 1, 1);
++    const int scy = K_q / QK8_1;
++#define TTF_LIN_LAUNCH(NT, RR) mul_mat_vec_tq1_p<NT, RR><<<grid, block, 0, stream>>>(W, yq, dst, r, b, hfin, U, \
++        K, N, (int) stride_row_w, scy, (int) stride_col_dst)
++    switch (ntok*100 + R) {
++        case 116: TTF_LIN_LAUNCH(1, 16); break;
++        case 216: TTF_LIN_LAUNCH(2, 16); break;
++        case 316: TTF_LIN_LAUNCH(3, 16); break;
++        case 416: TTF_LIN_LAUNCH(4, 16); break;
++        case 100: TTF_LIN_LAUNCH(1, 0); break;
++        case 200: TTF_LIN_LAUNCH(2, 0); break;
++        case 300: TTF_LIN_LAUNCH(3, 0); break;
++        case 400: TTF_LIN_LAUNCH(4, 0); break;
++        default: GGML_ABORT("ttf_linear_tq1p: ntok %d, R %d", ntok, R);
++    }
++#undef TTF_LIN_LAUNCH
++}
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a18dc2f4e..6e5f42f02 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -2,6 +2,16 @@
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
++#include "mmvq-tq1p.cuh"
++
++#include <climits>
++#include <cstdlib>
++
++// GGML_CUDA_TQ1P_GENERIC=1: the generic arithmetic-decode kernel for TQ1_P (A/B against the table kernel)
++static bool getenv_tq1p_generic() {
++    static const bool v = getenv("GGML_CUDA_TQ1P_GENERIC") != nullptr;
++    return v;
++}
+ 
+ #include <cstdint>
+ #include <type_traits>
+@@ -679,6 +689,7 @@ static __global__ void mul_mat_vec_q(
+     bool use_gate_bias = false;
+     bool use_scale = false;
+     bool use_gate_scale = false;
++    bool use_rscale = false;
+     [[maybe_unused]] const void * vgate = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
+@@ -696,6 +707,7 @@ static __global__ void mul_mat_vec_q(
+         gate_bias     = (const float *) fusion.gate_bias;
+         active_glu    = fusion.glu_op;
+         glu_limit     = fusion.glu_limit;
++        use_rscale    = fusion.x_rscale  != nullptr;
+         if constexpr (type == GGML_TYPE_NVFP4) {
+             use_scale      = fusion.x_scale    != nullptr;
+             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
+@@ -709,6 +721,7 @@ static __global__ void mul_mat_vec_q(
+     [[maybe_unused]] float gate_biases[ncols_dst] = { 0.0f };
+     [[maybe_unused]] float x_scales = 1.0f;
+     [[maybe_unused]] float gate_scales = 1.0f;
++    [[maybe_unused]] float x_rscales = 1.0f;
+     if constexpr (has_fusion) {
+         // 1. Hide latency by prefetching bias, gates and scales here
+         // 2. load only on threads that won't die after partial sum calculation
+@@ -729,6 +742,9 @@ static __global__ void mul_mat_vec_q(
+                     gate_biases[j] = gate_bias[j * stride_col_dst + threadIdx.x];
+                 }
+             }
++            if (use_rscale) {
++                x_rscales = ((const float *) fusion.x_rscale)[row0 + threadIdx.x];
++            }
+             if constexpr (type == GGML_TYPE_NVFP4) {
+                 if (use_scale) {
+                     x_scales = x_scale[ids ? channel_x : 0];
+@@ -841,7 +857,12 @@ static __global__ void mul_mat_vec_q(
+                     if constexpr (type == GGML_TYPE_NVFP4) {
+                         result *= x_scales;
+                     }
+-                    result += x_biases[j];
++                    if (use_rscale) {
++                        // no contraction: the same bits as the separate MUL (row scale) and ADD (bias) nodes
++                        result = __fadd_rn(__fmul_rn(result, x_rscales), x_biases[j]);
++                    } else {
++                        result += x_biases[j];
++                    }
+                     if (use_gate) {
+                         float gate_value = tmp_gate[j][i];
+                         if constexpr (type == GGML_TYPE_NVFP4) {
+@@ -1061,7 +1082,7 @@ static void mul_mat_vec_q_switch_fusion(
+         const uint32_t ids_stride, cudaStream_t stream) {
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
++                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_rscale != nullptr;
+     if constexpr (c_ncols_dst == 1) {
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+@@ -1098,7 +1119,7 @@ static void mul_mat_vec_q_moe_launch(
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+-                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
++                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr || fusion.x_rscale != nullptr;
+ 
+     if (has_fusion) {
+         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
+@@ -1383,6 +1404,12 @@ static void mul_mat_vec_q_switch_type(
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
+         case GGML_TYPE_TQ1_P:
++            if (ids == nullptr && nchannels_x == 1 && nchannels_dst == 1 && nsamples_x == 1 && nsamples_dst == 1 &&
++                    !getenv_tq1p_generic() &&
++                    mul_mat_vec_tq1_p_cuda(vx, vy, dst, fusion, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
++                                           stride_col_dst, stream)) {
++                break;
++            }
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_TQ1_P>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+@@ -1530,6 +1557,12 @@ void ggml_cuda_mul_mat_vec_q(
+             fusion_local.shared_stride_col_dst = fusion->shared_dst->nb[1] / ts_dst;
+         }
+ 
++        if (fusion->x_rscale) {
++            GGML_ASSERT(!ids && dst->ne[1] == 1);
++            GGML_ASSERT(fusion->x_rscale->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->x_rscale));
++            GGML_ASSERT(fusion->x_rscale->ne[0] == dst->ne[0] && ggml_nelements(fusion->x_rscale) == dst->ne[0]);
++            fusion_local.x_rscale = fusion->x_rscale->data;
++        }
+         if (fusion->x_bias) {
+             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+@@ -1641,3 +1674,39 @@ void ggml_cuda_op_mul_mat_vec_q(
+ 
+     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+ }
++
++bool ggml_cuda_ttf_linear_tq1p(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * c,
++        const ggml_tensor * m, const ggml_tensor * W, const ggml_tensor * r, const ggml_tensor * b, const ggml_tensor * D,
++        const ggml_tensor * U, ggml_tensor * dst, const int slot) {
++    const int64_t K    = W->ne[0];
++    const int64_t N    = W->ne[1];
++    const int64_t K_in = x->ne[0];
++    const int64_t ntok = x->ne[1];
++    const auto vec = [](const ggml_tensor * v, int64_t n) {
++        return v->type == GGML_TYPE_F32 && ggml_is_contiguous(v) && ggml_nelements(v) == n && v->ne[0] == n;
++    };
++    if (W->type != GGML_TYPE_TQ1_P || ggml_n_dims(W) != 2 || K % QK_TQ1_P != 0 || K_in > K ||
++            x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || ntok < 1 || ntok > 4 || x->ne[2] != 1 || x->ne[3] != 1 ||
++            !vec(c, K) || !vec(m, K) || !vec(r, N) || (b && !vec(b, N)) ||
++            dst->type != GGML_TYPE_F32 || dst->ne[0] != N || dst->ne[1] != ntok || dst->nb[0] != sizeof(float) ||
++            (D == nullptr) != (U == nullptr) || N > INT_MAX/2) {
++        return false;
++    }
++    int R = 0;
++    if (D) {
++        R = (int) D->ne[1];
++        if (R != 16 || D->type != GGML_TYPE_F16 || U->type != GGML_TYPE_F16 || !ggml_is_contiguous(D) || !ggml_is_contiguous(U) ||
++                D->ne[0] != K || ggml_n_dims(D) != 2 || U->ne[0] != R || U->ne[1] != N || ggml_n_dims(U) != 2) {
++            return false;
++        }
++    }
++    const int64_t K_q = GGML_PAD(K, MATRIX_ROW_PADDING);
++    ggml_cuda_pool_alloc<block_q8_1> yq(ctx.pool(), ntok*K_q/QK8_1);
++    ggml_cuda_pool_alloc<float> hp(ctx.pool(), R ? ntok*(K_q/256)*R : 1);
++    ggml_cuda_pool_alloc<float> hfin(ctx.pool(), R ? ntok*R : 1);
++    ttf_linear_tq1p_cuda((const float *) x->data, x->nb[1]/sizeof(float), (int) K_in, (const float *) c->data,
++        (const float *) m->data, W->data, (int) K, (int) N, W->nb[1]/ggml_type_size(W->type), (const float *) r->data,
++        b ? (const float *) b->data : nullptr, D ? (const half *) D->data : nullptr, U ? (const half *) U->data : nullptr,
++        R, (float *) dst->data, dst->nb[1]/sizeof(float), (int) ntok, yq.get(), (int) K_q, hp.get(), hfin.get(), slot, ctx.stream());
++    return true;
++}
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 5605bf7a4..f340297a0 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -11,6 +11,14 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
++// TTF linear on a TQ1_P weight W [K, N] for 1..4 tokens, in two kernels: dst = r * (W Q8(c x + m)) + b
++// [+ U (D (c x + m))]; x [K_in <= K, ntok] (zero beyond K_in), D F16 [K, 16], U F16 [16, N] (both or neither).
++// slot: a number distinct among the products that may run concurrently (the graph node index).
++// false: the shapes are not covered, nothing was launched.
++bool ggml_cuda_ttf_linear_tq1p(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * c,
++    const ggml_tensor * m, const ggml_tensor * W, const ggml_tensor * r, const ggml_tensor * b, const ggml_tensor * D,
++    const ggml_tensor * U, ggml_tensor * dst, int slot);
++
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 3a04c796b..2ac52206d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1697,6 +1697,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w_s) const {
+     ggml_tensor * res = nullptr;
+ 
++    // a K-padded weight (TQ1_P, K rounded up to a multiple of 160 with zero columns): zero-pad the input to match
++    if (w->ne[0] > cur->ne[0]) {
++        cur = ggml_pad(ctx0, cur, w->ne[0] - cur->ne[0], 0, 0, 0);
++    }
++
+     const llama_ttf_ext * te = nullptr;
+     if (ttf && !ttf->empty()) {
+         auto it = ttf->find(w);
+@@ -1723,13 +1728,40 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+             res = ggml_add(ctx0, res, te->main.b);
+         }
+     } else if (te) {
+-        res = build_ttf_mm(w, cur, te->main);
++        // the centred input c * x + m, computed once when an adapter reads the same one (aliased at load)
++        ggml_tensor * xc = nullptr;
++        const bool shared = (te->d && te->dl.c == te->main.c && te->dl.m == te->main.m) ||
++                            (te->fd && te->fdl.c == te->main.c && te->fdl.m == te->main.m);
++        if (shared && (te->main.c || te->main.m)) {
++            xc = cur;
++            if (te->main.c) {
++                xc = ggml_mul(ctx0, xc, te->main.c);
++            }
++            if (te->main.m) {
++                xc = ggml_add(ctx0, xc, te->main.m);
++            }
++        }
++        auto lin_in = [&](const llama_ttf_lin & l) -> std::pair<ggml_tensor *, llama_ttf_lin> {
++            if (xc && l.c == te->main.c && l.m == te->main.m) {
++                llama_ttf_lin l2 = l;
++                l2.c = nullptr;
++                l2.m = nullptr;
++                return { xc, l2 };
++            }
++            return { cur, l };
++        };
++        {
++            auto [x, l] = lin_in(te->main);
++            res = build_ttf_mm(w, x, l);
++        }
+         if (te->d && te->u) {
+-            ggml_tensor * h = build_ttf_mm(te->d, cur, te->dl);
++            auto [x, l] = lin_in(te->dl);
++            ggml_tensor * h = build_ttf_mm(te->d, x, l);
+             res = ggml_add(ctx0, res, build_ttf_mm(te->u, h, te->ul));
+         }
+         if (te->fd && te->fu) {
+-            ggml_tensor * h = build_ttf_mm(te->fd, cur, te->fdl);
++            auto [x, l] = lin_in(te->fdl);
++            ggml_tensor * h = build_ttf_mm(te->fd, x, l);
+             res = ggml_add(ctx0, build_ttf_mm(te->fu, h, te->ful), res);
+         }
+     } else {
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 2d084a08b..f04058521 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -911,7 +911,11 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
+         }
+     } else {
+         for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
+-            if ((i < ne.size() && ne[i] != cur->ne[i]) || (i >= ne.size() && cur->ne[i] != 1)) {
++            // a TQ1_P weight whose K is not a multiple of 160 is stored with zero columns up to the next multiple
++            // (TTF: the graph pads the input with zeros, see build_lora_mm)
++            const bool k_padded = i == 0 && !ne.empty() && cur->type == GGML_TYPE_TQ1_P && ne[0] % 160 != 0 &&
++                                  cur->ne[0] == (ne[0] + 159) / 160 * 160;
++            if ((i < ne.size() && ne[i] != cur->ne[i] && !k_padded) || (i >= ne.size() && cur->ne[i] != 1)) {
+                 is_ok = false;
+                 break;
+             }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 1e366a3bc..82342d83d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2265,6 +2265,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+     load_tensors_hadamard();
+ 
++    // TTF: an adapter whose input scale / centring equal the main weight's reads the same centred input; alias them
++    // so the graph computes c * x + m once (exact: the same values)
++    {
++        auto same = [](ggml_tensor * x, ggml_tensor * y) -> bool {
++            if (x == y) {
++                return true;
++            }
++            if (!x || !y || x->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, y)) {
++                return false;
++            }
++            std::vector<uint8_t> bx(ggml_nbytes(x)), by(ggml_nbytes(y));
++            ggml_backend_tensor_get(x, bx.data(), 0, bx.size());
++            ggml_backend_tensor_get(y, by.data(), 0, by.size());
++            return bx == by;
++        };
++        int n_alias = 0;
++        for (auto & [w, te] : ttf) {
++            for (llama_ttf_lin * l : { &te.dl, &te.fdl }) {
++                if (l->c && l->m && same(l->c, te.main.c) && same(l->m, te.main.m)) {
++                    l->c = te.main.c;
++                    l->m = te.main.m;
++                    n_alias++;
++                }
++            }
++        }
++        if (n_alias > 0) {
++            LLAMA_LOG_INFO("%s: TTF: %d adapters share the main weight's centred input\n", __func__, n_alias);
++        }
++    }
++
+     return true;
+ }
+ 
+-- 
+2.55.0
+

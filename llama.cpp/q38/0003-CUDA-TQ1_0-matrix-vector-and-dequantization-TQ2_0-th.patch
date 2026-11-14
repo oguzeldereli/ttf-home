@@ -1,0 +1,185 @@
+From eb3348117ebd9b67bc894719bd05da03fd1fb1cb Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Mon, 26 Oct 2026 05:00:30 +0000
+Subject: [PATCH 3/8] CUDA: TQ1_0 matrix-vector and dequantization; TQ2_0
+ through MMQ (the Q2_K kernels with unit sub-block scales)
+
+TQ1_0: one int of base-3 codes per thread, branch-free across the three code regions, two bytes per 16-bit lane;
+bit-identical decode NLL to the CPU layout (0.8B TTF 2.587994). 27B TTF: 16.8 tok/s at 7.87 GiB (TQ2_0: 23.1 at
+9.23 GiB). TQ2_0 MMQ: prefill without the fp16 copy of the weight; NLL 2.5889 vs 2.5883 through cuBLAS.
+---
+ ggml/src/ggml-cuda/common.cuh   |  7 +++++++
+ ggml/src/ggml-cuda/convert.cu   | 30 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  1 +
+ ggml/src/ggml-cuda/mmvq.cu      |  8 ++++++++
+ ggml/src/ggml-cuda/vecdotq.cuh  | 36 +++++++++++++++++++++++++++++++++
+ 5 files changed, 82 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index e7c7d9c6a..0f29da5bf 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1063,6 +1063,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
+     static constexpr int bs = sizeof(block_nvfp4);
+ };
+ 
++template<>
++struct ggml_cuda_type_traits<GGML_TYPE_TQ1_0> {
++    static constexpr int qk = QK_K;
++    static constexpr int qr = 1;
++    static constexpr int qi = 16;   // 13 ints per block (vec_dot_tq1_0_q8_1), padded to divide the warp
++};
++
+ template<>
+ struct ggml_cuda_type_traits<GGML_TYPE_TQ2_0> {
+     static constexpr int qk = QK_K;
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index 783fd197b..a7024d336 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -301,6 +301,32 @@ static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k
+     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
+ }
+ 
++template<typename dst_t>
++static __global__ void dequantize_block_tq1_0(const void * __restrict__ vx, dst_t * __restrict__ yy) {
++
++    const int64_t i = blockIdx.x;
++    const block_tq1_0 * x = (const block_tq1_0 *) vx;
++    const int e = threadIdx.x;     // the element, 0..255 (layout: vec_dot_tq1_0_q8_1)
++
++    int n, b;
++    if (e < 160) {
++        n = e / 32;          b = x[i].qs[e % 32];
++    } else if (e < 240) {
++        n = (e - 160) / 16;  b = x[i].qs[32 + (e - 160) % 16];
++    } else {
++        n = (e - 240) / 4;   b = x[i].qh[(e - 240) % 4];
++    }
++    const uint32_t pow3[5] = {1, 3, 9, 27, 81};
++    const uint32_t q = ((uint32_t) b * pow3[n]) & 0xFF;
++    yy[i*QK_K + e] = __half2float(x[i].d) * ((int) ((q * 3) >> 8) - 1);
++}
++
++template<typename dst_t>
++static void dequantize_row_tq1_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
++    const int nb = k / QK_K;
++    dequantize_block_tq1_0<<<nb, QK_K, 0, stream>>>(vx, y);
++}
++
+ template<typename dst_t>
+ static void dequantize_row_tq2_0_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = k / QK_K;
+@@ -597,6 +623,8 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+         case GGML_TYPE_Q2_K:
+             return dequantize_row_q2_K_cuda;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_row_tq1_0_cuda;
+         case GGML_TYPE_TQ2_0:
+             return dequantize_row_tq2_0_cuda;
+         case GGML_TYPE_Q3_K:
+@@ -656,6 +684,8 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
+             return dequantize_block_cont_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+         case GGML_TYPE_Q2_K:
+             return dequantize_row_q2_K_cuda;
++        case GGML_TYPE_TQ1_0:
++            return dequantize_row_tq1_0_cuda;
+         case GGML_TYPE_TQ2_0:
+             return dequantize_row_tq2_0_cuda;
+         case GGML_TYPE_Q3_K:
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index be3ad58d0..5e86d3dd8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6007,6 +6007,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+                     case GGML_TYPE_MXFP4:
+                     case GGML_TYPE_NVFP4:
+                     case GGML_TYPE_Q2_K:
++                    case GGML_TYPE_TQ1_0:
+                     case GGML_TYPE_TQ2_0:
+                     case GGML_TYPE_Q3_K:
+                     case GGML_TYPE_Q4_K:
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index c372593c7..22cff3d0a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -49,6 +49,7 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type)
+         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
+         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
++        case GGML_TYPE_TQ1_0:   return vec_dot_tq1_0_q8_1;
+         case GGML_TYPE_TQ2_0:   return vec_dot_tq2_0_q8_1;
+         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
+@@ -79,6 +80,7 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
+         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
+         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
++        case GGML_TYPE_TQ1_0:   return VDR_TQ1_0_Q8_1_MMVQ;
+         case GGML_TYPE_TQ2_0:   return VDR_TQ2_0_Q8_1_MMVQ;
+         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
+         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
+@@ -1372,6 +1374,12 @@ static void mul_mat_vec_q_switch_type(
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+             break;
++        case GGML_TYPE_TQ1_0:
++            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_TQ1_0>
++                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++            break;
+         case GGML_TYPE_TQ2_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_TQ2_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 162127bd5..0fafb0a4c 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -949,6 +949,42 @@ static __device__ __forceinline__ float vec_dot_tq2_0_q8_1(
+     return __half2float(bq->d) * sumf;
+ }
+ 
++// TQ1_0: five base-3 digits per byte (qh: four), digit n of byte b = ((b * 3^n mod 256) * 3) >> 8, in {0, 1, 2}.
++// Element order: qs[0..31] digit n -> elements 32n + byte (q8_1 blocks 0..4); qs[32..47] digit n -> 160 + 16n + byte
++// (half blocks of 5..7); qh[0..3] digit n -> 240 + 4n + byte (the second half of block 7). One int of codes per
++// thread, iqs 0..12 (iqs 13..15 idle).
++#define VDR_TQ1_0_Q8_1_MMVQ 1
++
++// digit n (p = 3^n) of the 4 bytes of v, two bytes per 16-bit lane (b * 81 < 2^16: no carry between lanes)
++static __device__ __forceinline__ int tq1_0_digit4(const int v, const uint32_t p) {
++    const uint32_t e = (( (uint32_t) v       & 0x00FF00FF) * p) & 0x00FF00FF;
++    const uint32_t o = ((((uint32_t) v >> 8) & 0x00FF00FF) * p) & 0x00FF00FF;
++    return (int) ((((e * 3) >> 8) & 0x00030003) | ((((o * 3) >> 8) & 0x00030003) << 8));
++}
++
++static __device__ __forceinline__ float vec_dot_tq1_0_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    if (iqs >= 13) {
++        return 0.0f;
++    }
++    const block_tq1_0 * bq = (const block_tq1_0 *) vbq + kbx;
++    const int v = get_int_b2(bq->qs, iqs);          // iqs 12: qh, which follows qs
++
++    // the q8_1 block and int of digit n, without branches (a warp holds all three cases)
++    const bool lo = iqs < 8, hi = iqs == 12;
++    float sumf = 0.0f;
++    uint32_t p = 1;
++#pragma unroll
++    for (int n = 0; n < 5; ++n, p *= 3) {
++        const int blk = lo ? n : (hi ? 7 : 5 + n/2);
++        const int idx = lo ? iqs : (hi ? 4 + n : (n % 2)*4 + iqs - 8);
++        const int u   = (hi && n == 4) ? 0 : get_int_b4(bq8_1[blk].qs, idx);
++        sumf += __low2float(bq8_1[blk].ds) * (ggml_cuda_dp4a(tq1_0_digit4(v, p), u, 0) - ggml_cuda_dp4a(0x01010101, u, 0));
++    }
++    return __half2float(bq->d) * sumf;
++}
++
+ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+-- 
+2.55.0
+

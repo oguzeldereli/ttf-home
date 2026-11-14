@@ -1,0 +1,85 @@
+From 2e0ebfca151e4d2f6663bbee5fc649faec3d79b0 Mon Sep 17 00:00:00 2001
+From: Ozgur Guzeldereli <ozgur@guzeldereli.com>
+Date: Thu, 29 Oct 2026 01:44:01 +0000
+Subject: [PATCH 5/8] TTF side tensors: a second low-rank adapter (ttf_fd /
+ ttf_fu) beside the ternary one
+
+A converted layer can carry both a ternary adapter (ttf_d / ttf_u) and a float
+low-rank adapter fitted to what the ternary one left; both outputs are added to
+the main product. The second adapter takes the same side-tensor form
+(_c / _m / _b) and the same loader checks.
+---
+ src/llama-graph.cpp |  4 ++++
+ src/llama-model.cpp | 16 +++++++++++++++-
+ src/llama-ttf.h     |  6 ++++++
+ 3 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 055ca2750..92be20e36 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1708,6 +1708,10 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+             ggml_tensor * h = build_ttf_mm(te->d, cur, te->dl);
+             res = ggml_add(ctx0, res, build_ttf_mm(te->u, h, te->ul));
+         }
++        if (te->fd && te->fu) {
++            ggml_tensor * h = build_ttf_mm(te->fd, cur, te->fdl);
++            res = ggml_add(ctx0, build_ttf_mm(te->fu, h, te->ful), res);
++        }
+     } else {
+         // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
+         ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 84de5068b..931cbbd9a 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2012,7 +2012,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 te.ul.m = ttf_vec(e, "ttf_u_m", bid, r);
+                 te.ul.b = ttf_vec(e, "ttf_u_b", bid, N);
+             }
+-            if (te.main.c || te.main.m || te.main.b || te.d) {
++            te.fd = ttf_mat(e, "ttf_fd", bid, K, -1);
++            if (te.fd) {
++                const int64_t r = te.fd->ne[1];
++                te.fdl.c = ttf_vec(e, "ttf_fd_c", bid, K);
++                te.fdl.m = ttf_vec(e, "ttf_fd_m", bid, K);
++                te.fdl.b = ttf_vec(e, "ttf_fd_b", bid, r);
++                te.fu = ttf_mat(e, "ttf_fu", bid, r, N);
++                if (!te.fu) {
++                    throw std::runtime_error(format("TTF adapter %s has a down layer but no up layer", tn(e, "ttf_fd", bid).str().c_str()));
++                }
++                te.ful.c = ttf_vec(e, "ttf_fu_c", bid, r);
++                te.ful.m = ttf_vec(e, "ttf_fu_m", bid, r);
++                te.ful.b = ttf_vec(e, "ttf_fu_b", bid, N);
++            }
++            if (te.main.c || te.main.m || te.main.b || te.d || te.fd) {
+                 ttf[w] = te;
+             }
+         };
+diff --git a/src/llama-ttf.h b/src/llama-ttf.h
+index 04a955d2b..3f5118c70 100644
+--- a/src/llama-ttf.h
++++ b/src/llama-ttf.h
+@@ -5,6 +5,8 @@
+ // exactly), c is the per-input-channel scale, m = -c * mu the centring, b the output bias. Each of the three
+ // parts is optional; the adapter's down (D) and up (U) layers have the same form. The side tensors sit next to
+ // the weight in the GGUF: <base>.ttf_c / ttf_m / ttf_b, <base>.ttf_d (+ _c / _m / _b), <base>.ttf_u (+ _c / _m / _b).
++// A second adapter of the same form, <base>.ttf_fd / ttf_fu (+ _c / _m / _b), adds its output too: the float low-rank
++// adapter of a layer that also has a ternary one.
+ 
+ #include "ggml.h"
+ 
+@@ -22,6 +24,10 @@ struct llama_ttf_ext {
+     llama_ttf_lin dl;
+     ggml_tensor * u = nullptr; // [r, N] adapter up
+     llama_ttf_lin ul;
++    ggml_tensor * fd = nullptr; // [K, r2] second adapter down
++    llama_ttf_lin fdl;
++    ggml_tensor * fu = nullptr; // [r2, N] second adapter up
++    llama_ttf_lin ful;
+ };
+ 
+ using llama_ttf_map = std::unordered_map<const ggml_tensor *, llama_ttf_ext>;
+-- 
+2.55.0
+
