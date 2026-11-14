@@ -736,7 +736,7 @@ bool ggml_cuda_ttf_quant_multi(ggml_backend_cuda_context & ctx, ggml_tensor * co
 template <int BS, int VPT>
 static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, const float * mul, const float eps,
                                              const int K, const bool bf16, const ttf_qparts P, const float * ux,
-                                             const int64_t su, const int act) {
+                                             const int64_t su, const int act, const int one_j) {
     __shared__ float sf[32];
     __shared__ int   si[32];
     const int        z    = blockIdx.z;
@@ -806,8 +806,63 @@ static __global__ void ttf_norm_quant_kernel(const float * x, const int64_t sx, 
                 *(float4 *) (xsh + 4 * i) = xs[k];
             }
         }
-        __syncthreads();
         const int lane = tid % WARP_SIZE;
+        if (one_j) {
+            // decode: one block per down projection j. All threads stage mB_j next to xc (its loads in flight together),
+            // then warps 0 / 1 run ttf_adapter_dot's two chains (a0: k = lane + 64 i, a1: k = lane + 32 + 64 i) over
+            // shared memory and warp 0 sums them as it does: u_j bit-identical
+            const int j = blockIdx.y - 1;
+            if (j >= qp.rank) {
+                return;  // the whole block
+            }
+            float * ws = xsh + K;
+            if (qp.mbh) {
+                for (int k = tid; k < K; k += BS) {
+                    ws[k] = ttf_ad_ld<true>(qp.mB, (int64_t) j * K + k);
+                }
+            } else {
+                for (int k = tid; k < K; k += BS) {
+                    ws[k] = ttf_ad_ld<false>(qp.mB, (int64_t) j * K + k);
+                }
+            }
+            __syncthreads();
+            __shared__ float sa1[WARP_SIZE];
+            float            a = 0.0f;
+            if (tid < 2 * WARP_SIZE) {
+                int k = lane + 32 * (tid / WARP_SIZE);
+                for (; k + 7 * 64 < K; k += 8 * 64) {
+                    float xv[8], wv[8];
+#pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        xv[u] = xsh[k + 64 * u];
+                        wv[u] = ws[k + 64 * u];
+                    }
+#pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        a = __fmaf_rn(xv[u], wv[u], a);
+                    }
+                }
+                for (; k < K; k += 64) {
+                    a = __fmaf_rn(xsh[k], ws[k], a);
+                }
+                if (tid >= WARP_SIZE) {
+                    sa1[lane] = a;
+                }
+            }
+            __syncthreads();
+            if (tid < WARP_SIZE) {
+                float sum = __fadd_rn(a, sa1[lane]);
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, off));
+                }
+                if (lane == 0) {
+                    *(float *) (o + Kp + TTF_QROW_TAIL + 4 * j) = ttf_rd(sum, bf16);
+                }
+            }
+            return;
+        }
+        __syncthreads();
         const int j    = (blockIdx.y - 1) * (BS / WARP_SIZE) + tid / WARP_SIZE;
         if (j < qp.rank) {
             const float s = ttf_adapter_dot([&](int64_t k) { return xsh[k]; }, ttf_adp{ qp.mB, qp.mbh != 0 }, (int64_t) j * K, K, lane);
@@ -892,12 +947,18 @@ bool ggml_cuda_ttf_norm_quant(ggml_backend_cuda_context & ctx, const ggml_tensor
     memcpy(&eps, rms->op_params, sizeof(float));
     const bool    bf16 = ggml_get_op_params_i32(qs[0], 1) != 0;
     const int64_t n4   = K / 4;
-    const int     xsz  = rmax > 0 ? (int) (K * sizeof(float)) : 0;
+    // decode (few rows): one adapter block per j, mB_j staged beside xc (TTF_NORM_QUANT_WARP_J=1: a warp per j);
+    // else BS / 32 projections per block, a warp each
+    static const bool warp_j = getenv("TTF_NORM_QUANT_WARP_J") != nullptr;
+    const int     nsm   = ggml_cuda_info().devices[ctx.device].nsm;
+    // (K >= 2048: at 340M's 1024 the warp-per-j blocks were as fast or faster)
+    const int     one_j = rmax > 0 && !warp_j && K >= 2048 && rows * np * 4 <= nsm && 2 * K * (int64_t) sizeof(float) <= 48 * 1024;
+    const int     xsz   = rmax > 0 ? (int) ((one_j ? 2 : 1) * K * sizeof(float)) : 0;
     auto go = [&](auto kern, const int bs) {
-        const dim3 grid((unsigned) rows, 1 + (rmax + bs / WARP_SIZE - 1) / (bs / WARP_SIZE), (unsigned) np);
+        const dim3 grid((unsigned) rows, 1 + (one_j ? rmax : (rmax + bs / WARP_SIZE - 1) / (bs / WARP_SIZE)), (unsigned) np);
         kern<<<grid, bs, xsz, ctx.stream()>>>((const float *) x->data, x->nb[1] / 4, (const float *) w->data, eps,
                                               (int) K, bf16, P, act ? (const float *) u->data : nullptr,
-                                              act ? u->nb[1] / 4 : 0, act);
+                                              act ? u->nb[1] / 4 : 0, act, one_j);
     };
     // rms_norm_f32_dispatch's vec choices
     if (n4 <= 32) {
