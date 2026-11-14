@@ -202,6 +202,50 @@ const char * k_re_qwen35 =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|"
     "\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
+// GPT-2's regex (the ByteLevel pre-tokenizer's, use_regex): the end of its match at i, or i when nothing matches
+//   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+size_t gpt2_match(const std::vector<uint32_t> & c, size_t i) {
+    const size_t n = c.size();
+    auto         L = [](uint32_t x) { return (uflags(x) & 1u) != 0; };
+    auto         N = [](uint32_t x) { return (uflags(x) & 4u) != 0; };
+    if (c[i] == '\'' && i + 1 < n) {
+        const uint32_t a = c[i + 1];
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') {
+            return i + 2;
+        }
+        if (i + 2 < n && ((a == 'r' && c[i + 2] == 'e') || (a == 'v' && c[i + 2] == 'e') || (a == 'l' && c[i + 2] == 'l'))) {
+            return i + 3;
+        }
+    }
+    auto run = [&](auto cls) -> size_t {  // ' '?cls+ at i, or i
+        size_t j = i + (c[i] == ' ' && i + 1 < n && cls(c[i + 1]) ? 1 : 0);
+        if (!cls(c[j])) {
+            return i;
+        }
+        while (j < n && cls(c[j])) {
+            ++j;
+        }
+        return j;
+    };
+    for (size_t e : { run(L), run(N), run([&](uint32_t x) { return !uspace(x) && !L(x) && !N(x); }) }) {
+        if (e > i) {
+            return e;
+        }
+    }
+    if (!uspace(c[i])) {
+        return i;
+    }
+    size_t re = i;
+    while (re < n && uspace(c[re])) {
+        ++re;
+    }
+    return re == n || re - i < 2 ? re : re - 1;  // \s+(?!\S), else \s+
+}
+
+bool hf_punct(uint32_t cp) {  // tokenizers' is_punc: ASCII punctuation or a Unicode P* character
+    return (cp < 0x80 && std::ispunct((int) cp)) || (uflags(cp) & 8u) != 0;
+}
+
 // the end of the regex's match at i (leftmost alternative first, as the regex engine), or i when nothing matches.
 // split 1: Llama-3 (letters \p{L}, numbers 1-3); 2: Qwen3.5 (letters [\p{L}\p{M}], numbers 1, marks out of alt 4)
 size_t split_match(const std::vector<uint32_t> & c, size_t i, int split) {
@@ -337,7 +381,18 @@ std::unique_ptr<Tokenizer> Tokenizer::from_json(const std::string & tj, std::str
             const json seq = pre.at("type") == "Sequence" ? pre.at("pretokenizers") : json::array({ pre });
             for (const json & p : seq) {
                 const std::string ty = p.at("type");
-                if (ty == "Split" && t->split == 0 && !t->byte_level && p.at("pattern").contains("Regex") &&
+                if (ty == "Punctuation" && p.value("behavior", std::string()) == "Contiguous" && !t->punct &&
+                    t->split == 0 && !t->byte_level && !t->digits) {
+                    t->punct = true;  // only first in the sequence: applied before the split
+                } else if (ty == "Digits" && p.value("individual_digits", false) && !t->digits) {
+                    t->digits = true;  // applied last (after the byte-level map): nothing may follow it
+                } else if (t->digits) {
+                    throw std::runtime_error("tokenizer: pre_tokenizer after Digits not implemented");
+                } else if (ty == "ByteLevel" && !t->byte_level && t->split == 0 && !p.value("add_prefix_space", false) &&
+                           p.value("use_regex", true)) {
+                    t->byte_level = true;
+                    t->split      = 3;
+                } else if (ty == "Split" && t->split == 0 && !t->byte_level && p.at("pattern").contains("Regex") &&
                     p.value("behavior", std::string()) == "Isolated" && !p.value("invert", false)) {
                     const std::string re = p.at("pattern").at("Regex");
                     t->split             = re == k_re_llama3 ? 1 : re == k_re_qwen35 ? 2 : 0;
@@ -516,42 +571,85 @@ std::string Tokenizer::normalize(const std::string & text) const {
 
 // an already normalized piece: pre-tokenizer, byte-level map, BPE
 void Tokenizer::model_piece(const std::string & s, std::vector<int32_t> & ids) const {
+    // Punctuation (Contiguous): runs of punctuation and the runs between them, in order
+    std::vector<std::string> pieces;
+    if (punct) {
+        std::string cur;
+        int         kind = -1;
+        for (uint32_t cp : to_cps(s)) {
+            const int k = hf_punct(cp) ? 1 : 0;
+            if (k != kind && !cur.empty()) {
+                pieces.push_back(cur);
+                cur.clear();
+            }
+            kind = k;
+            put_utf8(cur, cp);
+        }
+        if (!cur.empty()) {
+            pieces.push_back(cur);
+        }
+    } else {
+        pieces.push_back(s);
+    }
     std::vector<std::string> words;
-    if (split) {
-        const std::vector<uint32_t> c = to_cps(s);
-        std::string                 gap;
-        for (size_t i = 0; i < c.size();) {
-            const size_t e = split_match(c, i, split);
-            if (e == i) {  // no alternative matches here: the character joins the gap piece (Isolated keeps gaps)
-                put_utf8(gap, c[i++]);
-                continue;
+    for (const std::string & ps : pieces) {
+        if (split) {
+            const std::vector<uint32_t> c = to_cps(ps);
+            std::string                 gap;
+            for (size_t i = 0; i < c.size();) {
+                const size_t e = split == 3 ? gpt2_match(c, i) : split_match(c, i, split);
+                if (e == i) {  // no alternative matches here: the character joins the gap piece (Isolated keeps gaps)
+                    put_utf8(gap, c[i++]);
+                    continue;
+                }
+                if (!gap.empty()) {
+                    words.push_back(gap);
+                    gap.clear();
+                }
+                std::string w;
+                for (size_t k = i; k < e; ++k) {
+                    put_utf8(w, c[k]);
+                }
+                words.push_back(w);
+                i = e;
             }
             if (!gap.empty()) {
                 words.push_back(gap);
-                gap.clear();
             }
-            std::string w;
-            for (size_t k = i; k < e; ++k) {
-                put_utf8(w, c[k]);
-            }
-            words.push_back(w);
-            i = e;
+        } else {
+            words.push_back(ps);
         }
-        if (!gap.empty()) {
-            words.push_back(gap);
-        }
-    } else {
-        words.push_back(s);
     }
     for (const std::string & w : words) {
+        std::string m;
         if (byte_level) {
-            std::string m;
             for (unsigned char b : w) {
                 put_utf8(m, byte_chars()[b]);
             }
-            bpe_word(m, ids);
         } else {
-            bpe_word(w, ids);
+            m = w;
+        }
+        if (!digits) {
+            bpe_word(m, ids);
+            continue;
+        }
+        // Digits (individual): each numeric character of the mapped word its own piece
+        std::string cur;
+        for (uint32_t cp : to_cps(m)) {
+            if ((uflags(cp) & 4u) != 0) {
+                if (!cur.empty()) {
+                    bpe_word(cur, ids);
+                    cur.clear();
+                }
+                std::string d;
+                put_utf8(d, cp);
+                bpe_word(d, ids);
+            } else {
+                put_utf8(cur, cp);
+            }
+        }
+        if (!cur.empty()) {
+            bpe_word(cur, ids);
         }
     }
 }

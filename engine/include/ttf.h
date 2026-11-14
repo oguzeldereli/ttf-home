@@ -235,8 +235,10 @@ struct Tokenizer {
     std::vector<NormStep> norm;
     int32_t unk = -1;
     bool    byte_fallback = false, fuse_unk = false, ignore_merges = false;
-    int     split      = 0;      // 0 none, 1 the Llama-3 regex, 2 the Qwen3.5 regex
+    int     split      = 0;      // 0 none, 1 the Llama-3 regex, 2 the Qwen3.5 regex, 3 GPT-2's (ByteLevel use_regex)
     bool    byte_level = false;  // GPT-2 byte -> char map before the model; its inverse in decode
+    bool    punct      = false;  // Punctuation pre-tokenizer (Contiguous), before the split
+    bool    digits     = false;  // Digits pre-tokenizer (individual), after the byte-level map
     std::vector<int32_t> post_pre, post_post;  // the post-processor's special tokens around a single sequence
     int32_t byte_id[256];
 
