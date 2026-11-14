@@ -237,7 +237,10 @@ int main(int argc, char ** argv) {
         // TTF_BENCH_MB: the weight copies' total (default 400 MB, over the L2; the 27B reads ~6300 MB per token)
         const double   wmb  = std::getenv("TTF_BENCH_MB") ? std::atof(std::getenv("TTF_BENCH_MB")) : 400.0;
         const int      NC   = (int) std::max<int64_t>(4, (int64_t) (wmb * 1e6 / (double) (N * Kp / 5)));
-        ggml_init_params ip = { (size_t) (16 * NC + 64) * ggml_tensor_overhead() + ggml_graph_overhead_custom(16 * NC + 64, false), nullptr, true };
+        // TTF_BENCH_NODES: products per graph, cycling over the NC copies (default NC; more with few copies keeps
+        // the per-graph overhead out of the time)
+        const int      NN   = std::getenv("TTF_BENCH_NODES") ? std::max(NC, std::atoi(std::getenv("TTF_BENCH_NODES"))) : NC;
+        ggml_init_params ip = { (size_t) (16 * NN + 64) * ggml_tensor_overhead() + ggml_graph_overhead_custom(16 * NN + 64, false), nullptr, true };
         ggml_context *   ctx = ggml_init(ip);
         ggml_tensor * tx  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T);
         ggml_tensor * tmu = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K), * tc = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);
@@ -246,23 +249,43 @@ int main(int argc, char ** argv) {
         ggml_tensor * tr  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N), * tb = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, N);
         ggml_tensor * tbe = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
         ggml_tensor * qa  = ggml_ttf_quant(ctx, tx, tmu, tc, tB, Kp, true);
-        ggml_cgraph * gf  = ggml_new_graph_custom(ctx, 16 * NC + 64, false);
+        ggml_cgraph * gf  = ggml_new_graph_custom(ctx, 16 * NN + 64, false);
         std::vector<ggml_tensor *> ws;
-        for (int i = 0; i < NC; ++i) {
-            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_TQ1_P, Kp, N);
-            ws.push_back(w);
-            ggml_build_forward_expand(gf, ggml_ttf_mm(ctx, w, qa, tbe, tA, tr, tb, nullptr, true));
+        // TTF_BENCH_CHAIN=1: each product accumulates the previous one (a dependency chain, as a model's layers)
+        const bool    chain = std::getenv("TTF_BENCH_CHAIN") != nullptr;
+        ggml_tensor * prev  = nullptr;
+        for (int i = 0; i < NN; ++i) {
+            if (i < NC) {  // TTF_BENCH_Q2=1: Q2P weights (I8 [Kp / 4, N], 2-bit codes; K % 640 == 0 so Kp fits both)
+                ws.push_back(std::getenv("TTF_BENCH_Q2") ? ggml_new_tensor_2d(ctx, GGML_TYPE_I8, Kp / 4, N)
+                                                         : ggml_new_tensor_2d(ctx, GGML_TYPE_TQ1_P, Kp, N));
+            }
+            ggml_tensor * w = ws[i % NC];
+            ggml_tensor * mm = ggml_ttf_mm(ctx, w, qa, tbe, tA, tr, tb, chain ? prev : nullptr, true);
+            prev             = mm;
+            if (std::getenv("TTF_MM_R")) {  // the session's rows-per-warp hint (0 = shape rule)
+                ((int32_t *) mm->op_params)[1] = std::atoi(std::getenv("TTF_MM_R"));
+            }
+            ggml_build_forward_expand(gf, mm);
         }
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
         ggml_backend_buffer_clear(buf, 0);
         std::mt19937 rng(3);
+        // TTF_BENCH_P0: fraction of zero trits (default: uniform over -1, 0, 1)
+        const double p0 = std::getenv("TTF_BENCH_P0") ? std::atof(std::getenv("TTF_BENCH_P0")) : -1.0;
         std::vector<float>   row(Kp, 0.0f);
         std::vector<uint8_t> wb(ggml_nbytes(ws[0]));
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t k = 0; k < K; ++k) {
-                row[k] = (float) ((int) (rng() % 3) - 1);
+                row[k] = p0 >= 0 ? ((rng() % 1000) < p0 * 1000 ? 0.0f : (rng() % 2 ? 1.0f : -1.0f))
+                                 : (float) ((int) (rng() % 3) - 1);
             }
-            ggml_quantize_chunk(GGML_TYPE_TQ1_P, row.data(), wb.data() + n * ws[0]->nb[1], 0, 1, Kp, nullptr);
+            if (ws[0]->type == GGML_TYPE_I8) {
+                for (int64_t k = 0; k < Kp / 4; ++k) {
+                    wb[n * ws[0]->nb[1] + k] = (uint8_t) (rng() % 3 | (rng() % 3) << 2 | (rng() % 3) << 4 | (rng() % 3) << 6);
+                }
+            } else {
+                ggml_quantize_chunk(GGML_TYPE_TQ1_P, row.data(), wb.data() + n * ws[0]->nb[1], 0, 1, Kp, nullptr);
+            }
         }
         for (auto * w : ws) {
             ggml_backend_tensor_set(w, wb.data(), 0, wb.size());
@@ -282,9 +305,9 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < 10; ++i) {
             ggml_backend_graph_compute(gpu, gf);
         }
-        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 10 / NC;
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 10 / NN;
         std::printf("cold K %lld N %lld T %lld rank %d: %d copies, %.1f us per mm (incl. 1/%d quant), %.0f GB/s\n", (long long) K,
-                    (long long) N, (long long) T, rank, NC, us, NC, ggml_nbytes(ws[0]) / us / 1e3);
+                    (long long) N, (long long) T, rank, NC, us, NN, ggml_nbytes(ws[0]) / us / 1e3);
         ggml_backend_buffer_free(buf);
         ggml_free(ctx);
 #endif

@@ -15,6 +15,7 @@
 #define TTF_QROW_TAIL 32
 #define TTF_MM_WARPS  4   // rows per block, one warp each
 #define TTF_MM_TOK    4   // tokens per warp pass
+#define TTF_MM_AP     2   // adapter values per lane kept in registers by the decode kernel (ranks <= 16)
 
 static __device__ __forceinline__ float ttf_rbf(const float v) {
     return __bfloat162float(__float2bfloat16_rn(v));
@@ -813,8 +814,29 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
     }
     const int nr = (int) min((int64_t) R, N - n0);
     const int m  = lane % 8;
+    // the epilogue's per-row operands, loaded before the weight stream so that their latency hides behind it (as
+    // mmvq-tq1p.cuh): row scale, bias, and the adapter row's values k = lane % 8 + 8 i (ranks up to 8 TTF_MM_AP)
+    float rv[R], bv[R], av[R][TTF_MM_AP];
+    const int64_t n8a = rank / 8 * 8;
+#pragma unroll
+    for (int rr = 0; rr < R; ++rr) {
+        const bool live = rr < nr;
+        rv[rr]          = r && live ? r[n0 + rr] : 0.0f;
+        bv[rr]          = b && live ? b[n0 + rr] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < TTF_MM_AP; ++i) {
+            const int64_t k = m + 8 * i;
+            av[rr][i]       = mA && live && k < n8a ? mA[(n0 + rr) * rank + k] : 0.0f;
+        }
+    }
     for (int64_t t0 = (int64_t) blockIdx.y * TTF_MM_TOK; t0 < T; t0 += (int64_t) gridDim.y * TTF_MM_TOK) {
         const int nt = (int) min((int64_t) TTF_MM_TOK, T - t0);
+        // lane tt < nt: the residual of token t0 + tt per row (decode: before the weight stream)
+        float resv[R];
+#pragma unroll
+        for (int rr = 0; rr < R; ++rr) {
+            resv[rr] = res && rr < nr && lane < nt ? res[(t0 + lane) * N + n0 + rr] : 0.0f;
+        }
         int       a[R][TTF_MM_TOK];
 #pragma unroll
         for (int rr = 0; rr < R; ++rr) {
@@ -1000,8 +1022,17 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
                 float         pl = 0.0f;
                 if (tt < nt) {
                     const float * u = (const float *) (qa + (t0 + tt) * ldq + Kp + TTF_QROW_TAIL);
-                    for (int64_t k = l; k < n8; k += 8) {
-                        pl = __fmaf_rn(u[k], ar[k], pl);
+                    if (n8 <= 8 * TTF_MM_AP) {
+#pragma unroll
+                        for (int i = 0; i < TTF_MM_AP; ++i) {
+                            if (l + 8 * i < n8) {
+                                pl = __fmaf_rn(u[l + 8 * i], av[rr][i], pl);
+                            }
+                        }
+                    } else {
+                        for (int64_t k = l; k < n8; k += 8) {
+                            pl = __fmaf_rn(u[k], ar[k], pl);
+                        }
                     }
                 }
                 float rs = 0.0f;
@@ -1045,17 +1076,17 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
                 y = ttf_rd(__fadd_rn(y, ad[rr]), bf16);
             }
             if (r) {
-                y = ttf_rd(__fmul_rn(y, ttf_rd(r[n], bf16)), bf16);
+                y = ttf_rd(__fmul_rn(y, ttf_rd(rv[rr], bf16)), bf16);
             }
             if (b) {
-                y = ttf_rd(__fadd_rn(y, ttf_rd(b[n], bf16)), bf16);
+                y = ttf_rd(__fadd_rn(y, ttf_rd(bv[rr], bf16)), bf16);
             }
             const int64_t i = t * N + n;
             if (acc) {
                 y = ttf_rd(__fadd_rn(acc[i], y), bf16);
             }
             if (res) {  // a following ADD of the product (residual), as ggml's add: not rounded
-                y = __fadd_rn(res[i], y);
+                y = __fadd_rn(resv[rr], y);
             }
             out[i] = y;
         }
@@ -1063,7 +1094,7 @@ static __device__ __forceinline__ void ttf_mm_body(const uint8_t * w, const int6
 }
 
 template <bool Q2, int R, bool H = false>
-static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 7 : 4) ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
+static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 8 : 4) ttf_mm_kernel(const uint8_t * w, const int64_t nbw1, const char * qa, const int64_t ldq,
                                      const float * beta, const float * mA, const int rank, const float * r,
                                      const float * b, const float * acc, const bool bf16, float * out, const int64_t N,
                                      const int64_t T, const int64_t Kp, const float * res = nullptr) {
@@ -1095,7 +1126,7 @@ struct ttf_mmparts {
 
 // register cap as the single-part kernel gets (128 with R = 4): the part selection otherwise costs occupancy
 template <bool Q2, int R, bool H = false>
-static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 7 : 4) ttf_mm_multi_kernel(const ttf_mmparts P, const bool bf16, const int64_t T) {
+static __global__ void __launch_bounds__(TTF_MM_WARPS * WARP_SIZE, R == 1 ? 8 : 4) ttf_mm_multi_kernel(const ttf_mmparts P, const bool bf16, const int64_t T) {
     const int        bx = blockIdx.x;
     const int        z  = bx >= P.p[2].bx0 ? 2 : bx >= P.p[1].bx0 ? 1 : 0;  // unused parts: bx0 = INT_MAX
     const ttf_mmpart q  = z == 0 ? P.p[0] : z == 1 ? P.p[1] : P.p[2];
