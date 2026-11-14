@@ -83,8 +83,8 @@ models trained from scratch. Get one:
 
 **Exactness.** Every op has a reference: the `.ttf` exporter runs the file's graphs in PyTorch and the runtime's per-op
 dump (`TTF_DUMP`) is checked against it. VoxCPM2 through the runtime scores the same as through PyTorch on FLEURS
-(30 languages x 8 texts, Whisper-large-v3): median character error 0.080 vs 0.074, within the spread between two seeds
-of the runtime itself.
+(30 languages x 8 texts, Whisper-large-v3): median character error 0.080-0.086 over three runtime passes vs 0.074,
+within the spread between two seeds of the runtime itself.
 
 ## llama.cpp: the released Qwen3.8 GGUF models
 
