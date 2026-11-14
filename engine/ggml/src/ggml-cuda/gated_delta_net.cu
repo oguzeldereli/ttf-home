@@ -439,7 +439,7 @@ static __global__ void k_gdn_gates(const ggml_cuda_gdn_gates p) {
     const int row = blockIdx.x;
     const bool is_b = row < p.H;
     const int  h    = is_b ? row : row - p.H;
-    const uint4  * w = (const uint4 *) (is_b ? p.wb + h * p.swb : p.wa + h * p.swa);
+    const uint4  * w = (const uint4 *) (is_b ? (const half *) p.wb + h * p.swb : (const half *) p.wa + h * p.swa);
     const float4 * x = (const float4 *) p.x;
     const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
     float s = 0.0f;
@@ -478,7 +478,56 @@ static __global__ void k_gdn_gates(const ggml_cuda_gdn_gates p) {
     }
 }
 
+// F32 weights: per row the sums of mul_mat_vec_f<float, float, 1, 256> (float2 pairs strided by the block, each
+// thread's fma chain, a warp reduce, then the warps' partials (the rest zero) reduced by warp 0), then the epilogues of
+// its bias fusion and of the separate sigmoid / softplus-times-a kernels: the same bits as the unfused graph
+static __global__ void __launch_bounds__(256, 1) k_gdn_gates_f32(const ggml_cuda_gdn_gates p) {
+    constexpr int BS  = 256;
+    const int     row = blockIdx.x;
+    const bool    is_b = row < p.H;
+    const int     h    = is_b ? row : row - p.H;
+    const float2 * w   = (const float2 *) (is_b ? (const float *) p.wb + h * p.swb : (const float *) p.wa + h * p.swa);
+    const float2 * y   = (const float2 *) p.x;
+    const int     tid  = threadIdx.x;
+    __shared__ float buf[WARP_SIZE];
+    if (tid < WARP_SIZE) {
+        buf[tid] = 0.0f;
+    }
+    __syncthreads();
+    float s = 0.0f;
+    for (int c = tid; c < p.K / 2; c += BS) {
+        const float2 wv = w[c];
+        const float2 yv = y[c];
+        ggml_cuda_mad(s, wv.x, yv.x);
+        ggml_cuda_mad(s, wv.y, yv.y);
+    }
+    s = warp_reduce_sum<WARP_SIZE>(s);
+    buf[tid / WARP_SIZE] = s;
+    __syncthreads();
+    if (tid >= WARP_SIZE) {
+        return;
+    }
+    s = buf[tid];
+    s = warp_reduce_sum<WARP_SIZE>(s);
+    if (tid != 0) {
+        return;
+    }
+    if (is_b) {
+        if (p.bb) {
+            s += p.bb[h];
+        }
+        p.beta[h] = 1.0f / (1.0f + expf(-s));
+    } else {
+        s += p.dt[h];
+        p.gate[h] = ((s > 20.0f) ? s : log1pf(expf(s))) * p.a[h];
+    }
+}
+
 void ggml_cuda_gdn_gates_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_gates & p) {
+    if (p.f32) {
+        k_gdn_gates_f32<<<2 * p.H, 256, 0, ctx.stream()>>>(p);
+        return;
+    }
     constexpr int WARPS = 4;
     const dim3 block(WARP_SIZE, WARPS);
     k_gdn_gates<WARPS><<<2 * p.H, block, 0, ctx.stream()>>>(p);

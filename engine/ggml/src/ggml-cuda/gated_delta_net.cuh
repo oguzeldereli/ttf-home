@@ -30,10 +30,11 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
 
 // beta = sigmoid(Wb x [+ bb]) and gate = softplus(Wa x + dt) * a for one token (ggml-cuda.cu matches the graph)
 struct ggml_cuda_gdn_gates {
-    const half  * wb;
-    const half  * wa;
-    int64_t       swb;      // row strides in halfs
+    const void  * wb;       // F16, or F32 (f32)
+    const void  * wa;
+    int64_t       swb;      // row strides in elements
     int64_t       swa;
+    bool          f32;      // F32 weights: mul_mat_vec_f's sums (block 256), the separate kernels' bits
     const float * x;
     const float * bb;       // may be null
     const float * dt;

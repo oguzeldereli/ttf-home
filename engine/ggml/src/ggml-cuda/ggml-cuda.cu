@@ -4803,9 +4803,32 @@ static bool ggml_cuda_gdn_gates_vec(const ggml_tensor * t, int64_t H) {
     return t && t->type == GGML_TYPE_F32 && ggml_nelements(t) == H && ggml_is_contiguous(t);
 }
 
-static bool ggml_cuda_gdn_gates_w(const ggml_tensor * w, int64_t K, int64_t H) {
-    return w->type == GGML_TYPE_F16 && w->ne[0] == K && w->ne[1] == H && w->ne[2] == 1 && w->ne[3] == 1 &&
-           w->nb[0] == sizeof(half) && w->nb[1] % 16 == 0 && ((uintptr_t) w->data) % 16 == 0;
+// F16 (k_gdn_gates' own sums), or F32 (TTF: mul_mat_vec_f's sums, the unfused bits; TTF_NO_GDN_GATES_F32=1: not fused)
+static bool ggml_cuda_gdn_gates_f32_ok(int64_t K) {
+    static const bool off = getenv("TTF_NO_GDN_GATES_F32") != nullptr;
+    if (off || K % 2 != 0) {
+        return false;
+    }
+    // mul_mat_vec_f's block size for K columns (warp 32, at most 256): k_gdn_gates_f32 is that of 256
+    int64_t best = 32, niter_best = (K + 63) / 64;
+    for (int64_t bs = 64; bs <= 256; bs += 32) {
+        const int64_t niter = (K + 2 * bs - 1) / (2 * bs);
+        if (niter < niter_best) {
+            niter_best = niter;
+            best       = bs;
+        }
+    }
+    return best == 256 && ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size == 32;
+}
+
+static bool ggml_cuda_gdn_gates_w(const ggml_tensor * w, int64_t K, int64_t H, ggml_type t) {
+    if (w->type != t || w->ne[0] != K || w->ne[1] != H || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (t == GGML_TYPE_F32) {
+        return w->nb[0] == sizeof(float) && w->nb[1] % 8 == 0 && ((uintptr_t) w->data) % 8 == 0;
+    }
+    return t == GGML_TYPE_F16 && w->nb[0] == sizeof(half) && w->nb[1] % 16 == 0 && ((uintptr_t) w->data) % 16 == 0;
 }
 
 static bool ggml_cuda_gdn_gates_disabled() {
@@ -4827,10 +4850,10 @@ struct ggml_cuda_gdn_gate_chain {
 };
 
 static bool ggml_cuda_gdn_gate_chain_parse(const ggml_cgraph * cgraph, int j, const ggml_tensor * x, int64_t K,
-                                           int64_t H, ggml_cuda_gdn_gate_chain & c) {
+                                           int64_t H, ggml_type wt, ggml_cuda_gdn_gate_chain & c) {
     c = {};
     const ggml_tensor * mm = cgraph->nodes[j];
-    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != x || !ggml_cuda_gdn_gates_w(mm->src[0], K, H) ||
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != x || !ggml_cuda_gdn_gates_w(mm->src[0], K, H, wt) ||
             mm->type != GGML_TYPE_F32) {
         return false;
     }
@@ -4884,16 +4907,19 @@ static int ggml_cuda_gdn_gates_match(const ggml_cgraph * cgraph, int i, ggml_cud
     const ggml_tensor * x = m0->src[1];
     const int64_t K = m0->src[0]->ne[0];
     const int64_t H = m0->src[0]->ne[1];
-    if (K % 8 != 0 || H < 1 || m0->src[0]->type != GGML_TYPE_F16 || x->type != GGML_TYPE_F32 ||
-            ggml_nelements(x) != K || !ggml_is_contiguous(x) || ((uintptr_t) x->data) % 16 != 0) {
+    const ggml_type wt = m0->src[0]->type;
+    const bool      f32 = wt == GGML_TYPE_F32;
+    if (H < 1 || x->type != GGML_TYPE_F32 || ggml_nelements(x) != K || !ggml_is_contiguous(x) ||
+            !(f32 ? ggml_cuda_gdn_gates_f32_ok(K) && ((uintptr_t) x->data) % 8 == 0
+                  : wt == GGML_TYPE_F16 && K % 8 == 0 && ((uintptr_t) x->data) % 16 == 0)) {
         return 0;
     }
     ggml_cuda_gdn_gate_chain c0, c1;
-    if (!ggml_cuda_gdn_gate_chain_parse(cgraph, i, x, K, H, c0)) {
+    if (!ggml_cuda_gdn_gate_chain_parse(cgraph, i, x, K, H, wt, c0)) {
         return 0;
     }
     const int j = ggml_cuda_next_compute(cgraph, c0.last);
-    if (j < 0 || !ggml_cuda_gdn_gate_chain_parse(cgraph, j, x, K, H, c1) || c0.is_beta == c1.is_beta) {
+    if (j < 0 || !ggml_cuda_gdn_gate_chain_parse(cgraph, j, x, K, H, wt, c1) || c0.is_beta == c1.is_beta) {
         return 0;
     }
     const ggml_cuda_gdn_gate_chain & cb = c0.is_beta ? c0 : c1;
@@ -4941,10 +4967,11 @@ static int ggml_cuda_gdn_gates_match(const ggml_cgraph * cgraph, int i, ggml_cud
     if (overlap(cb.act, cg.mul)) {
         return 0;
     }
-    p.wb   = (const half *) cb.mm->src[0]->data;
-    p.wa   = (const half *) cg.mm->src[0]->data;
-    p.swb  = cb.mm->src[0]->nb[1] / sizeof(half);
-    p.swa  = cg.mm->src[0]->nb[1] / sizeof(half);
+    p.f32  = f32;
+    p.wb   = cb.mm->src[0]->data;
+    p.wa   = cg.mm->src[0]->data;
+    p.swb  = cb.mm->src[0]->nb[1] / ggml_type_size(wt);
+    p.swa  = cg.mm->src[0]->nb[1] / ggml_type_size(wt);
     p.x    = (const float *) x->data;
     p.bb   = cb.bias ? (const float *) cb.bias->data : nullptr;
     p.dt   = (const float *) cg.bias->data;

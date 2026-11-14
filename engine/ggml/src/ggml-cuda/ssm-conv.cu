@@ -246,13 +246,29 @@ static __global__ void __launch_bounds__(T) k_conv_state(const ggml_cuda_conv_st
     }
 }
 
+static __global__ void k_conv_state_copy(const float * __restrict__ src, float * __restrict__ dst, const int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = src[i];
+    }
+}
+
 void ggml_cuda_conv_state_launch(ggml_backend_cuda_context & ctx, const ggml_cuda_conv_state & p) {
     GGML_ASSERT(p.KC == 4);
-    if (p.one_block) {
+    constexpr int T = 128;
+    // dst overlapping x: the many-block kernel into a pool scratch, then a copy (27B C 10240: 10.3 us on one SM vs ~2 +
+    // ~1.5 us); the same values. TTF_CONV_STATE_ONE_BLOCK=1: the one-block kernel
+    static const bool one_block = getenv("TTF_CONV_STATE_ONE_BLOCK") != nullptr;
+    if (p.one_block && one_block) {
         GGML_ASSERT(p.C <= 1024 * 16);
         k_conv_state<4, 1024, 16><<<1, 1024, 0, ctx.stream()>>>(p);
+    } else if (p.one_block) {
+        ggml_cuda_pool_alloc<float> tmp(ctx.pool(), p.C);
+        ggml_cuda_conv_state        q = p;
+        q.dst                         = tmp.get();
+        k_conv_state<4, T, 1><<<(p.C + T - 1) / T, T, 0, ctx.stream()>>>(q);
+        k_conv_state_copy<<<(p.C + 255) / 256, 256, 0, ctx.stream()>>>(tmp.get(), p.dst, p.C);
     } else {
-        constexpr int T = 128;
         k_conv_state<4, T, 1><<<(p.C + T - 1) / T, T, 0, ctx.stream()>>>(p);
     }
 }
