@@ -44,6 +44,8 @@
 #include <cctype>
 #include <ctime>
 
+#include "webui.h"
+
 using json = nlohmann::json;
 
 namespace {
@@ -790,7 +792,8 @@ int run_chat(const ttf::Model & m, const Args & a) {
 }
 
 
-// ---- serve: an OpenAI-style HTTP endpoint (POST /v1/chat/completions, GET /v1/models), one request at a time.
+// ---- serve: an OpenAI-style HTTP endpoint (POST /v1/chat/completions, GET /v1/models), one request at a time, and a
+// chat page at GET / (tools/webui.h).
 // Messages render as the template does for the families above (no tools); reasoning goes out as reasoning_content.
 // The state is reused across requests in two ways, both exact in tokens: (1) when the new prompt extends the last
 // reply as the client sends it back (templates that keep the reasoning in history), the state as the reply left it;
@@ -910,8 +913,8 @@ int run_serve(const ttf::Model & m, const Args & a) {
         std::fprintf(stderr, "serve: cannot listen on %s:%d\n", a.host.c_str(), a.port);
         return 1;
     }
-    std::fprintf(stderr, "serving %s on http://%s:%d/v1 (POST /v1/chat/completions, GET /v1/models)\n", name.c_str(),
-                 a.host.c_str(), a.port);
+    std::fprintf(stderr, "serving %s: chat page http://%s:%d/ , API http://%s:%d/v1 (POST /v1/chat/completions, GET /v1/models)\n",
+                 name.c_str(), a.host.c_str(), a.port, a.host.c_str(), a.port);
     for (;;) {
         const int fd = ::accept(lfd, nullptr, nullptr);
         if (fd < 0) {
@@ -955,6 +958,12 @@ int run_serve(const ttf::Model & m, const Args & a) {
         try {
             if (method == "OPTIONS") {
                 http_reply(fd, 204, "text/plain", "");
+            } else if (method == "GET" && (path == "/" || path == "/index.html")) {
+                http_reply(fd, 200, "text/html; charset=utf-8", TTF_WEBUI);
+            } else if (method == "GET" && path == "/props") {
+                http_reply(fd, 200, "application/json", json{ { "model", name }, { "think", f.kind == ChatFmt::CHATML && f.think_on }, { "n_ctx", ctx } }.dump());
+            } else if (method == "GET" && path == "/health") {
+                http_reply(fd, 200, "application/json", "{\"status\":\"ok\"}");
             } else if (method == "GET" && path == "/v1/models") {
                 http_reply(fd, 200, "application/json",
                            json{ { "object", "list" }, { "data", json::array({ json{ { "id", name }, { "object", "model" }, { "owned_by", "local" } } }) } }.dump());
@@ -1154,8 +1163,16 @@ int run_serve(const ttf::Model & m, const Args & a) {
                 }
                 json usage = { { "prompt_tokens", ids.size() }, { "completion_tokens", gen.size() }, { "total_tokens", ids.size() + gen.size() } };
                 if (stream) {
-                    if (alive) {
-                        chunk(json::object(), finish);
+                    if (alive) {  // the last chunk carries the usage and llama-server style timings
+                        const double tp = std::chrono::duration<double>(t1 - t0).count() * 1e3;
+                        const double tg = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count() * 1e3;
+                        json c = { { "id", id }, { "object", "chat.completion.chunk" }, { "created", created }, { "model", name },
+                                   { "choices", json::array({ json{ { "index", 0 }, { "delta", json::object() }, { "finish_reason", finish } } }) },
+                                   { "usage", usage },
+                                   { "timings", { { "prompt_n", ids.size() - reused }, { "prompt_ms", tp }, { "cache_n", reused },
+                                                  { "predicted_n", gen.size() }, { "predicted_ms", tg },
+                                                  { "predicted_per_second", gen.size() / std::max(tg * 1e-3, 1e-9) } } } };
+                        send_all(fd, "data: " + c.dump() + "\n\n");
                         send_all(fd, "data: [DONE]\n\n");
                     }
                 } else {
@@ -1325,7 +1342,7 @@ int run_tokenize(const std::string & path, bool specials, bool escapes) {
 const char * USAGE =
     "usage: ttf-home MODEL \"text\" [options]     run the model (text model: continuation; speech model: -o out.wav)\n"
     "       ttf-home MODEL --chat [--system S] [--think | --no-think] [--effort xhigh|medium|low]   text model, stdin turns\n"
-    "       ttf-home MODEL --serve [--host 127.0.0.1] [--port 8080]   OpenAI-style /v1/chat/completions (stream too)\n"
+    "       ttf-home MODEL --serve [--host 127.0.0.1] [--port 8080]   chat page at /, OpenAI-style /v1/chat/completions\n"
     "       ttf-home MODEL --bench [--pp 512] [--tg 128] [--reps 3] [--depth 16]\n"
     "       ttf-home MODEL --list FILE           speech model, one job per line: out.wav<TAB>text[<TAB>seed]\n"
     "       ttf-home MODEL --tokenize [--specials] [--escapes] < lines\n"
