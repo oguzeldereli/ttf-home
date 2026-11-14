@@ -602,7 +602,14 @@ struct Builder {
         } else {
             q = ggml_scale(ctx, q, scale * std::sqrt((float) dv));
         }
-        if (Hv != Hk) {  // v head h reads q / k head h // (Hv / Hk): interleave (the op broadcasts tiled)
+        // v head h reads q / k head h // (Hv / Hk), interleaved (the op broadcasts tiled): CUDA by the op's interleaved
+        // mode (op param 1, the same values), else q / k repeated. TTF_GDN_REPEAT=1: the repeat on CUDA too
+        static const bool gdn_repeat = std::getenv("TTF_GDN_REPEAT") != nullptr;
+        const bool        qk_inter   = Hv != Hk && m.device != "cpu" && !gdn_repeat;
+        int64_t           Hq         = Hv;
+        if (qk_inter) {
+            Hq = Hk;
+        } else if (Hv != Hk) {
             const int64_t r = Hv / Hk;
             q = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, q, dk, 1, Hk, T), dk, r, Hk, T), dk, Hv, T);
             k = ggml_reshape_3d(ctx, ggml_repeat_4d(ctx, ggml_reshape_4d(ctx, k, dk, 1, Hk, T), dk, r, Hk, T), dk, Hv, T);
@@ -610,9 +617,15 @@ struct Builder {
         g  = ggml_reshape_4d(ctx, g, 1, Hv, T, 1);
         be = ggml_reshape_4d(ctx, be, 1, Hv, T, 1);
         ggml_tensor * st  = s.rec.at(a.at("state").get<std::string>());  // [dv, dk, Hv, 1] (transposed S)
-        ggml_tensor * out = ggml_gated_delta_net(ctx, ggml_reshape_4d(ctx, q, dk, Hv, T, 1),
-                                                 ggml_reshape_4d(ctx, k, dk, Hv, T, 1),
+        ggml_tensor * out = ggml_gated_delta_net(ctx, ggml_reshape_4d(ctx, q, dk, Hq, T, 1),
+                                                 ggml_reshape_4d(ctx, k, dk, Hq, T, 1),
                                                  ggml_reshape_4d(ctx, v, dv, Hv, T, 1), g, be, st, 1);
+        if (qk_inter) {
+            if (Hv % Hk != 0) {
+                throw std::runtime_error("delta_rule: heads_v not a multiple of heads_k");
+            }
+            ggml_set_op_params_i32(out, 1, (int32_t) (Hv / Hk));
+        }
         const int64_t na = dv * Hv * T;
         writes.push_back(ggml_cpy(ctx, ggml_view_1d(ctx, out, dv * dv * Hv, na * sizeof(float)),
                                   ggml_reshape_1d(ctx, st, ggml_nelements(st))));
