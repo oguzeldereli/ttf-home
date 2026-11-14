@@ -653,7 +653,9 @@ static void ttf_quant_launch(ggml_backend_cuda_context & ctx, ggml_tensor * cons
             CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&one_per_sm, ttf_quant_one_kernel, TTF_QSPLIT_TH, 0));
         }
         static_assert(TTF_QSPLIT_EL % TTF_QSPLIT_TH == 0, "ttf_quant_one_kernel");
-        if (!two && rmax == 0 && rows * np <= TTF_QONE_SLOT && (int64_t) B * rows * np <= (int64_t) one_per_sm * nsm) {
+        // (not with concurrent streams, GGML_CUDA_GRAPH_OPT=1: the counters are one set per device)
+        if (!two && rmax == 0 && rows * np <= TTF_QONE_SLOT && (int64_t) B * rows * np <= (int64_t) one_per_sm * nsm &&
+                ctx.stream_context().concurrent_events.empty()) {
             ttf_quant_one_kernel<<<dim3((unsigned) B, (unsigned) rows, (unsigned) np), TTF_QSPLIT_TH, 0, ctx.stream()>>>(
                 (const char *) x->data, x->nb[1], K, bf16, P, act ? (const char *) u->data : nullptr, act ? u->nb[1] : 0,
                 act, B);
