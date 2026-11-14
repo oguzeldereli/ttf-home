@@ -1278,7 +1278,9 @@ static void ttf_mm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, co
     // 4 rows per warp for prefill (each activation load feeds 4 rows) and for decode on tall matrices (4 rows'
     // loads in flight per lane, one epilogue latency per 4 rows); 1 row per warp when N is too small to fill the GPU
     static const int64_t r4_min_n = getenv("TTF_MM_R4_N") ? atoll(getenv("TTF_MM_R4_N")) : 2048;
-    const int     R  = T > TTF_MM_TOK || N >= r4_min_n ? 4 : 1;
+    // (op param 1: the caller's choice, 1 or 4; ttf::Session times both on its first decode step)
+    const int     hint = ggml_get_op_params_i32(dst, 1);
+    const int     R  = T > TTF_MM_TOK ? 4 : hint == 1 || hint == 4 ? hint : N >= r4_min_n ? 4 : 1;
     // short rows (<= 16 chunks of 16 bytes) with 4 rows per warp: half warps (H), 2 rows each. (With 1 row per warp,
     // H's 2 rows per warp cost more than the idle lanes: their epilogues run one after the other; 340M o: 5.6 vs 4.8 us)
     const bool    H  = R == 4 && 2 * (Kp / (q2 ? 128 : 160)) <= 16 && !ttf_mm_no_half();
@@ -1356,7 +1358,8 @@ bool ggml_cuda_ttf_mm_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const
     }
     int R = 0;
     for (int p = 0; p < np; ++p) {
-        const int Rp = ds[p]->src[0]->ne[1] >= r4_min_n || Ntot >= r4_tot_n ? 4 : 1;
+        const int hint = ggml_get_op_params_i32(ds[p], 1);
+        const int Rp   = hint == 1 || hint == 4 ? hint : ds[p]->src[0]->ne[1] >= r4_min_n || Ntot >= r4_tot_n ? 4 : 1;
         if (R != 0 && Rp != R) {
             return false;
         }

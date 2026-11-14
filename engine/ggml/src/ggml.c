@@ -6512,7 +6512,8 @@ struct ggml_tensor * ggml_ttf_mm(
     GGML_ASSERT(!b || (b->type == GGML_TYPE_F32 && b->ne[0] == N));
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, N, qa->ne[1], qa->ne[2], qa->ne[3]);
     GGML_ASSERT(!acc_in || (acc_in->type == GGML_TYPE_F32 && ggml_are_same_shape(acc_in, result)));
-    const int32_t params[1] = { d_bf16 ? 1 : 0 };
+    // params: [0] D = bf16; [1] CUDA decode rows per warp (0 = by shape, 1 or 4; set by the caller after this)
+    const int32_t params[2] = { d_bf16 ? 1 : 0, 0 };
     ggml_set_op_params(result, params, sizeof(params));
     result->op     = GGML_OP_TTF_MM;
     result->src[0] = w;

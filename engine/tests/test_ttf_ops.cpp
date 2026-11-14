@@ -234,7 +234,9 @@ int main(int argc, char ** argv) {
         const int64_t  K = std::atoll(argv[2]), N = std::atoll(argv[3]), T = std::atoll(argv[4]);
         const int      rank = std::atoi(argv[5]);
         const int64_t  Kp   = (K + 159) / 160 * 160;
-        const int      NC   = (int) std::max<int64_t>(4, (int64_t) (400e6 / (double) (N * Kp / 5)));
+        // TTF_BENCH_MB: the weight copies' total (default 400 MB, over the L2; the 27B reads ~6300 MB per token)
+        const double   wmb  = std::getenv("TTF_BENCH_MB") ? std::atof(std::getenv("TTF_BENCH_MB")) : 400.0;
+        const int      NC   = (int) std::max<int64_t>(4, (int64_t) (wmb * 1e6 / (double) (N * Kp / 5)));
         ggml_init_params ip = { (size_t) (16 * NC + 64) * ggml_tensor_overhead() + ggml_graph_overhead_custom(16 * NC + 64, false), nullptr, true };
         ggml_context *   ctx = ggml_init(ip);
         ggml_tensor * tx  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, T);

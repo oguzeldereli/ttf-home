@@ -298,7 +298,9 @@ struct Builder {
         if (!qa) {
             qa = ggml_ttf_quant(ctx, x2, P.mu, P.c, qb, P.Kp, bf16);
         }
-        return ggml_ttf_mm(ctx, P.w, qa, P.beta, P.mag_B ? P.mag_A : nullptr, P.r, P.b, acc_in, bf16);
+        ggml_tensor * mm = ggml_ttf_mm(ctx, P.w, qa, P.beta, P.mag_B ? P.mag_A : nullptr, P.r, P.b, acc_in, bf16);
+        ggml_set_op_params_i32(mm, 1, s.mm_r);
+        return mm;
     }
 
     ggml_tensor * op_linear(const json & n) {
@@ -1040,10 +1042,52 @@ void Session::truncate(int32_t n) {
 
 StepOut Session::step(const std::string & graph, const std::vector<int32_t> & ids, const std::vector<int32_t> & pos,
                       bool last_only) {
+    if (mm_mode < 0) {
+        mm_mode = 0;
+        if (const char * e = std::getenv("TTF_MM_R")) {
+            mm_r = std::atoi(e);
+        } else if (m.device != "cpu") {
+            for (const auto & n : m.ir.at("graphs").at(graph).at("nodes")) {
+                mm_mode = n.at("op") == "ttf.linear" ? 1 : mm_mode;
+            }
+        }
+    }
+    // online choice of the decode rows per warp (see ttf.h): trials of 32 steps alternating the two settings (clocks
+    // ramping up at the start then weigh on both alike) at step 0, 256 (a laptop's power cap has set in by then), then
+    // every 8192 (each trial builds the other setting's graphs, ~50 ms at 27B); the first 8 steps of a trial untimed
+    // (they build / capture the graphs)
+    constexpr int64_t TR = 32, SKIP = 8;
+    const bool        one = mm_mode == 1 && ids.size() == 1;
+    const int64_t     ph  = mm_n < 256 ? mm_n : mm_n < 8192 ? mm_n - 256 : mm_n % 8192;
+    if (one) {
+        mm_r = ph < TR ? (ph % 2 ? 1 : 0) : mm_best;
+    }
     Values in;
     in["ids"] = Tensor::i32({ (int64_t) ids.size() }, ids);
     in["pos"] = Tensor::i32({ (int64_t) pos.size() }, pos);
+    const auto t0 = std::chrono::steady_clock::now();
     Values  o = run(graph, in, last_only);
+    if (one) {
+        if (ph < TR && ph >= SKIP) {
+            mm_ms[ph % 2].push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+        if (ph == TR - 1) {
+            double md[2];
+            for (int i = 0; i < 2; ++i) {
+                std::sort(mm_ms[i].begin(), mm_ms[i].end());
+                md[i] = mm_ms[i].empty() ? 0 : mm_ms[i][mm_ms[i].size() / 2];
+                mm_ms[i].clear();
+            }
+            // 1 only on a clear win: the trial reads a few percent in 1's favour where it then loses sustained (4080
+            // Laptop BitNet: trial 4.98 vs 5.03 ms, fixed 5.23 vs 5.11); the 27B on a 4070 Ti Super: 18.0 vs 20.3
+            mm_best = md[1] < 0.95 * md[0] ? 1 : 0;
+            if (std::getenv("TTF_MM_R_LOG")) {
+                std::fprintf(stderr, "[ttf: decode rows per warp %s (by shape: %.2f ms, 1: %.2f ms)]\n",
+                             mm_best ? "1" : "by shape", md[0], md[1]);
+            }
+        }
+        ++mm_n;
+    }
     StepOut r;
     Tensor & lo = o.begin()->second;
     r.n_vocab   = lo.shape.back();
@@ -1112,7 +1156,8 @@ Values Session::run(const std::string & graph, const Values & in, bool last_only
     const bool   prof_by_op = std::getenv("TTF_PROF_OPS") != nullptr;
     static const bool no_cache = std::getenv("TTF_NO_GRAPH_CACHE") != nullptr;
     const bool   cacheable  = !dump_dir && !prof_by_op && !no_cache && T <= 64;
-    std::string  key = graph + "|" + std::to_string(T) + "|" + std::to_string(S) + "|" + (last_only ? "1" : "0");
+    std::string  key = "r" + std::to_string(mm_r) + "|" + graph + "|" + std::to_string(T) + "|" + std::to_string(S) + "|" +
+                      (last_only ? "1" : "0");
     for (const auto & inp : g.at("inputs")) {
         const std::string name = inp.at("name");
         auto              it   = in.find(name);
