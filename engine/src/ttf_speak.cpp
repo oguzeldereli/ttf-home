@@ -282,6 +282,9 @@ SpeakOut speak_once(Session & s, const std::vector<int32_t> & text_ids, const Sp
         out.ms_lm += ms_since(tl);
     }
 
+    if (p.skip_vae) {
+        return out;
+    }
     // vae: z [D, patches * P] (b d (t p))
     auto          tv = clk::now();
     const int64_t L  = (int64_t) out.n_patches * P;

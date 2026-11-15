@@ -1505,6 +1505,10 @@ int run_speech(const ttf::Model & m, Args a) {
             }
             continue;
         }
+        if (a.sp.skip_vae) {
+            std::fprintf(stderr, "%s: %d patches in %.2f s%s\n", jb.out.c_str(), o.n_patches, ms / 1000,
+                         o.attempts > 1 ? (" after " + std::to_string(o.attempts) + " attempts").c_str() : "");
+        } else
         std::fprintf(stderr, "%s: %.2f s audio in %.2f s (RTF %.3f)%s\n", jb.out.c_str(), sec, ms / 1000, ms / 1000 / sec,
                      o.attempts > 1 ? (" after " + std::to_string(o.attempts) + " attempts, seed " + std::to_string(o.seed)).c_str() : "");
         if (a.verbose) {
@@ -1516,6 +1520,15 @@ int run_speech(const ttf::Model & m, Args a) {
                 print_ops(s, 1);
                 s.prof_ops.clear();
             }
+        }
+        if (a.sp.skip_vae) {
+            FILE * f = std::fopen(jb.out.c_str(), "wb");
+            if (!f || std::fwrite(o.feat.data(), 4, o.feat.size(), f) != o.feat.size()) {
+                std::fprintf(stderr, "cannot write %s\n", jb.out.c_str());
+                return 1;
+            }
+            std::fclose(f);
+            continue;
         }
         if (!write_wav(jb.out, o.wav, o.sample_rate)) {
             std::fprintf(stderr, "cannot write %s\n", jb.out.c_str());
@@ -1714,6 +1727,8 @@ int main(int argc, char ** argv) {
             a.noise = next();
         } else if (o == "--feat") {
             a.feat = next();
+        } else if (o == "--latents-only") {  // speech --list: each job writes its latents (f32 [patches, P, D]) to out
+            a.sp.skip_vae = true;
         } else if (o == "--vae") {
             a.vae = next();
         } else if (o == "--split-vae") {

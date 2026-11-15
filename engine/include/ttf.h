@@ -319,6 +319,7 @@ struct SpeakParams {
     // resamples). It is encoded once per call and put before the text as [ref_start, its patches, ref_end]; no
     // transcript needed. Empty = zero-shot (the model's own voice).
     const std::vector<float> * ref_audio = nullptr;
+    bool     skip_vae      = false;  // latents only (out.wav empty)
 };
 
 struct SpeakOut {
