@@ -40,11 +40,20 @@
 
 namespace {
 
+// q holds the rows in panels of NT = 3 (18 Nov 2026): for panel p (rows 3p .. 3p + 2, zero rows past N) the 32-byte
+// chunks of the three rows interleaved, [K / 32][3][32], so a tile reads ONE sequential stream (hardware prefetcher
+// friendly; i7-9800X cold weights: +10% over three strided rows) and the software prefetch runs ahead in it.
+constexpr int64_t W8_NT = 3;
+
+inline size_t w8_off(int64_t n, int64_t k, int64_t K) {  // byte of element (n, k) in the panel layout
+    return (size_t) (n / W8_NT) * W8_NT * K + (size_t) (k / 32) * (32 * W8_NT) + (size_t) (n % W8_NT) * 32 + k % 32;
+}
+
 struct W8 {
     int64_t              K = 0, N = 0;
     bool                 fresh     = true;   // rows not converted yet: the first call converts them, each thread its own
     bool                 conv_call = false;  // the converting call has run (thread 0's flag)
-    std::vector<int8_t>  q;   // [N, K]
+    std::vector<int8_t>  q;   // [N3, K] in panels (w8_off), N3 = N rounded up to 3
     std::vector<float>   s;   // [N]
     std::vector<int32_t> rs;  // [N] row sums (VNNI: the u8 offset's correction)
 };
@@ -56,7 +65,7 @@ W8 * alloc(const ggml_tensor * w) {
     W8 * c = new W8;
     c->K   = w->ne[0];
     c->N   = w->ne[1];
-    c->q.resize((size_t) c->N * c->K);
+    c->q.assign((size_t) ((c->N + W8_NT - 1) / W8_NT * W8_NT) * c->K, 0);   // (the pad rows stay 0)
     c->s.resize(c->N);
     c->rs.resize(c->N);
     return c;
@@ -80,13 +89,25 @@ void convert_rows(const ggml_tensor * w, W8 * c, int64_t n0, int64_t n1) {
         int32_t     sum = 0;
         for (int64_t k = 0; k < K; ++k) {
             const int q              = (int) std::lrintf(f[k] * is);
-            c->q[(size_t) n * K + k] = (int8_t) q;
+            c->q[w8_off(n, k, K)] = (int8_t) q;
             sum += q;
         }
         c->s[n]  = s;
         c->rs[n] = sum;
     }
 }
+
+// AVX2 without VNNI: 8-bit activations need vpsignb per product (maddubs wants one unsigned operand and |a| |w| 2
+// <= 32767); TTF_W8A7=1 quantizes the activations to 7 bits instead (|a| <= 63, stored + 64 as u8: maddubs(u8, s8) is
+// exact, 127 * 127 * 2 < 32767) and drops the vpsignb: 1.4x on the DiT shapes (cold weights). Off by default.
+#if !TTF_W8_VNNI
+const bool g_a7 = [] {
+    const char * e = std::getenv("TTF_W8A7");
+    return e && std::atoi(e) != 0;
+}();
+#else
+constexpr bool g_a7 = false;
+#endif
 
 inline int hsum8i(__m256i v) {
     __m128i a = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
@@ -105,7 +126,7 @@ void quant_row(const float * p, int64_t K, uint8_t * q, float * sd) {
     __m128 h = _mm_max_ps(_mm256_castps256_ps128(mx), _mm256_extractf128_ps(mx, 1));
     h        = _mm_max_ps(h, _mm_movehl_ps(h, h));
     h        = _mm_max_ss(h, _mm_movehdup_ps(h));
-    const float d = _mm_cvtss_f32(h) / 127.f, id = d > 0 ? 1.f / d : 0.f;
+    const float d = _mm_cvtss_f32(h) / (g_a7 ? 63.f : 127.f), id = d > 0 ? 1.f / d : 0.f;
     *sd           = d;
     const __m256  vi  = _mm256_set1_ps(id);
     const __m256i prm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
@@ -118,37 +139,33 @@ void quant_row(const float * p, int64_t K, uint8_t * q, float * sd) {
         b                = _mm256_permutevar8x32_epi32(b, prm);  // the packs interleave the 128-bit lanes
 #if TTF_W8_VNNI
         b = _mm256_xor_si256(b, _mm256_set1_epi8((char) 0x80));  // + 128
+#else
+        if (g_a7) {
+            b = _mm256_add_epi8(b, _mm256_set1_epi8(64));        // |a| <= 63 (scale amax / 63): + 64 in [1, 127]
+        }
 #endif
         _mm256_storeu_si256((__m256i *) (q + k), b);
     }
 }
 
-// rows [n0, n1) of W x all M activation rows; tile 4 x 3 (12 accumulators, 3 weight + 1 activation vector: 16 ymm)
-void gemm(const W8 * w, int64_t K, int64_t n0, int64_t n1, const uint8_t * aq, const float * sa, int64_t M, float * y,
-          size_t ldy) {
-    constexpr int MT = 4, NT = 3;
+// rows [n0, n1) of W x all M activation rows; tile 4 x 3 (12 accumulators, 3 weight + 1 activation vector: 16 ymm);
+// n0 a multiple of 3 (a panel's first row). A7: the a7 kernel (u8 a + 64), else the vpsignb one (AVX2) / VNNI.
+template <bool A7>
+void gemm_t(const W8 * w, int64_t K, int64_t n0, int64_t n1, const uint8_t * aq, const float * sa, int64_t M, float * y,
+            size_t ldy) {
+    constexpr int MT = 4, NT = (int) W8_NT;
 #if TTF_W8_VNNI
 #    define TTF_W8_DOT(acc, a, w) TTF_DPBUSD(acc, a, w)
-#else  // a holds signed codes: |w| x sign(a, w) stays within int16 pairs (|w|, |a| <= 127)
+#else  // A8: a holds signed codes: |w| x sign(a, w) stays within int16 pairs (|w|, |a| <= 127); A7: a in [1, 127]
     const __m256i ones = _mm256_set1_epi16(1);
-#    define TTF_W8_DOT(acc, a, w) \
-        _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(a, w)), ones))
+#    define TTF_W8_DOT(acc, a, w)                                                                                  \
+        (A7 ? _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(a, w), ones))                           \
+            : _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(a, w)), ones)))
 #endif
+    constexpr int64_t PF = 1024;  // software prefetch distance in the panel stream (bytes)
     for (int64_t n = n0; n < n1; n += NT) {
         const int      nn = (int) std::min<int64_t>(NT, n1 - n);
-        const int8_t * wr[NT];
-        for (int j = 0; j < NT; ++j) {
-            wr[j] = w->q.data() + (size_t) (n + (j < nn ? j : 0)) * K;
-        }
-        // the next tile's weight rows on their way while this one computes (cold weights: DRAM-bound otherwise)
-        constexpr int PD = TTF_W8_PD;  // tiles ahead
-        if (n + PD * NT < n1) {
-            const int8_t * nx = w->q.data() + (size_t) (n + PD * NT) * K;
-            const int64_t  nb = std::min<int64_t>(NT, n1 - n - PD * NT) * K;
-            for (int64_t o = 0; o < nb; o += 64) {
-                _mm_prefetch((const char *) (nx + o), _MM_HINT_T0);
-            }
-        }
+        const int8_t * pn = w->q.data() + (size_t) n * K;   // the panel of rows n .. n + 2
         for (int64_t m = 0; m < M; m += MT) {
             const int       mm = (int) std::min<int64_t>(MT, M - m);
             const uint8_t * ar[MT];
@@ -158,12 +175,17 @@ void gemm(const W8 * w, int64_t K, int64_t n0, int64_t n1, const uint8_t * aq, c
             // named accumulators: as an array GCC keeps them on the stack across the loop
             __m256i c00 = _mm256_setzero_si256(), c01 = c00, c02 = c00, c10 = c00, c11 = c00, c12 = c00, c20 = c00, c21 = c00,
                     c22 = c00, c30 = c00, c31 = c00, c32 = c00;
-            const int8_t * w0 = wr[0], * w1 = wr[1], * w2 = wr[2];
             const uint8_t * a0 = ar[0], * a1 = ar[1], * a2 = ar[2], * a3 = ar[3];
-            for (int64_t k = 0; k < K; k += 32) {
-                const __m256i v0 = _mm256_loadu_si256((const __m256i *) (w0 + k));
-                const __m256i v1 = _mm256_loadu_si256((const __m256i *) (w1 + k));
-                const __m256i v2 = _mm256_loadu_si256((const __m256i *) (w2 + k));
+            const int8_t *  q  = pn;
+            const bool      pf = m == 0;   // the first m-tile streams the panel from memory; the rest hit the cache
+            for (int64_t k = 0; k < K; k += 32, q += 32 * NT) {
+                if (pf) {
+                    _mm_prefetch((const char *) (q + PF), _MM_HINT_T0);
+                    _mm_prefetch((const char *) (q + PF + 64), _MM_HINT_T0);
+                }
+                const __m256i v0 = _mm256_loadu_si256((const __m256i *) (q));
+                const __m256i v1 = _mm256_loadu_si256((const __m256i *) (q + 32));
+                const __m256i v2 = _mm256_loadu_si256((const __m256i *) (q + 64));
                 __m256i       a  = _mm256_loadu_si256((const __m256i *) (a0 + k));
                 c00 = TTF_W8_DOT(c00, a, v0);
                 c01 = TTF_W8_DOT(c01, a, v1);
@@ -187,12 +209,22 @@ void gemm(const W8 * w, int64_t K, int64_t n0, int64_t n1, const uint8_t * aq, c
 #if TTF_W8_VNNI
                     const int32_t d = hsum8i(acc[i][j]) - 128 * w->rs[n + j];
 #else
-                    const int32_t d = hsum8i(acc[i][j]);
+                    const int32_t d = hsum8i(acc[i][j]) - (A7 ? 64 * w->rs[n + j] : 0);
 #endif
                     y[(size_t) (m + i) * ldy + n + j] = w->s[n + j] * sa[m + i] * (float) d;
                 }
             }
         }
+    }
+#undef TTF_W8_DOT
+}
+
+void gemm(const W8 * w, int64_t K, int64_t n0, int64_t n1, const uint8_t * aq, const float * sa, int64_t M, float * y,
+          size_t ldy) {
+    if (g_a7) {
+        gemm_t<true>(w, K, n0, n1, aq, sa, M, y, ldy);
+    } else {
+        gemm_t<false>(w, K, n0, n1, aq, sa, M, y, ldy);
     }
 }
 
