@@ -499,24 +499,31 @@ def _train_from(a, extra):
     ck = torch.load(a.init, map_location="cpu", weights_only=False, mmap=True)
     ca = ck.get("args", {}) or {}
     ca = ca if isinstance(ca, dict) else vars(ca)
-    args = ["--init-ckpt", a.init, *_data_args(a.data, "u32" if ca.get("init_hf") else None), "--out-dir", a.out,
+    if not ca.get("init_hf"):   # a native preset: ttf-core's --init-ckpt loads --arch-hf models only (and refuses a
+        out = Path(a.out)       # native one), so the checkpoint becomes the run's own at step 0, resumed; a run already
+        out.mkdir(parents=True, exist_ok=True)   # in progress there keeps its own checkpoint
+        if not (out / "ckpt.pt").exists():
+            torch.save({**ck, "step": 0}, out / "ckpt.pt")
+        args = [*_data_args(a.data), "--out-dir", a.out, "--mem-cap-gib", f"{gib * 0.94:.1f}", "--resume",
+                "--allow-leak-change",   # (a fresh schedule from step 0: the checkpoint's own theta / leak may differ)
+                "--recipe", "scratch-110m", "--preset", ca.get("preset", "small")]
+        return _trainer(args + _knobs(a), extra)
+    args = ["--init-ckpt", a.init, *_data_args(a.data, "u32"), "--out-dir", a.out,
             "--mem-cap-gib", f"{gib * 0.94:.1f}", "--resume"]
-    if ca.get("init_hf"):
-        base = a.base or ca["init_hf"]
-        if not Path(base).exists():
-            raise SystemExit(f"the checkpoint was converted from {ca['init_hf']}: pass --base (its config + tokenizer)")
-        if ck.get("imported"):   # rebuilt from a GGUF (`ttf import`): ttf-home's own recipe and structure plug-in
-            args += [*_train_recipe(base, gib), "--init-hf", base]
-        else:
-            args += [*_conv_recipe(base, gib, convert=False)[1], "--init-hf", base]
-        for e in ca.get("ext", []):
-            args += ["--ext", e]
-        if a.teacher:
-            args += ["--teacher", a.teacher]
-        else:
-            args += ["--kd-weight", 0]
+    # (from here: a converted model)
+    base = a.base or ca["init_hf"]
+    if not Path(base).exists():
+        raise SystemExit(f"the checkpoint was converted from {ca['init_hf']}: pass --base (its config + tokenizer)")
+    if ck.get("imported"):   # rebuilt from a GGUF (`ttf import`): ttf-home's own recipe and structure plug-in
+        args += [*_train_recipe(base, gib), "--init-hf", base]
     else:
-        args += ["--recipe", "scratch-110m", "--preset", ca.get("preset", "small")]
+        args += [*_conv_recipe(base, gib, convert=False)[1], "--init-hf", base]
+    for e in ca.get("ext", []):
+        args += ["--ext", e]
+    if a.teacher:
+        args += ["--teacher", a.teacher]
+    else:
+        args += ["--kd-weight", 0]
     _trainer(args + _knobs(a), extra)
 
 
