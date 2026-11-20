@@ -228,7 +228,10 @@ build backend "is missing the 'build_editable' hook", the build ran without isol
     ttf generate mine.gguf "Once upon a time"
 
     ttf convert --base Qwen3.5-0.8B-Base --data data/web --out runs/q08        # convert to ternary + recover
-    ttf finetune --ckpt runs/q08/ckpt.pt --base Qwen3.5-0.8B-Base --data data/mine --out runs/q08-mine
+    ttf train --init runs/q08/ckpt.pt --base Qwen3.5-0.8B-Base --data data/mine --out runs/q08-mine
+
+    ttf import ttf-Qwen3.8-27B-noadapters-TQ1_P.gguf q27.pt --base Qwen3.8-27B   # a released GGUF -> a checkpoint
+    ttf train --init q27.pt --base Qwen3.8-27B --data data/mine --out runs/q27-mine
     ttf export runs/q08-mine/ckpt.pt q08-mine.gguf --base Qwen3.5-0.8B-Base
     ttf chat q08-mine.gguf          # or: ttf serve q08-mine.gguf   (OpenAI-compatible HTTP API)
 
@@ -240,7 +243,7 @@ build backend "is missing the 'build_editable' hook", the build ran without isol
 `--base` is a local Hugging Face model directory (`hf download Qwen/Qwen3.5-0.8B-Base --local-dir Qwen3.5-0.8B-Base`).
 For a conversion, run `ttf data` with `--tokenizer Qwen3.5-0.8B-Base` so the tokens match the base model.
 
-TTF knobs on `train`, `convert` and `finetune`:
+TTF knobs on `train` and `convert`:
 
 | knob | meaning |
 |---|---|
